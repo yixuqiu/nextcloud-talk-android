@@ -11,11 +11,11 @@ import android.app.Dialog
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
+import androidx.core.os.BundleCompat
 import androidx.fragment.app.DialogFragment
 import androidx.lifecycle.ViewModelProvider
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -24,22 +24,30 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import com.nextcloud.talk.R
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.DialogPollCreateBinding
+import com.nextcloud.talk.logger.Logger
 import com.nextcloud.talk.polls.adapters.PollCreateOptionItem
 import com.nextcloud.talk.polls.adapters.PollCreateOptionsAdapter
 import com.nextcloud.talk.polls.adapters.PollCreateOptionsItemListener
 import com.nextcloud.talk.polls.viewmodels.PollCreateViewModel
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
-class PollCreateDialogFragment : DialogFragment(), PollCreateOptionsItemListener {
+class PollCreateDialogFragment :
+    DialogFragment(),
+    PollCreateOptionsItemListener {
 
     @Inject
     lateinit var viewModelFactory: ViewModelProvider.Factory
 
     @Inject
     lateinit var viewThemeUtils: ViewThemeUtils
+
+    @Inject
+    lateinit var logger: Logger
 
     private lateinit var binding: DialogPollCreateBinding
     private lateinit var viewModel: PollCreateViewModel
@@ -49,15 +57,17 @@ class PollCreateDialogFragment : DialogFragment(), PollCreateOptionsItemListener
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
 
         viewModel = ViewModelProvider(this, viewModelFactory)[PollCreateViewModel::class.java]
         val roomToken = arguments?.getString(KEY_ROOM_TOKEN)!!
-        viewModel.setData(roomToken)
+        val user = BundleCompat.getParcelable(requireArguments(), KEY_USER, User::class.java)!!
+        viewModel.setData(user, roomToken)
     }
 
     @SuppressLint("InflateParams")
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
-        binding = DialogPollCreateBinding.inflate(LayoutInflater.from(context))
+        binding = DialogPollCreateBinding.inflate(layoutInflater)
 
         val dialogBuilder = MaterialAlertDialogBuilder(binding.root.context)
             .setView(binding.root)
@@ -66,9 +76,8 @@ class PollCreateDialogFragment : DialogFragment(), PollCreateOptionsItemListener
         return dialogBuilder.create()
     }
 
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
-        return binding.root
-    }
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+        binding.root
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -157,7 +166,7 @@ class PollCreateDialogFragment : DialogFragment(), PollCreateOptionsItemListener
 
     private fun showError() {
         dismiss()
-        Log.e(TAG, "Failed to create poll")
+        logger.e(TAG, "Failed to create poll")
         Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
     }
 
@@ -183,10 +192,12 @@ class PollCreateDialogFragment : DialogFragment(), PollCreateOptionsItemListener
     companion object {
         private val TAG = PollCreateDialogFragment::class.java.simpleName
         private const val KEY_ROOM_TOKEN = "keyRoomToken"
+        private const val KEY_USER = "keyUser"
 
         @JvmStatic
-        fun newInstance(roomTokenParam: String): PollCreateDialogFragment {
+        fun newInstance(user: User, roomTokenParam: String): PollCreateDialogFragment {
             val args = Bundle()
+            args.putParcelable(KEY_USER, user)
             args.putString(KEY_ROOM_TOKEN, roomTokenParam)
             val fragment = PollCreateDialogFragment()
             fragment.arguments = args

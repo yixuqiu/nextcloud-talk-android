@@ -22,12 +22,11 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <com.vanniktech.emoji.EmojiEditText
+    <androidx.emoji2.widget.EmojiTextView
         android:id="@+id/participant_status_emoji"
         android:layout_width="22dp"
         android:layout_height="wrap_content"
         android:background="@color/transparent"
-        android:cursorVisible="false"
         android:gravity="center|start"
         android:text="@string/default_emoji"
         android:textSize="16sp"
@@ -66,7 +65,6 @@
         android:ellipsize="end"
         android:maxLines="3"
         android:textAlignment="viewStart"
-        android:textAppearance="?android:attr/textAppearanceListItem"
         android:textColor="?android:attr/textColorSecondary"
         android:layout_marginEnd="@dimen/side_margin"
         app:layout_constraintBottom_toBottomOf="parent"
@@ -89,19 +87,5 @@
         app:layout_constraintStart_toEndOf="@+id/name_text"
         app:layout_constraintTop_toTopOf="@+id/name_text"
         tools:text="Moderator (or userid for autocomplete mention)" />
-
-
-    <ImageView
-        android:id="@+id/videoCallIcon"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="@dimen/standard_half_margin"
-        android:layout_marginEnd="@dimen/standard_half_margin"
-        android:contentDescription="@null"
-        android:src="@drawable/ic_videocam_grey_600_24dp"
-        android:visibility="gone"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintTop_toTopOf="@+id/secondary_text"
-        tools:visibility="visible" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

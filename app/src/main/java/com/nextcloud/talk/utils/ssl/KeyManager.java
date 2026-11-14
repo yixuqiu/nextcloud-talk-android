@@ -27,7 +27,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.X509KeyManager;
+import kotlin.coroutines.EmptyCoroutineContext;
+import kotlinx.coroutines.BuildersKt;
 
 import androidx.annotation.Nullable;
 
@@ -47,17 +51,64 @@ public class KeyManager implements X509KeyManager {
         context = NextcloudTalkApplication.Companion.getSharedApplication().getApplicationContext();
     }
 
+    /**
+     * Chooses the certificate of the accounts on the server of the connection, see {@link ClientCertificateSelector}. The
+     * handshake doesn't know the account of the request, so the default account alone would offer the wrong
+     * certificate for the requests of other accounts.
+     */
     @Override
     public String chooseClientAlias(String[] strings, Principal[] principals, Socket socket) {
         String alias;
-        User currentUser = userManager.getCurrentUser().blockingGet();
-        if ((currentUser != null &&
-            !TextUtils.isEmpty(alias = currentUser.getClientCertificate())) ||
+        List<User> users = new ArrayList<>();
+        User defaultUser = null;
+        try {
+            users = BuildersKt.runBlocking(
+                EmptyCoroutineContext.INSTANCE,
+                (scope, continuation) -> userManager.getUsers(continuation));
+            defaultUser = BuildersKt.runBlocking(
+                EmptyCoroutineContext.INSTANCE,
+                (scope, continuation) -> userManager.getDefaultUser(continuation));
+        } catch (InterruptedException e) {
+            Log.e(TAG, "Interrupted while getting the users: " + e.getLocalizedMessage());
+            Thread.currentThread().interrupt();
+        }
+        if (!TextUtils.isEmpty(alias = ClientCertificateSelector.selectAlias(
+            getPeerHost(socket),
+            getPeerPort(socket),
+            users,
+            defaultUser)) ||
             !TextUtils.isEmpty(alias = appPreferences.getTemporaryClientCertAlias())
                 && new ArrayList<>(Arrays.asList(getClientAliases())).contains(alias)) {
             return alias;
         }
 
+        return null;
+    }
+
+    private static int getPeerPort(@Nullable Socket socket) {
+        if (socket instanceof SSLSocket) {
+            SSLSession session = ((SSLSocket) socket).getHandshakeSession();
+            if (session != null && session.getPeerPort() > 0) {
+                return session.getPeerPort();
+            }
+        }
+        if (socket != null && socket.getPort() > 0) {
+            return socket.getPort();
+        }
+        return -1;
+    }
+
+    @Nullable
+    private static String getPeerHost(@Nullable Socket socket) {
+        if (socket instanceof SSLSocket) {
+            SSLSession session = ((SSLSocket) socket).getHandshakeSession();
+            if (session != null && session.getPeerHost() != null) {
+                return session.getPeerHost();
+            }
+        }
+        if (socket != null && socket.getInetAddress() != null) {
+            return socket.getInetAddress().getHostName();
+        }
         return null;
     }
 
@@ -115,7 +166,15 @@ public class KeyManager implements X509KeyManager {
             aliases.add(alias);
         }
 
-        List<User> userEntities = userManager.getUsers().blockingGet();
+        List<User> userEntities = new ArrayList<>();
+        try {
+            userEntities = BuildersKt.runBlocking(
+                EmptyCoroutineContext.INSTANCE,
+                (scope, continuation) -> userManager.getUsers(continuation));
+        } catch (InterruptedException e) {
+            Log.e(TAG, "Interrupted while getting users: " + e.getLocalizedMessage());
+            Thread.currentThread().interrupt();
+        }
         for (int i = 0; i < userEntities.size(); i++) {
             if (!TextUtils.isEmpty(alias = userEntities.get(i).getClientCertificate())) {
                 aliases.add(alias);

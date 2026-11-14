@@ -5,8 +5,39 @@
     ":gitSignOff"
   ],
   "timezone": "Europe/Berlin",
+  "prConcurrentLimit": 10,
+  "rebaseWhen": "conflicted",
+  "schedule": ["* 1-4 * * *"],
+  "minimumReleaseAge": "10 days",
   "labels": [
     "dependencies",
     "3. to review"
+  ],
+  "packageRules": [
+    {
+      // 5.23.0 has a regression in the Maker implementation that breaks the Android tests.
+      // Remove this rule once a later release fixes it, so mockito can move again.
+      "matchPackageNames": ["org.mockito:mockito-core", "org.mockito:mockito-android"],
+      "allowedVersions": "!/^5[.]23[.]0$/"
+    },
+    {
+      // LiteRT 2.x depends on Play Asset Delivery (com.google.android.play:ai-delivery),
+      // which F-Droid's scanner flags as non-free
+      "matchPackageNames": ["com.google.ai.edge.litert:**"],
+      "allowedVersions": "<2"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchPackageNames": ["/^com\\.github\\.nextcloud/", "nextcloud/**"],
+      "minimumReleaseAge": "0 days"
+    },
+    {
+      "matchPackageNames": ["com.github.nextcloud-deps.hwsecurity:hwsecurity-fido2", "com.github.nextcloud-deps.hwsecurity:hwsecurity-fido", "fidoVersion"],
+      "automerge": false,
+	  "enabled": false
+    }
   ],
 }

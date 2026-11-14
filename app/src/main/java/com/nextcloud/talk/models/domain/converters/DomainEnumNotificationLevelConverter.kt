@@ -9,28 +9,26 @@
 package com.nextcloud.talk.models.domain.converters
 
 import com.bluelinelabs.logansquare.typeconverters.IntBasedTypeConverter
-import com.nextcloud.talk.models.domain.NotificationLevel
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
 
-class DomainEnumNotificationLevelConverter : IntBasedTypeConverter<NotificationLevel>() {
-    override fun getFromInt(i: Int): NotificationLevel {
-        return when (i) {
-            DEFAULT -> NotificationLevel.DEFAULT
-            ALWAYS -> NotificationLevel.ALWAYS
-            MENTION -> NotificationLevel.MENTION
-            NEVER -> NotificationLevel.NEVER
-            else -> NotificationLevel.DEFAULT
+class DomainEnumNotificationLevelConverter : IntBasedTypeConverter<ConversationEnums.NotificationLevel>() {
+    override fun getFromInt(i: Int): ConversationEnums.NotificationLevel =
+        when (i) {
+            DEFAULT -> ConversationEnums.NotificationLevel.DEFAULT
+            ALWAYS -> ConversationEnums.NotificationLevel.ALWAYS
+            MENTION -> ConversationEnums.NotificationLevel.MENTION
+            NEVER -> ConversationEnums.NotificationLevel.NEVER
+            else -> ConversationEnums.NotificationLevel.DEFAULT
         }
-    }
 
-    override fun convertToInt(`object`: NotificationLevel): Int {
-        return when (`object`) {
-            NotificationLevel.DEFAULT -> DEFAULT
-            NotificationLevel.ALWAYS -> ALWAYS
-            NotificationLevel.MENTION -> MENTION
-            NotificationLevel.NEVER -> NEVER
+    override fun convertToInt(`object`: ConversationEnums.NotificationLevel): Int =
+        when (`object`) {
+            ConversationEnums.NotificationLevel.DEFAULT -> DEFAULT
+            ConversationEnums.NotificationLevel.ALWAYS -> ALWAYS
+            ConversationEnums.NotificationLevel.MENTION -> MENTION
+            ConversationEnums.NotificationLevel.NEVER -> NEVER
             else -> DEFAULT
         }
-    }
 
     companion object {
         private const val DEFAULT: Int = 0

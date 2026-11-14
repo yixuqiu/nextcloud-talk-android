@@ -16,6 +16,7 @@ import com.nextcloud.android.common.ui.theme.utils.ColorRole
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.databinding.DialogPollLoadingBinding
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
@@ -29,6 +30,7 @@ class PollLoadingFragment : Fragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
@@ -42,8 +44,6 @@ class PollLoadingFragment : Fragment() {
         private const val HEIGHT = 300
 
         @JvmStatic
-        fun newInstance(): PollLoadingFragment {
-            return PollLoadingFragment()
-        }
+        fun newInstance(): PollLoadingFragment = PollLoadingFragment()
     }
 }

@@ -1,101 +1,115 @@
 /*
  * Nextcloud Talk - Android Client
  *
- * SPDX-FileCopyrightText: 2023 Ezhil Shanmugham <ezhil56x.contact@gmail.com>
- * SPDX-FileCopyrightText: 2021-2023 Andy Scherzinger <info@andy-scherzinger.de>
- * SPDX-FileCopyrightText: 2021-2023 Marcel Hibbe <dev@mhibbe.de>
- * SPDX-FileCopyrightText: 2021-2022 Tim Krüger <t@timkrueger.me>
- * SPDX-FileCopyrightText: 2017-2018 Mario Danic <mario@lovelyhq.com>
+ * SPDX-FileCopyrightText: 2017-2026 Nextcloud GmbH and Nextcloud contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 package com.nextcloud.talk.conversationinfo
 
 import android.annotation.SuppressLint
 import android.content.Intent
-import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.text.TextUtils
 import android.util.Log
-import android.view.Menu
-import android.view.MenuItem
-import android.view.View
-import android.view.View.GONE
-import android.view.View.VISIBLE
+import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AlertDialog
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.AlertDialog as ComposeAlertDialog
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentTransaction
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequest
+import com.nextcloud.talk.utils.setExpeditedIfSupported
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import autodagger.AutoInjector
-import com.afollestad.materialdialogs.LayoutMode.WRAP_CONTENT
-import com.afollestad.materialdialogs.MaterialDialog
-import com.afollestad.materialdialogs.bottomsheets.BottomSheet
-import com.afollestad.materialdialogs.datetime.dateTimePicker
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.snackbar.Snackbar
-import com.nextcloud.android.common.ui.theme.utils.ColorRole
 import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
-import com.nextcloud.talk.activities.MainActivity
-import com.nextcloud.talk.adapters.items.ParticipantItem
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
-import com.nextcloud.talk.bottomsheet.items.BasicListItemWithImage
-import com.nextcloud.talk.bottomsheet.items.listItemsWithImage
+import com.nextcloud.talk.chat.ChatActivity
+import com.nextcloud.talk.components.ColoredStatusBar
+import com.nextcloud.talk.contacts.CompanionClass.Companion.KEY_HIDE_ALREADY_EXISTING_PARTICIPANTS
 import com.nextcloud.talk.contacts.ContactsActivity
+import com.nextcloud.talk.conversationinfo.model.ParticipantModel
+import com.nextcloud.talk.conversationinfo.ui.ConversationInfoScreen
+import com.nextcloud.talk.conversationinfo.ui.ConversationInfoScreenCallbacks
+import com.nextcloud.talk.conversationinfo.ui.LobbyTimerPickerDialog
+import com.nextcloud.talk.conversationinfo.ui.ParticipantOpsAction
 import com.nextcloud.talk.conversationinfo.viewmodel.ConversationInfoViewModel
 import com.nextcloud.talk.conversationinfoedit.ConversationInfoEditActivity
+import com.nextcloud.talk.conversationlist.ConversationsListActivity
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.databinding.ActivityConversationInfoBinding
+import com.nextcloud.talk.databinding.DialogBanParticipantBinding
 import com.nextcloud.talk.events.EventStatus
-import com.nextcloud.talk.extensions.loadConversationAvatar
-import com.nextcloud.talk.extensions.loadNoteToSelfAvatar
-import com.nextcloud.talk.extensions.loadSystemAvatar
+import com.nextcloud.talk.extensions.getParcelableArrayListExtraProvider
+import com.nextcloud.talk.extensions.getParcelableExtraProvider
 import com.nextcloud.talk.extensions.loadUserAvatar
+import com.nextcloud.talk.jobs.AddParticipantsToConversationWorker
 import com.nextcloud.talk.jobs.DeleteConversationWorker
 import com.nextcloud.talk.jobs.LeaveConversationWorker
-import com.nextcloud.talk.models.domain.ConversationModel
-import com.nextcloud.talk.models.domain.ConversationType
-import com.nextcloud.talk.models.domain.LobbyState
-import com.nextcloud.talk.models.domain.NotificationLevel
-import com.nextcloud.talk.models.domain.converters.DomainEnumNotificationLevelConverter
-import com.nextcloud.talk.models.json.capabilities.SpreedCapability
+import com.nextcloud.talk.models.json.autocomplete.AutocompleteUserDto
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
+import com.nextcloud.talk.models.json.converters.EnumActorTypeConverter
 import com.nextcloud.talk.models.json.generic.GenericOverall
-import com.nextcloud.talk.models.json.participants.Participant
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.CIRCLES
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.GROUPS
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.USERS
-import com.nextcloud.talk.models.json.participants.ParticipantsOverall
-import com.nextcloud.talk.repositories.conversations.ConversationsRepository
+import com.nextcloud.talk.models.json.participants.ParticipantDto
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.CIRCLES
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.GROUPS
+import com.nextcloud.talk.models.json.upcomingEvents.UpcomingEventDto
+import com.nextcloud.talk.passwordpolicy.PasswordPolicyField
+import com.nextcloud.talk.passwordpolicy.PasswordValidationState
+import com.nextcloud.talk.passwordpolicy.isPasswordAccepted
 import com.nextcloud.talk.shareditems.activities.SharedItemsActivity
+import com.nextcloud.talk.threadsoverview.ThreadsOverviewActivity
+import com.nextcloud.talk.ui.dialog.DialogBanListFragment
 import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.ConversationUtils
-import com.nextcloud.talk.utils.DateConstants
 import com.nextcloud.talk.utils.DateUtils
 import com.nextcloud.talk.utils.ShareUtils
-import com.nextcloud.talk.utils.SpreedFeatures
+import com.nextcloud.talk.utils.ShortcutManagerHelper
 import com.nextcloud.talk.utils.bundle.BundleKeys
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
-import com.nextcloud.talk.utils.preferences.preferencestorage.DatabaseStorageModule
-import eu.davidea.flexibleadapter.FlexibleAdapter
-import eu.davidea.flexibleadapter.common.SmoothScrollLinearLayoutManager
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
+import com.nextcloud.talk.utils.copyPasswordToClipboard
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.launch
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
-import java.util.Calendar
-import java.util.Collections
-import java.util.Locale
+import org.json.JSONObject
+import retrofit2.HttpException
+import java.time.Instant
+import java.time.ZoneId
+import java.time.ZonedDateTime
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
-class ConversationInfoActivity :
-    BaseActivity(),
-    FlexibleAdapter.OnItemClickListener {
-    private lateinit var binding: ActivityConversationInfoBinding
+@Suppress("LargeClass", "TooManyFunctions")
+class ConversationInfoActivity : BaseActivity() {
 
     @Inject
     lateinit var viewModelFactory: ViewModelProvider.Factory
@@ -104,65 +118,82 @@ class ConversationInfoActivity :
     lateinit var ncApi: NcApi
 
     @Inject
-    lateinit var currentUserProvider: CurrentUserProviderNew
-
-    @Inject
-    lateinit var conversationsRepository: ConversationsRepository
-
-    @Inject
     lateinit var dateUtils: DateUtils
 
     lateinit var viewModel: ConversationInfoViewModel
 
-    private lateinit var spreedCapabilities: SpreedCapability
-
     private lateinit var conversationToken: String
     private lateinit var conversationUser: User
-    private var hasAvatarSpacing: Boolean = false
     private lateinit var credentials: String
-    private var roomDisposable: Disposable? = null
-    private var participantsDisposable: Disposable? = null
 
-    private var databaseStorageModule: DatabaseStorageModule? = null
-
-    // private var conversation: Conversation? = null
-    private var conversation: ConversationModel? = null
-
-    private var adapter: FlexibleAdapter<ParticipantItem>? = null
-    private var userItems: MutableList<ParticipantItem> = ArrayList()
-
-    private lateinit var optionsMenu: Menu
+    private var startGroupChat: Boolean = false
 
     private val workerData: Data?
         get() {
-            if (!TextUtils.isEmpty(conversationToken)) {
-                val data = Data.Builder()
-                data.putString(BundleKeys.KEY_ROOM_TOKEN, conversationToken)
-                data.putLong(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id!!)
-                return data.build()
+            return if (conversationToken.isNotEmpty()) {
+                Data.Builder()
+                    .putString(KEY_ROOM_TOKEN, conversationToken)
+                    .putLong(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id!!)
+                    .build()
+            } else {
+                null
             }
-
-            return null
         }
+
+    private val addParticipantsResult = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        executeIfResultOk(result) { intent ->
+            val selectedAutocompleteUsers =
+                intent?.getParcelableArrayListExtraProvider<AutocompleteUserDto>("selectedParticipants")
+                    ?: emptyList()
+            if (startGroupChat) {
+                viewModel.createRoomFromOneToOne(
+                    conversationUser,
+                    viewModel.uiState.value.participants.map { it.participant },
+                    selectedAutocompleteUsers,
+                    conversationToken
+                )
+            } else {
+                addParticipantsToConversation(selectedAutocompleteUsers)
+            }
+        }
+    }
+
+    private val editConversationResult = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            viewModel.getRoom(conversationUser, conversationToken)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        conversationUser = setUpBoundUserOrFinish() ?: return
 
-        binding = ActivityConversationInfoBinding.inflate(layoutInflater)
-        setupActionBar()
-        setContentView(binding.root)
-        setupSystemColors()
+        conversationToken = requireNotNull(
+            intent.getStringExtra(KEY_ROOM_TOKEN)
+        ) { "Missing room token" }
 
-        viewModel =
-            ViewModelProvider(this, viewModelFactory)[ConversationInfoViewModel::class.java]
+        val upcomingEvent = intent.getParcelableExtraProvider<UpcomingEventDto>(BundleKeys.KEY_UPCOMING_EVENT)
+        val upcomingEventSummary = upcomingEvent?.summary
+        val upcomingEventTime = upcomingEvent?.start?.let { start ->
+            val startDateTime = Instant.ofEpochSecond(start).atZone(ZoneId.systemDefault())
+            val currentTime = ZonedDateTime.now(ZoneId.systemDefault())
+            dateUtils.getStringForMeetingStartDateTime(startDateTime, currentTime)
+        }
 
-        conversationUser = currentUserProvider.currentUser.blockingGet()
+        viewModel = ViewModelProvider(this, viewModelFactory)[ConversationInfoViewModel::class.java]
 
-        conversationToken = intent.getStringExtra(BundleKeys.KEY_ROOM_TOKEN)!!
-        hasAvatarSpacing = intent.getBooleanExtra(BundleKeys.KEY_ROOM_ONE_TO_ONE, false)
         credentials = ApiUtils.getCredentials(conversationUser.username, conversationUser.token)!!
-        initObservers()
+        viewModel.getRoom(conversationUser, conversationToken)
+        if (upcomingEventSummary != null || upcomingEventTime != null) {
+            viewModel.setUpcomingEvent(upcomingEventSummary, upcomingEventTime)
+        }
+
+        setupCompose()
     }
 
     override fun onStart() {
@@ -175,1224 +206,750 @@ class ConversationInfoActivity :
         this.lifecycle.removeObserver(ConversationInfoViewModel.LifeCycleObserver)
     }
 
-    override fun onResume() {
-        super.onResume()
-
-        if (databaseStorageModule == null) {
-            databaseStorageModule = DatabaseStorageModule(conversationUser, conversationToken)
-        }
-
-        binding.deleteConversationAction.setOnClickListener { showDeleteConversationDialog() }
-        binding.leaveConversationAction.setOnClickListener { leaveConversation() }
-        binding.clearConversationHistory.setOnClickListener { showClearHistoryDialog() }
-        binding.addParticipantsAction.setOnClickListener { addParticipants() }
-
-        viewModel.getRoom(conversationUser, conversationToken)
-
-        themeTextViews()
-        themeSwitchPreferences()
-
-        binding.addParticipantsAction.visibility = GONE
-
-        binding.progressBar.let { viewThemeUtils.platform.colorCircularProgressBar(it, ColorRole.PRIMARY) }
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    fun onMessageEvent(eventStatus: EventStatus) {
+        viewModel.loadParticipants(conversationUser, conversationToken)
     }
 
-    private fun initObservers() {
-        viewModel.viewState.observe(this) { state ->
-            when (state) {
-                is ConversationInfoViewModel.GetRoomSuccessState -> {
-                    conversation = state.conversationModel
-                    viewModel.getCapabilities(conversationUser, conversationToken, conversation!!)
-                    if (ConversationUtils.isNoteToSelfConversation(conversation)) {
-                        binding.shareConversationButton.visibility = GONE
-                    }
-                    binding.shareConversationButton.setOnClickListener {
-                        ShareUtils.shareConversationLink(
-                            this,
-                            conversationUser.baseUrl,
-                            conversation?.token,
-                            conversation?.name
-                        )
+    private fun setupCompose() {
+        val colorScheme = viewThemeUtils.getColorScheme(this)
+        setContent {
+            val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+            val snackbarHostState = remember { SnackbarHostState() }
+
+            LaunchedEffect(Unit) {
+                viewModel.uiEvent.collect { event ->
+                    when (event) {
+                        is ConversationInfoUiEvent.ShowSnackbar ->
+                            snackbarHostState.showSnackbar(getString(event.resId))
+                        is ConversationInfoUiEvent.ShowSnackbarText ->
+                            snackbarHostState.showSnackbar(event.text)
+                        is ConversationInfoUiEvent.NavigateToChat -> {
+                            startActivity(
+                                ChatActivity.createIntent(
+                                    this@ConversationInfoActivity,
+                                    conversationUser.id!!,
+                                    event.token
+                                )
+                            )
+                        }
+                        ConversationInfoUiEvent.RefreshParticipants ->
+                            viewModel.loadParticipants(conversationUser, conversationToken)
                     }
                 }
+            }
 
-                is ConversationInfoViewModel.GetRoomErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
+            var passwordRequest by remember { mutableStateOf<PasswordRequest?>(null) }
+            var showLobbyTimerPicker by rememberSaveable { mutableStateOf(false) }
+
+            MaterialTheme(colorScheme = colorScheme) {
+                ColoredStatusBar()
+                ConversationInfoScreen(
+                    state = uiState,
+                    callbacks = buildCallbacks(
+                        onPasswordRequest = { passwordRequest = it },
+                        onLobbyTimerRequest = { showLobbyTimerPicker = true }
+                    )
+                )
+                if (showLobbyTimerPicker) {
+                    LobbyTimerPicker(uiState.conversation?.lobbyTimer ?: 0L) { showLobbyTimerPicker = false }
                 }
-
-                else -> {}
-            }
-        }
-
-        viewModel.getCapabilitiesViewState.observe(this) { state ->
-            when (state) {
-                is ConversationInfoViewModel.GetCapabilitiesSuccessState -> {
-                    spreedCapabilities = state.spreedCapabilities
-
-                    handleConversation()
-                }
-
-                else -> {}
-            }
-        }
-    }
-
-    private fun setupActionBar() {
-        setSupportActionBar(binding.conversationInfoToolbar)
-        binding.conversationInfoToolbar.setNavigationOnClickListener {
-            onBackPressedDispatcher.onBackPressed()
-        }
-        supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(android.R.color.transparent, null)))
-        supportActionBar?.title = if (hasAvatarSpacing) {
-            " " + resources!!.getString(R.string.nc_conversation_menu_conversation_info)
-        } else {
-            resources!!.getString(R.string.nc_conversation_menu_conversation_info)
-        }
-        viewThemeUtils.material.themeToolbar(binding.conversationInfoToolbar)
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        super.onCreateOptionsMenu(menu)
-        optionsMenu = menu
-        return true
-    }
-
-    fun showOptionsMenu() {
-        if (::optionsMenu.isInitialized) {
-            optionsMenu.clear()
-            if (CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.AVATAR)) {
-                menuInflater.inflate(R.menu.menu_conversation_info, optionsMenu)
-            }
-        }
-    }
-
-    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
-        super.onPrepareOptionsMenu(menu)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == R.id.edit) {
-            val bundle = Bundle()
-            bundle.putString(BundleKeys.KEY_ROOM_TOKEN, conversationToken)
-
-            val intent = Intent(this, ConversationInfoEditActivity::class.java)
-            intent.putExtras(bundle)
-            startActivity(intent)
-        }
-        return true
-    }
-
-    private fun themeSwitchPreferences() {
-        binding.run {
-            listOf(
-                binding.webinarInfoView.lobbySwitch,
-                binding.notificationSettingsView.callNotificationsSwitch,
-                binding.notificationSettingsView.importantConversationSwitch,
-                binding.guestAccessView.allowGuestsSwitch,
-                binding.guestAccessView.passwordProtectionSwitch,
-                binding.recordingConsentView.recordingConsentForConversationSwitch
-            ).forEach(viewThemeUtils.talk::colorSwitch)
-        }
-    }
-
-    private fun themeTextViews() {
-        binding.run {
-            listOf(
-                binding.notificationSettingsView.notificationSettingsCategory,
-                binding.webinarInfoView.webinarSettingsCategory,
-                binding.guestAccessView.guestAccessSettingsCategory,
-                binding.sharedItemsTitle,
-                binding.recordingConsentView.recordingConsentSettingsCategory,
-                binding.conversationSettingsTitle,
-                binding.participantsListCategory
-            )
-        }.forEach(viewThemeUtils.platform::colorTextView)
-    }
-
-    private fun showSharedItems() {
-        val intent = Intent(this, SharedItemsActivity::class.java)
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        intent.putExtra(BundleKeys.KEY_CONVERSATION_NAME, conversation?.displayName)
-        intent.putExtra(BundleKeys.KEY_ROOM_TOKEN, conversationToken)
-        intent.putExtra(
-            SharedItemsActivity.KEY_USER_IS_OWNER_OR_MODERATOR,
-            ConversationUtils.isParticipantOwnerOrModerator(conversation!!)
-        )
-        startActivity(intent)
-    }
-
-    private fun setupWebinaryView() {
-        if (CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.WEBINARY_LOBBY) &&
-            webinaryRoomType(conversation!!) &&
-            ConversationUtils.canModerate(conversation!!, spreedCapabilities)
-        ) {
-            binding.webinarInfoView.webinarSettings.visibility = VISIBLE
-
-            val isLobbyOpenToModeratorsOnly =
-                conversation!!.lobbyState == LobbyState.LOBBY_STATE_MODERATORS_ONLY
-            binding.webinarInfoView.lobbySwitch.isChecked = isLobbyOpenToModeratorsOnly
-
-            reconfigureLobbyTimerView()
-
-            binding.webinarInfoView.startTimeButton.setOnClickListener {
-                MaterialDialog(this, BottomSheet(WRAP_CONTENT)).show {
-                    val currentTimeCalendar = Calendar.getInstance()
-                    if (conversation!!.lobbyTimer != null && conversation!!.lobbyTimer != 0L) {
-                        currentTimeCalendar.timeInMillis = conversation!!.lobbyTimer!! * DateConstants.SECOND_DIVIDER
-                    }
-
-                    dateTimePicker(
-                        minDateTime = Calendar.getInstance(),
-                        requireFutureDateTime = true,
-                        currentDateTime = currentTimeCalendar,
-                        show24HoursView = true,
-                        dateTimeCallback = { _, dateTime ->
-                            reconfigureLobbyTimerView(dateTime)
-                            submitLobbyChanges()
+                passwordRequest?.let { request ->
+                    val validationState by viewModel.passwordValidation.state.collectAsStateWithLifecycle()
+                    GuestAccessPasswordDialog(
+                        validationState = validationState,
+                        onPasswordChanged = viewModel.passwordValidation::validate,
+                        onDismiss = {
+                            passwordRequest = null
+                            viewModel.passwordValidation.reset()
+                        },
+                        onSave = { password, copyAfterSave ->
+                            onGuestPasswordSave(request, password, copyAfterSave)
+                            passwordRequest = null
+                            viewModel.passwordValidation.reset()
                         }
                     )
                 }
             }
-
-            binding.webinarInfoView.webinarSettingsLobby.setOnClickListener {
-                binding.webinarInfoView.lobbySwitch.isChecked = !binding.webinarInfoView.lobbySwitch.isChecked
-                reconfigureLobbyTimerView()
-                submitLobbyChanges()
-            }
-        } else {
-            binding.webinarInfoView.webinarSettings.visibility = GONE
         }
     }
 
-    private fun webinaryRoomType(conversation: ConversationModel): Boolean {
-        return conversation.type == ConversationType.ROOM_GROUP_CALL ||
-            conversation.type == ConversationType.ROOM_PUBLIC_CALL
-    }
-
-    private fun reconfigureLobbyTimerView(dateTime: Calendar? = null) {
-        val isChecked = binding.webinarInfoView.lobbySwitch.isChecked
-
-        if (dateTime != null && isChecked) {
-            conversation!!.lobbyTimer = (
-                dateTime.timeInMillis - (dateTime.time.seconds * DateConstants.SECOND_DIVIDER)
-                ) / DateConstants.SECOND_DIVIDER
-        } else if (!isChecked) {
-            conversation!!.lobbyTimer = 0
-        }
-
-        conversation!!.lobbyState = if (isChecked) {
-            LobbyState.LOBBY_STATE_MODERATORS_ONLY
-        } else {
-            LobbyState.LOBBY_STATE_ALL_PARTICIPANTS
-        }
-
-        if (
-            conversation!!.lobbyTimer != null &&
-            conversation!!.lobbyTimer != Long.MIN_VALUE &&
-            conversation!!.lobbyTimer != 0L
-        ) {
-            binding.webinarInfoView.startTimeButtonSummary.text = (
-                dateUtils.getLocalDateTimeStringFromTimestamp(
-                    conversation!!.lobbyTimer!! * DateConstants.SECOND_DIVIDER
-                )
-                )
-        } else {
-            binding.webinarInfoView.startTimeButtonSummary.setText(R.string.nc_manual)
-        }
-
-        if (isChecked) {
-            binding.webinarInfoView.startTimeButton.visibility = VISIBLE
-        } else {
-            binding.webinarInfoView.startTimeButton.visibility = GONE
-        }
-    }
-
-    private fun submitLobbyChanges() {
-        val state = if (binding.webinarInfoView.lobbySwitch.isChecked) {
-            1
-        } else {
-            0
-        }
-
-        val apiVersion = ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, 1))
-
-        ncApi.setLobbyForConversation(
-            ApiUtils.getCredentials(conversationUser.username, conversationUser.token),
-            ApiUtils.getUrlForRoomWebinaryLobby(apiVersion, conversationUser.baseUrl!!, conversation!!.token),
-            state,
-            conversation!!.lobbyTimer
+    @Composable
+    private fun LobbyTimerPicker(initialEpochSeconds: Long, onClose: () -> Unit) {
+        LobbyTimerPickerDialog(
+            initialEpochSeconds = initialEpochSeconds,
+            onConfirm = { seconds ->
+                onClose()
+                viewModel.setLobbyTimerAndSubmit(conversationUser, conversationToken, seconds)
+            },
+            onClear = {
+                onClose()
+                viewModel.setLobbyTimerAndSubmit(conversationUser, conversationToken, 0L)
+            },
+            onDismiss = onClose
         )
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onNext(t: GenericOverall) {
-                    // unused atm
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "Failed to setLobbyForConversation", e)
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                }
-            })
     }
 
-    @Subscribe(threadMode = ThreadMode.MAIN)
-    fun onMessageEvent(eventStatus: EventStatus) {
-        getListOfParticipants()
+    private fun onGuestPasswordSave(request: PasswordRequest, password: String, copyAfterSave: Boolean) {
+        if (copyAfterSave) {
+            copyPassword(password)
+        }
+        when (request) {
+            PasswordRequest.SET -> {
+                val apiVersion = ApiUtils.getConversationApiVersion(
+                    conversationUser,
+                    intArrayOf(ApiUtils.API_V4, ApiUtils.API_V1)
+                )
+                viewModel.setPassword(
+                    user = conversationUser,
+                    url = ApiUtils.getUrlForRoomPassword(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                    password = password
+                )
+            }
+            PasswordRequest.ALLOW_GUESTS -> viewModel.allowGuests(conversationUser, conversationToken, true, password)
+        }
+    }
+
+    private fun isPasswordEnforced(): Boolean =
+        CapabilitiesUtil.isPasswordEnforced(viewModel.uiState.value.spreedCapabilities)
+
+    private fun showSnackbar(@StringRes messageRes: Int) {
+        lifecycleScope.launch { viewModel.emitSnackbar(messageRes) }
+    }
+
+    private fun copyPassword(password: String) {
+        copyPasswordToClipboard(
+            context = this,
+            label = resources.getString(R.string.nc_app_product_name),
+            password = password
+        )
+    }
+
+    @Suppress("LongMethod", "CyclomaticComplexMethod")
+    private fun buildCallbacks(onPasswordRequest: (PasswordRequest) -> Unit, onLobbyTimerRequest: () -> Unit) =
+        ConversationInfoScreenCallbacks(
+            onNavigateBack = { onBackPressedDispatcher.onBackPressed() },
+            onEditConversation = {
+                editConversationResult.launch(
+                    Intent(this, ConversationInfoEditActivity::class.java).apply {
+                        putExtra(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id)
+                        putExtra(KEY_ROOM_TOKEN, conversationToken)
+                    }
+                )
+            },
+            onMessageNotificationLevelClick = { showNotificationLevelDialog() },
+            onCallNotificationsClick = { viewModel.toggleCallNotifications() },
+            onImportantConversationClick = {
+                viewModel.toggleImportantConversation(credentials, conversationUser.baseUrl!!, conversationToken)
+            },
+            onSensitiveConversationClick = {
+                viewModel.toggleSensitiveConversation(credentials, conversationUser.baseUrl!!, conversationToken)
+            },
+            onLobbyClick = { viewModel.toggleLobby(conversationUser, conversationToken) },
+            onLobbyTimerClick = onLobbyTimerRequest,
+            onAllowGuestsClick = {
+                val state = viewModel.uiState.value
+                val allow = !state.guestsAllowed
+                if (allow && isPasswordEnforced() && !state.hasPassword) {
+                    onPasswordRequest(PasswordRequest.ALLOW_GUESTS)
+                } else {
+                    viewModel.allowGuests(conversationUser, conversationToken, allow)
+                }
+            },
+            onPasswordProtectionClick = {
+                if (!viewModel.uiState.value.hasPassword) {
+                    onPasswordRequest(PasswordRequest.SET)
+                } else {
+                    val apiVersion =
+                        ApiUtils.getConversationApiVersion(
+                            conversationUser,
+                            intArrayOf(ApiUtils.API_V4, ApiUtils.API_V1)
+                        )
+                    viewModel.setPassword(
+                        user = conversationUser,
+                        url = ApiUtils.getUrlForRoomPassword(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                        password = ""
+                    )
+                }
+            },
+            onResendInvitationsClick = {
+                viewModel.resendInvitations(conversationUser, conversationToken)
+            },
+            onSharedItemsClick = { showSharedItems() },
+            onThreadsClick = { openThreadsOverview() },
+            onRecordingConsentClick = {
+                viewModel.toggleRecordingConsent(conversationUser, conversationToken)
+            },
+            onMessageExpirationClick = { showMessageExpirationDialog() },
+            onShareConversationClick = {
+                val state = viewModel.uiState.value
+                ShareUtils.shareConversationLink(
+                    this,
+                    conversationUser.baseUrl,
+                    state.conversationToken,
+                    CapabilitiesUtil.canGeneratePrettyURL(conversationUser)
+                )
+            },
+            onLockConversationClick = {
+                viewModel.toggleLock(conversationUser, conversationToken)
+            },
+            onParticipantClick = { model -> handleParticipantClick(model) },
+            onParticipantOpsDismiss = { viewModel.setParticipantForOps(null) },
+            onParticipantOpsAction = { action, model -> handleParticipantOpsAction(action, model) },
+            onAddParticipantsClick = {
+                startGroupChat = false
+                selectParticipantsToAdd()
+            },
+            onStartGroupChatClick = {
+                startGroupChat = true
+                selectParticipantsToAdd()
+            },
+            onListBansClick = { listBans() },
+            onArchiveClick = { viewModel.toggleArchive(conversationUser, conversationToken) },
+            onLeaveConversationClick = { leaveConversation() },
+            onClearHistoryClick = { showClearHistoryDialog() },
+            onDeleteConversationClick = { showDeleteConversationDialog() }
+        )
+
+    private fun showSharedItems() {
+        val conv = viewModel.uiState.value.conversation ?: return
+        startActivity(
+            Intent(this, SharedItemsActivity::class.java).apply {
+                putExtra(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id)
+                putExtra(BundleKeys.KEY_CONVERSATION_NAME, conv.displayName)
+                putExtra(KEY_ROOM_TOKEN, conversationToken)
+                putExtra(
+                    SharedItemsActivity.KEY_USER_IS_OWNER_OR_MODERATOR,
+                    ConversationUtils.isParticipantOwnerOrModerator(conv)
+                )
+                putExtra(
+                    SharedItemsActivity.KEY_IS_ONE_2_ONE,
+                    conv.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+                )
+            }
+        )
+    }
+
+    fun openThreadsOverview() {
+        val threadsUrl = ApiUtils.getUrlForRecentThreads(
+            version = 1,
+            baseUrl = conversationUser.baseUrl,
+            token = conversationToken
+        )
+        startActivity(
+            Intent(context, ThreadsOverviewActivity::class.java).apply {
+                putExtra(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id)
+                putExtra(KEY_ROOM_TOKEN, conversationToken)
+                putExtra(ThreadsOverviewActivity.KEY_APPBAR_TITLE, getString(R.string.recent_threads))
+                putExtra(ThreadsOverviewActivity.KEY_THREADS_SOURCE_URL, threadsUrl)
+            }
+        )
+    }
+
+    private fun showNotificationLevelDialog() {
+        val descriptions = resources.getStringArray(R.array.message_notification_levels)
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.nc_plain_old_messages)
+            .setItems(descriptions) { _, position -> viewModel.saveNotificationLevel(position) }
+            .setNegativeButton(R.string.nc_cancel, null)
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(dialog.getButton(AlertDialog.BUTTON_NEGATIVE))
+    }
+
+    private fun showMessageExpirationDialog() {
+        val descriptions = resources.getStringArray(R.array.message_expiring_descriptions)
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.nc_expire_messages)
+            .setItems(descriptions) { _, position -> viewModel.saveMessageExpiration(position) }
+            .setNegativeButton(R.string.nc_cancel, null)
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(dialog.getButton(AlertDialog.BUTTON_NEGATIVE))
     }
 
     private fun showDeleteConversationDialog() {
-        binding.conversationInfoName.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_delete_black_24dp
-                    )
-                )
-                .setTitle(R.string.nc_delete_call)
-                .setMessage(R.string.nc_delete_conversation_more)
-                .setPositiveButton(R.string.nc_delete) { _, _ ->
-                    deleteConversation()
-                }
-                .setNegativeButton(R.string.nc_cancel) { _, _ ->
-                    // unused atm
-                }
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.ic_delete_black_24dp))
+            .setTitle(R.string.nc_delete_call)
+            .setMessage(R.string.nc_delete_conversation_more)
+            .setPositiveButton(R.string.nc_delete) { _, _ -> deleteConversation() }
+            .setNegativeButton(R.string.nc_cancel, null)
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        )
+    }
 
-            viewThemeUtils.dialog
-                .colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+    private fun listBans() {
+        val transaction = supportFragmentManager.beginTransaction()
+        transaction.setTransition(FragmentTransaction.TRANSIT_FRAGMENT_OPEN)
+        transaction.add(android.R.id.content, DialogBanListFragment.newInstance(conversationToken, conversationUser))
+            .addToBackStack(null)
+            .commit()
+    }
+
+    private fun executeIfResultOk(result: ActivityResult, onResult: (intent: Intent?) -> Unit) {
+        if (result.resultCode == RESULT_OK) {
+            onResult(result.data)
+        } else {
+            Log.e(ChatActivity.TAG, "resultCode for received intent was != ok")
+        }
+    }
+
+    private fun selectParticipantsToAdd() {
+        val existingParticipants = ArrayList<AutocompleteUserDto>()
+        for (model in viewModel.uiState.value.participants) {
+            existingParticipants.add(
+                AutocompleteUserDto(
+                    model.participant.calculatedActorId!!,
+                    model.participant.displayName,
+                    model.participant.calculatedActorType.name.lowercase()
+                )
             )
         }
-    }
-
-    private fun setupAdapter() {
-        if (adapter == null) {
-            adapter = FlexibleAdapter(userItems, this, true)
-        }
-
-        val layoutManager = SmoothScrollLinearLayoutManager(this)
-        binding.recyclerView.layoutManager = layoutManager
-        binding.recyclerView.setHasFixedSize(false)
-        binding.recyclerView.adapter = adapter
-        binding.recyclerView.isNestedScrollingEnabled = false
-        adapter!!.addListener(this)
-    }
-
-    private fun handleParticipants(participants: List<Participant>) {
-        var userItem: ParticipantItem
-        var participant: Participant
-
-        userItems = ArrayList()
-        var ownUserItem: ParticipantItem? = null
-
-        for (i in participants.indices) {
-            participant = participants[i]
-            userItem = ParticipantItem(this, participant, conversationUser, viewThemeUtils, conversationToken)
-            if (participant.sessionId != null) {
-                userItem.isOnline = !participant.sessionId.equals("0")
-            } else {
-                userItem.isOnline = participant.sessionIds.isNotEmpty()
+        addParticipantsResult.launch(
+            Intent(this, ContactsActivity::class.java).apply {
+                putExtra(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id)
+                putExtra(BundleKeys.KEY_ADD_PARTICIPANTS, true)
+                putParcelableArrayListExtra("selectedParticipants", existingParticipants)
+                putExtra(KEY_HIDE_ALREADY_EXISTING_PARTICIPANTS, true)
+                putExtra(BundleKeys.KEY_TOKEN, conversationToken)
+                putExtra(BundleKeys.KEY_ONLY_LOCAL_PARTICIPANTS, viewModel.uiState.value.isClassified)
             }
-
-            if (participant.calculatedActorType == USERS &&
-                participant.calculatedActorId == conversationUser.userId
-            ) {
-                ownUserItem = userItem
-                ownUserItem.model.sessionId = "-1"
-                ownUserItem.isOnline = true
-            } else {
-                userItems.add(userItem)
-            }
-        }
-
-        Collections.sort(userItems, ParticipantItemComparator())
-
-        if (ownUserItem != null) {
-            userItems.add(0, ownUserItem)
-        }
-
-        setupAdapter()
-
-        binding.participants.visibility = VISIBLE
-        adapter!!.updateDataSet(userItems)
-    }
-
-    private fun getListOfParticipants() {
-        // FIXME Fix API checking with guests?
-        val apiVersion: Int = ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, 1))
-
-        val fieldMap = HashMap<String, Boolean>()
-        fieldMap["includeStatus"] = true
-
-        ncApi.getPeersForCall(
-            credentials,
-            ApiUtils.getUrlForParticipants(
-                apiVersion,
-                conversationUser.baseUrl!!,
-                conversationToken
-            ),
-            fieldMap
         )
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ParticipantsOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    participantsDisposable = d
-                }
-
-                @Suppress("Detekt.TooGenericExceptionCaught")
-                override fun onNext(participantsOverall: ParticipantsOverall) {
-                    handleParticipants(participantsOverall.ocs!!.data!!)
-                }
-
-                override fun onError(e: Throwable) {
-                    // unused atm
-                }
-
-                override fun onComplete() {
-                    participantsDisposable!!.dispose()
-                }
-            })
     }
 
-    private fun addParticipants() {
-        val bundle = Bundle()
-        val existingParticipantsId = arrayListOf<String>()
+    private fun addParticipantsToConversation(autocompleteUsers: List<AutocompleteUserDto>) {
+        val groupIds = mutableSetOf<String>()
+        val emailIds = mutableSetOf<String>()
+        val circleIds = mutableSetOf<String>()
+        val userIds = mutableSetOf<String>()
 
-        for (userItem in userItems) {
-            if (userItem.model.calculatedActorType == USERS) {
-                existingParticipantsId.add(userItem.model.calculatedActorId!!)
+        autocompleteUsers.forEach { participant ->
+            when (participant.source) {
+                GROUPS.name.lowercase() -> groupIds.add(participant.id!!)
+                ParticipantDto.ActorType.EMAILS.name.lowercase() -> emailIds.add(participant.id!!)
+                CIRCLES.name.lowercase() -> circleIds.add(participant.id!!)
+                else -> userIds.add(participant.id!!)
             }
         }
 
-        bundle.putBoolean(BundleKeys.KEY_ADD_PARTICIPANTS, true)
-        bundle.putStringArrayList(BundleKeys.KEY_EXISTING_PARTICIPANTS, existingParticipantsId)
-        bundle.putString(BundleKeys.KEY_TOKEN, conversation!!.token)
+        val data = Data.Builder()
+            .putLong(BundleKeys.KEY_INTERNAL_USER_ID, conversationUser.id!!)
+            .putString(BundleKeys.KEY_TOKEN, conversationToken)
+            .putStringArray(BundleKeys.KEY_SELECTED_USERS, userIds.toTypedArray())
+            .putStringArray(BundleKeys.KEY_SELECTED_GROUPS, groupIds.toTypedArray())
+            .putStringArray(BundleKeys.KEY_SELECTED_EMAILS, emailIds.toTypedArray())
+            .putStringArray(BundleKeys.KEY_SELECTED_CIRCLES, circleIds.toTypedArray())
+            .build()
 
-        val intent = Intent(this, ContactsActivity::class.java)
-        intent.putExtras(bundle)
-        startActivity(intent)
+        val addParticipantsWorker =
+            OneTimeWorkRequest.Builder(AddParticipantsToConversationWorker::class.java)
+                .setInputData(data)
+                .setExpeditedIfSupported()
+                .build()
+        WorkManager.getInstance().enqueue(addParticipantsWorker)
+        val names = autocompleteUsers.associate { it.id.orEmpty() to it.label.orEmpty() }
+        WorkManager.getInstance(context).getWorkInfoByIdLiveData(addParticipantsWorker.id)
+            .observe(this) { workInfo: WorkInfo? ->
+                when (workInfo?.state) {
+                    WorkInfo.State.SUCCEEDED -> {
+                        viewModel.loadParticipants(conversationUser, conversationToken)
+                        reportParticipantsNotAdded(workInfo.outputData, names)
+                    }
+                    WorkInfo.State.FAILED -> reportParticipantsNotAdded(workInfo.outputData, names)
+                    else -> { /* unused */ }
+                }
+            }
+    }
+
+    private fun reportParticipantsNotAdded(outputData: Data, names: Map<String, String>) {
+        val failed = outputData
+            .getStringArray(AddParticipantsToConversationWorker.KEY_FAILED_PARTICIPANTS)
+            ?.map { names[it]?.takeIf(String::isNotEmpty) ?: it }
+            .orEmpty()
+        if (failed.isEmpty()) {
+            return
+        }
+        val message = getString(
+            R.string.nc_conversation_created_invalid_participants_named,
+            failed.joinToString(", ")
+        )
+        lifecycleScope.launch { viewModel.emitSnackbar(message) }
     }
 
     private fun leaveConversation() {
-        workerData?.let {
-            WorkManager.getInstance(context).enqueue(
-                OneTimeWorkRequest.Builder(
-                    LeaveConversationWorker::class
-                        .java
-                ).setInputData(it).build()
+        workerData?.let { data ->
+            val workRequest = OneTimeWorkRequest.Builder(LeaveConversationWorker::class.java)
+                .setInputData(data)
+                .setExpeditedIfSupported()
+                .build()
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "leave_conversation_work",
+                ExistingWorkPolicy.REPLACE,
+                workRequest
             )
+            WorkManager.getInstance(context).getWorkInfoByIdLiveData(workRequest.id)
+                .observe(this) { workInfo: WorkInfo? ->
+                    if (workInfo != null) {
+                        when (workInfo.state) {
+                            WorkInfo.State.SUCCEEDED -> {
+                                conversationUser.id?.let { userId ->
+                                    ShortcutManagerHelper.disableConversationShortcut(
+                                        context,
+                                        conversationToken,
+                                        userId,
+                                        context.resources.getString(R.string.nc_shortcut_conversation_deleted)
+                                    )
+                                }
 
-            val intent = Intent(context, MainActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            startActivity(intent)
+                                showConversationList()
+                            }
+                            WorkInfo.State.FAILED -> {
+                                val errorType = workInfo.outputData.getString("error_type")
+                                lifecycleScope.launch {
+                                    viewModel.emitSnackbar(
+                                        if (errorType ==
+                                            LeaveConversationWorker.ERROR_NO_OTHER_MODERATORS_OR_OWNERS_LEFT
+                                        ) {
+                                            R.string.nc_last_moderator_leaving_room_warning
+                                        } else {
+                                            logger.e(TAG, "Failed to leave conversation, error_type: $errorType")
+                                            R.string.nc_common_error_sorry
+                                        }
+                                    )
+                                }
+                            }
+                            else -> { /* unused */ }
+                        }
+                    }
+                }
         }
     }
 
     private fun showClearHistoryDialog() {
-        binding.conversationInfoName.context.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_delete_black_24dp
-                    )
-                )
-                .setTitle(R.string.nc_clear_history)
-                .setMessage(R.string.nc_clear_history_warning)
-                .setPositiveButton(R.string.nc_delete_all) { _, _ ->
-                    clearHistory()
-                }
-                .setNegativeButton(R.string.nc_cancel) { _, _ ->
-                    // unused atm
-                }
-
-            viewThemeUtils.dialog
-                .colorMaterialAlertDialogBackground(it, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
-            )
-        }
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.ic_delete_black_24dp))
+            .setTitle(R.string.nc_clear_history)
+            .setMessage(R.string.nc_clear_history_warning)
+            .setPositiveButton(R.string.nc_delete_all) { _, _ -> clearHistory() }
+            .setNegativeButton(R.string.nc_cancel, null)
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        )
     }
 
     private fun clearHistory() {
-        val apiVersion = ApiUtils.getChatApiVersion(spreedCapabilities, intArrayOf(1))
-
-        ncApi.clearChatHistory(
-            credentials,
+        val caps = viewModel.uiState.value.spreedCapabilities ?: return
+        val apiVersion = ApiUtils.getChatApiVersion(caps, intArrayOf(1))
+        viewModel.clearChatHistory(
+            conversationUser,
             ApiUtils.getUrlForChat(apiVersion, conversationUser.baseUrl!!, conversationToken)
         )
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onNext(genericOverall: GenericOverall) {
-                    Snackbar.make(
-                        binding.root,
-                        context.getString(R.string.nc_clear_history_success),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                }
-
-                override fun onError(e: Throwable) {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                    Log.e(TAG, "failed to clear chat history", e)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
     }
 
     private fun deleteConversation() {
         workerData?.let {
             WorkManager.getInstance(context).enqueue(
-                OneTimeWorkRequest.Builder(
-                    DeleteConversationWorker::class.java
-                ).setInputData(it).build()
+                OneTimeWorkRequest.Builder(DeleteConversationWorker::class.java)
+                    .setInputData(it)
+                    .setExpeditedIfSupported()
+                    .build()
             )
-            val intent = Intent(context, MainActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            startActivity(intent)
-        }
-    }
 
-    @Suppress("LongMethod")
-    private fun handleConversation() {
-        val conversationCopy = conversation!!
-
-        setUpNotificationSettings(databaseStorageModule!!)
-
-        if (CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.RICH_OBJECT_LIST_MEDIA) &&
-            conversationCopy.remoteServer.isNullOrEmpty()
-        ) {
-            binding.sharedItemsButton.setOnClickListener { showSharedItems() }
-        } else {
-            binding.sharedItems.visibility = GONE
-        }
-
-        if (ConversationUtils.canModerate(conversationCopy, spreedCapabilities)) {
-            binding.addParticipantsAction.visibility = VISIBLE
-            if (CapabilitiesUtil.hasSpreedFeatureCapability(
-                    spreedCapabilities,
-                    SpreedFeatures.CLEAR_HISTORY
-                )
-            ) {
-                binding.clearConversationHistory.visibility = VISIBLE
-            } else {
-                binding.clearConversationHistory.visibility = GONE
-            }
-            showOptionsMenu()
-        } else {
-            binding.addParticipantsAction.visibility = GONE
-
-            if (ConversationUtils.isNoteToSelfConversation(conversation)) {
-                binding.notificationSettingsView.notificationSettings.visibility = VISIBLE
-            } else {
-                binding.clearConversationHistory.visibility = GONE
-            }
-        }
-
-        if (!isDestroyed) {
-            binding.dangerZoneOptions.visibility = VISIBLE
-
-            setupWebinaryView()
-
-            if (!ConversationUtils.canLeave(conversation!!)) {
-                binding.leaveConversationAction.visibility = GONE
-            } else {
-                binding.leaveConversationAction.visibility = VISIBLE
-            }
-
-            if (!ConversationUtils.canDelete(conversation!!, spreedCapabilities)) {
-                binding.deleteConversationAction.visibility = GONE
-            } else {
-                binding.deleteConversationAction.visibility = VISIBLE
-            }
-
-            if (ConversationType.ROOM_SYSTEM == conversation!!.type) {
-                binding.notificationSettingsView.callNotificationsSwitch.visibility = GONE
-            }
-
-            if (conversation!!.notificationCalls === null) {
-                binding.notificationSettingsView.callNotificationsSwitch.visibility = GONE
-            } else {
-                binding.notificationSettingsView.callNotificationsSwitch.isChecked =
-                    (conversationCopy.notificationCalls == 1)
-            }
-
-            getListOfParticipants()
-
-            binding.progressBar.visibility = GONE
-
-            binding.conversationInfoName.visibility = VISIBLE
-
-            binding.displayNameText.text = conversation!!.displayName
-
-            if (conversation!!.description != null && conversation!!.description!!.isNotEmpty()) {
-                binding.descriptionText.text = conversation!!.description
-                binding.conversationDescription.visibility = VISIBLE
-            }
-
-            loadConversationAvatar()
-            adjustNotificationLevelUI()
-            initRecordingConsentOption()
-            initExpiringMessageOption()
-
-            binding.let {
-                GuestAccessHelper(
-                    this@ConversationInfoActivity,
-                    it,
-                    conversation!!,
-                    spreedCapabilities,
-                    conversationUser
-                ).setupGuestAccess()
-            }
-            if (ConversationUtils.isNoteToSelfConversation(conversation!!)) {
-                binding.notificationSettingsView.notificationSettings.visibility = GONE
-            } else {
-                binding.notificationSettingsView.notificationSettings.visibility = VISIBLE
-            }
-        }
-    }
-
-    private fun initRecordingConsentOption() {
-        fun hide() {
-            binding.recordingConsentView.recordingConsentSettingsCategory.visibility = GONE
-            binding.recordingConsentView.recordingConsentForConversation.visibility = GONE
-            binding.recordingConsentView.recordingConsentAll.visibility = GONE
-        }
-
-        fun showAlwaysRequiredInfo() {
-            binding.recordingConsentView.recordingConsentForConversation.visibility = GONE
-            binding.recordingConsentView.recordingConsentAll.visibility = VISIBLE
-        }
-
-        fun showSwitch() {
-            binding.recordingConsentView.recordingConsentForConversation.visibility = VISIBLE
-            binding.recordingConsentView.recordingConsentAll.visibility = GONE
-
-            if (conversation!!.hasCall) {
-                binding.recordingConsentView.recordingConsentForConversation.isEnabled = false
-                binding.recordingConsentView.recordingConsentForConversation.alpha = LOW_EMPHASIS_OPACITY
-            } else {
-                binding.recordingConsentView.recordingConsentForConversationSwitch.isChecked =
-                    conversation!!.recordingConsentRequired == RECORDING_CONSENT_REQUIRED_FOR_CONVERSATION
-
-                binding.recordingConsentView.recordingConsentForConversation.setOnClickListener {
-                    binding.recordingConsentView.recordingConsentForConversationSwitch.isChecked =
-                        !binding.recordingConsentView.recordingConsentForConversationSwitch.isChecked
-                    submitRecordingConsentChanges()
-                }
-            }
-        }
-
-        if (ConversationUtils.isParticipantOwnerOrModerator(conversation!!) &&
-            !ConversationUtils.isNoteToSelfConversation(conversation!!)
-        ) {
-            when (CapabilitiesUtil.getRecordingConsentType(spreedCapabilities)) {
-                CapabilitiesUtil.RECORDING_CONSENT_NOT_REQUIRED -> hide()
-                CapabilitiesUtil.RECORDING_CONSENT_REQUIRED -> showAlwaysRequiredInfo()
-                CapabilitiesUtil.RECORDING_CONSENT_DEPEND_ON_CONVERSATION -> showSwitch()
-            }
-        } else {
-            hide()
-        }
-    }
-
-    private fun submitRecordingConsentChanges() {
-        val state = if (binding.recordingConsentView.recordingConsentForConversationSwitch.isChecked) {
-            RECORDING_CONSENT_REQUIRED_FOR_CONVERSATION
-        } else {
-            RECORDING_CONSENT_NOT_REQUIRED_FOR_CONVERSATION
-        }
-
-        val apiVersion = ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, 1))
-
-        ncApi.setRecordingConsent(
-            ApiUtils.getCredentials(conversationUser.username, conversationUser.token),
-            ApiUtils.getUrlForRecordingConsent(apiVersion, conversationUser.baseUrl!!, conversation!!.token),
-            state
-        )
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onNext(t: GenericOverall) {
-                    // unused atm
-                }
-
-                override fun onError(e: Throwable) {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                    Log.e(TAG, "Error when setting recording consent option for conversation", e)
-                }
-            })
-    }
-
-    private fun initExpiringMessageOption() {
-        if (ConversationUtils.isParticipantOwnerOrModerator(conversation!!) &&
-            CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.MESSAGE_EXPIRATION)
-        ) {
-            databaseStorageModule?.setMessageExpiration(conversation!!.messageExpiration)
-            val value = databaseStorageModule!!.getString("conversation_settings_dropdown", "")
-            val pos = resources.getStringArray(R.array.message_expiring_values).indexOf(value)
-            val text = resources.getStringArray(R.array.message_expiring_descriptions)[pos]
-            binding.conversationSettingsDropdown.setText(text)
-            binding.conversationSettingsDropdown
-                .setSimpleItems(resources.getStringArray(R.array.message_expiring_descriptions))
-            binding.conversationSettingsDropdown.setOnItemClickListener { _, _, position, _ ->
-                val v: String = resources.getStringArray(R.array.message_expiring_values)[position]
-                databaseStorageModule!!.saveString("conversation_settings_dropdown", v)
-            }
-            binding.messageExpirationSettings.visibility = VISIBLE
-        } else {
-            binding.messageExpirationSettings.visibility = GONE
-        }
-    }
-
-    private fun adjustNotificationLevelUI() {
-        if (conversation != null) {
-            if (CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.NOTIFICATION_LEVELS)) {
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.isEnabled = true
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.alpha = 1.0f
-
-                if (conversation!!.notificationLevel != NotificationLevel.DEFAULT) {
-                    val stringValue: String =
-                        when (
-                            DomainEnumNotificationLevelConverter()
-                                .convertToInt(conversation!!.notificationLevel!!)
-                        ) {
-                            NOTIFICATION_LEVEL_ALWAYS -> resources.getString(R.string.nc_notify_me_always)
-                            NOTIFICATION_LEVEL_MENTION -> resources.getString(R.string.nc_notify_me_mention)
-                            NOTIFICATION_LEVEL_NEVER -> resources.getString(R.string.nc_notify_me_never)
-                            else -> resources.getString(R.string.nc_notify_me_mention)
-                        }
-
-                    binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.setText(
-                        stringValue
-                    )
-                } else {
-                    setProperNotificationValue(conversation)
-                }
-            } else {
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.isEnabled = false
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.alpha =
-                    LOW_EMPHASIS_OPACITY
-                setProperNotificationValue(conversation)
-            }
-            binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown
-                .setSimpleItems(resources.getStringArray(R.array.message_notification_levels))
-        }
-    }
-
-    private fun setProperNotificationValue(conversation: ConversationModel?) {
-        if (conversation!!.type == ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL) {
-            if (CapabilitiesUtil.hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.MENTION_FLAG)) {
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.setText(
-                    resources.getString(R.string.nc_notify_me_always)
-                )
-            } else {
-                binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.setText(
-                    resources.getString(R.string.nc_notify_me_mention)
-                )
-            }
-        } else {
-            binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown.setText(
-                resources.getString(R.string.nc_notify_me_mention)
-            )
-        }
-    }
-
-    private fun loadConversationAvatar() {
-        when (conversation!!.type) {
-            ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL -> if (!TextUtils.isEmpty(conversation!!.name)) {
-                conversation!!.name?.let {
-                    binding.avatarImage.loadUserAvatar(
-                        conversationUser,
-                        it,
-                        true,
-                        false
-                    )
-                }
-            }
-
-            ConversationType.ROOM_GROUP_CALL, ConversationType.ROOM_PUBLIC_CALL -> {
-                binding.avatarImage.loadConversationAvatar(
-                    conversationUser,
-                    conversation!!,
-                    false,
-                    viewThemeUtils
+            conversationUser.id?.let { userId ->
+                ShortcutManagerHelper.disableConversationShortcut(
+                    context,
+                    conversationToken,
+                    userId,
+                    context.resources.getString(R.string.nc_shortcut_conversation_deleted)
                 )
             }
 
-            ConversationType.ROOM_SYSTEM -> {
-                binding.avatarImage.loadSystemAvatar()
-            }
-
-            ConversationType.NOTE_TO_SELF -> {
-                binding.avatarImage.loadNoteToSelfAvatar()
-            }
-
-            else -> {
-                // unused atm
-            }
+            showConversationList()
         }
     }
 
-    private fun toggleModeratorStatus(apiVersion: Int, participant: Participant) {
-        val subscriber = object : Observer<GenericOverall> {
-            override fun onSubscribe(d: Disposable) {
-                // unused atm
-            }
+    /**
+     * Shows the conversation list of the account of the conversation, which was left or deleted: the list in the task
+     * is recreated for it and the screens above it are closed, e.g. when the chat was opened from a notification of an
+     * account that isn't the default one.
+     */
+    private fun showConversationList() {
+        startActivity(ConversationsListActivity.createAccountSwitchIntent(context, conversationUser.id!!))
+    }
 
-            override fun onNext(genericOverall: GenericOverall) {
-                getListOfParticipants()
-            }
-
-            @SuppressLint("LongLogTag")
-            override fun onError(e: Throwable) {
-                Log.e(TAG, "Error toggling moderator status", e)
-            }
-
-            override fun onComplete() {
-                // unused atm
-            }
-        }
-
-        if (participant.type == Participant.ParticipantType.MODERATOR ||
-            participant.type == Participant.ParticipantType.GUEST_MODERATOR
+    private fun toggleModeratorStatus(apiVersion: Int, participant: ParticipantDto) {
+        val subscriber = participantActionObserver()
+        if (participant.type == ParticipantDto.ParticipantType.MODERATOR ||
+            participant.type == ParticipantDto.ParticipantType.GUEST_MODERATOR
         ) {
             ncApi.demoteAttendeeFromModerator(
                 credentials,
-                ApiUtils.getUrlForRoomModerators(
-                    apiVersion,
-                    conversationUser.baseUrl!!,
-                    conversation!!.token
-                ),
-                participant.attendeeId
-            )
-                ?.subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(subscriber)
-        } else if (participant.type == Participant.ParticipantType.USER ||
-            participant.type == Participant.ParticipantType.GUEST
+                ApiUtils.getUrlForRoomModerators(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                participant.attendeeId,
+                null
+            )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(subscriber)
+        } else if (participant.type == ParticipantDto.ParticipantType.USER ||
+            participant.type == ParticipantDto.ParticipantType.GUEST
         ) {
             ncApi.promoteAttendeeToModerator(
                 credentials,
-                ApiUtils.getUrlForRoomModerators(
-                    apiVersion,
-                    conversationUser.baseUrl!!,
-                    conversation!!.token
-                ),
-                participant.attendeeId
-            )
-                ?.subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(subscriber)
+                ApiUtils.getUrlForRoomModerators(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                participant.attendeeId,
+                null
+            )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(subscriber)
         }
     }
 
-    private fun toggleModeratorStatusLegacy(apiVersion: Int, participant: Participant) {
-        val subscriber = object : Observer<GenericOverall> {
-            override fun onSubscribe(d: Disposable) {
-                // unused atm
-            }
+    private fun toggleModeratorStatusLegacy(apiVersion: Int, participant: ParticipantDto) {
+        val subscriber = participantActionObserver()
+        if (participant.type == ParticipantDto.ParticipantType.MODERATOR) {
+            ncApi.demoteModeratorToUser(
+                credentials,
+                ApiUtils.getUrlForRoomModerators(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                participant.userId
+            )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(subscriber)
+        } else if (participant.type == ParticipantDto.ParticipantType.USER) {
+            ncApi.promoteUserToModerator(
+                credentials,
+                ApiUtils.getUrlForRoomModerators(apiVersion, conversationUser.baseUrl!!, conversationToken),
+                participant.userId
+            )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(subscriber)
+        }
+    }
 
+    private fun participantActionObserver(): Observer<GenericOverall> =
+        object : Observer<GenericOverall> {
+            override fun onSubscribe(d: Disposable) { /* unused */ }
             override fun onNext(genericOverall: GenericOverall) {
-                getListOfParticipants()
+                viewModel.loadParticipants(conversationUser, conversationToken)
             }
 
             @SuppressLint("LongLogTag")
             override fun onError(e: Throwable) {
-                Log.e(TAG, "Error toggling moderator status (legacy)", e)
+                Log.e(TAG, "Error changing the participant type", e)
+                showParticipantActionError(e)
             }
-
-            override fun onComplete() {
-                // unused atm
-            }
+            override fun onComplete() { /* unused */ }
         }
 
-        if (participant.type == Participant.ParticipantType.MODERATOR) {
-            ncApi.demoteModeratorToUser(
-                credentials,
-                ApiUtils.getUrlForRoomModerators(
-                    apiVersion,
-                    conversationUser.baseUrl!!,
-                    conversation!!.token
-                ),
-                participant.userId
-            )
-                ?.subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(subscriber)
-        } else if (participant.type == Participant.ParticipantType.USER) {
-            ncApi.promoteUserToModerator(
-                credentials,
-                ApiUtils.getUrlForRoomModerators(
-                    apiVersion,
-                    conversationUser.baseUrl!!,
-                    conversation!!.token
-                ),
-                participant.userId
-            )
-                ?.subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(subscriber)
-        }
-    }
-
-    private fun removeAttendeeFromConversation(apiVersion: Int, participant: Participant) {
+    private fun removeAttendeeFromConversation(apiVersion: Int, participant: ParticipantDto) {
+        val observer = participantActionObserver()
         if (apiVersion >= ApiUtils.API_V4) {
             ncApi.removeAttendeeFromConversation(
                 credentials,
-                ApiUtils.getUrlForAttendees(
-                    apiVersion,
-                    conversationUser.baseUrl!!,
-                    conversation!!.token
-                ),
+                ApiUtils.getUrlForAttendees(apiVersion, conversationUser.baseUrl!!, conversationToken),
                 participant.attendeeId
-            )
-                ?.subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(object : Observer<GenericOverall> {
-                    override fun onSubscribe(d: Disposable) {
-                        // unused atm
-                    }
-
-                    override fun onNext(genericOverall: GenericOverall) {
-                        getListOfParticipants()
-                    }
-
-                    @SuppressLint("LongLogTag")
-                    override fun onError(e: Throwable) {
-                        Log.e(TAG, "Error removing attendee from conversation", e)
-                    }
-
-                    override fun onComplete() {
-                        // unused atm
-                    }
-                })
+            )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(observer)
         } else {
-            if (participant.type == Participant.ParticipantType.GUEST ||
-                participant.type == Participant.ParticipantType.USER_FOLLOWING_LINK
+            if (participant.type == ParticipantDto.ParticipantType.GUEST ||
+                participant.type == ParticipantDto.ParticipantType.USER_FOLLOWING_LINK
             ) {
                 ncApi.removeParticipantFromConversation(
                     credentials,
                     ApiUtils.getUrlForRemovingParticipantFromConversation(
                         conversationUser.baseUrl!!,
-                        conversation!!.token,
+                        conversationToken,
                         true
                     ),
                     participant.sessionId
-                )
-                    ?.subscribeOn(Schedulers.io())
-                    ?.observeOn(AndroidSchedulers.mainThread())
-                    ?.subscribe(object : Observer<GenericOverall> {
-                        override fun onSubscribe(d: Disposable) {
-                            // unused atm
-                        }
-
-                        override fun onNext(genericOverall: GenericOverall) {
-                            getListOfParticipants()
-                        }
-
-                        @SuppressLint("LongLogTag")
-                        override fun onError(e: Throwable) {
-                            Log.e(TAG, "Error removing guest from conversation", e)
-                        }
-
-                        override fun onComplete() {
-                            // unused atm
-                        }
-                    })
+                )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(observer)
             } else {
                 ncApi.removeParticipantFromConversation(
                     credentials,
                     ApiUtils.getUrlForRemovingParticipantFromConversation(
                         conversationUser.baseUrl!!,
-                        conversation!!.token,
+                        conversationToken,
                         false
                     ),
                     participant.userId
-                )
-                    ?.subscribeOn(Schedulers.io())
-                    ?.observeOn(AndroidSchedulers.mainThread())
-                    ?.subscribe(object : Observer<GenericOverall> {
-                        override fun onSubscribe(d: Disposable) {
-                            // unused atm
-                        }
-
-                        override fun onNext(genericOverall: GenericOverall) {
-                            getListOfParticipants()
-                        }
-
-                        @SuppressLint("LongLogTag")
-                        override fun onError(e: Throwable) {
-                            Log.e(TAG, "Error removing user from conversation", e)
-                        }
-
-                        override fun onComplete() {
-                            // unused atm
-                        }
-                    })
+                )?.subscribeOn(Schedulers.io())?.observeOn(AndroidSchedulers.mainThread())?.subscribe(observer)
             }
         }
     }
 
-    @SuppressLint("CheckResult")
-    override fun onItemClick(view: View?, position: Int): Boolean {
-        if (!ConversationUtils.canModerate(conversation!!, spreedCapabilities)) {
-            return true
-        }
+    private fun banActor(actorType: String, actorId: String, internalNote: String) {
+        viewModel.banActor(conversationUser, conversationToken, actorType, actorId, internalNote)
+    }
 
-        val userItem = adapter?.getItem(position) as ParticipantItem
-        val participant = userItem.model
+    private fun handleParticipantClick(model: ParticipantModel) {
+        viewModel.setParticipantForOps(model)
+    }
 
+    @Suppress("ReturnCount")
+    private fun handleParticipantOpsAction(action: ParticipantOpsAction, model: ParticipantModel) {
+        val state = viewModel.uiState.value
+        val conv = state.conversation ?: return
+        val caps = state.spreedCapabilities ?: return
+        if (!ConversationUtils.canModerate(conv, caps)) return
+        val participant = model.participant
         val apiVersion = ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, 1))
-
-        if (participant.calculatedActorType == USERS && participant.calculatedActorId == conversationUser.userId) {
-            if (participant.attendeePin?.isNotEmpty() == true) {
-                val items = mutableListOf(
-                    BasicListItemWithImage(
-                        R.drawable.ic_lock_grey600_24px,
-                        context.getString(R.string.nc_attendee_pin, participant.attendeePin)
-                    )
-                )
-                MaterialDialog(this, BottomSheet(WRAP_CONTENT)).show {
-                    cornerRadius(res = R.dimen.corner_radius)
-
-                    title(text = participant.displayName)
-                    viewThemeUtils.material.colorBottomSheetBackground(this.view)
-                    listItemsWithImage(items = items) { _, index, _ ->
-                        if (index == 0) {
-                            removeAttendeeFromConversation(apiVersion, participant)
-                        }
-                    }
+        when (action) {
+            ParticipantOpsAction.PromoteToModerator,
+            ParticipantOpsAction.DemoteFromModerator ->
+                if (apiVersion >= ApiUtils.API_V4) {
+                    toggleModeratorStatus(apiVersion, participant)
+                } else {
+                    toggleModeratorStatusLegacy(apiVersion, participant)
                 }
-            }
-            return true
+
+            ParticipantOpsAction.PromoteToOwner ->
+                changeParticipantType(apiVersion, participant, promote = true, PARTICIPANT_TYPE_OWNER)
+
+            ParticipantOpsAction.DemoteOwnerToModerator ->
+                changeParticipantType(apiVersion, participant, promote = false, PARTICIPANT_TYPE_MODERATOR)
+
+            ParticipantOpsAction.DemoteOwnerToUser ->
+                changeParticipantType(apiVersion, participant, promote = false, PARTICIPANT_TYPE_USER)
+
+            ParticipantOpsAction.RemoveFromConversation -> removeAttendeeFromConversation(apiVersion, participant)
+            ParticipantOpsAction.Ban -> handleBan(participant)
         }
-
-        if (participant.type == Participant.ParticipantType.OWNER) {
-            // Can not moderate owner
-            return true
-        }
-
-        if (participant.calculatedActorType == GROUPS) {
-            val items = mutableListOf(
-                BasicListItemWithImage(
-                    R.drawable.ic_delete_grey600_24dp,
-                    context.getString(R.string.nc_remove_group_and_members)
-                )
-            )
-            MaterialDialog(this, BottomSheet(WRAP_CONTENT)).show {
-                cornerRadius(res = R.dimen.corner_radius)
-
-                title(text = participant.displayName)
-                listItemsWithImage(items = items) { _, index, _ ->
-                    if (index == 0) {
-                        removeAttendeeFromConversation(apiVersion, participant)
-                    }
-                }
-            }
-            return true
-        }
-
-        if (participant.calculatedActorType == CIRCLES) {
-            val items = mutableListOf(
-                BasicListItemWithImage(
-                    R.drawable.ic_delete_grey600_24dp,
-                    context.getString(R.string.nc_remove_team_and_members)
-                )
-            )
-            MaterialDialog(this, BottomSheet(WRAP_CONTENT)).show {
-                cornerRadius(res = R.dimen.corner_radius)
-
-                title(text = participant.displayName)
-                listItemsWithImage(items = items) { _, index, _ ->
-                    if (index == 0) {
-                        removeAttendeeFromConversation(apiVersion, participant)
-                    }
-                }
-            }
-            return true
-        }
-
-        val items = mutableListOf(
-            BasicListItemWithImage(
-                R.drawable.ic_lock_grey600_24px,
-                context.getString(R.string.nc_attendee_pin, participant.attendeePin)
-            ),
-            BasicListItemWithImage(
-                R.drawable.ic_pencil_grey600_24dp,
-                context.getString(R.string.nc_promote)
-            ),
-            BasicListItemWithImage(
-                R.drawable.ic_pencil_grey600_24dp,
-                context.getString(R.string.nc_demote)
-            ),
-            BasicListItemWithImage(
-                R.drawable.ic_delete_grey600_24dp,
-                context.getString(R.string.nc_remove_participant)
-            )
-        )
-
-        if (participant.type == Participant.ParticipantType.MODERATOR ||
-            participant.type == Participant.ParticipantType.GUEST_MODERATOR
-        ) {
-            items.removeAt(1)
-        } else if (participant.type == Participant.ParticipantType.USER ||
-            participant.type == Participant.ParticipantType.GUEST
-        ) {
-            items.removeAt(2)
-        } else {
-            // Self joined users can not be promoted nor demoted
-            items.removeAt(2)
-            items.removeAt(1)
-        }
-
-        if (participant.attendeePin == null || participant.attendeePin!!.isEmpty()) {
-            items.removeAt(0)
-        }
-
-        if (items.isNotEmpty()) {
-            MaterialDialog(this, BottomSheet(WRAP_CONTENT)).show {
-                cornerRadius(res = R.dimen.corner_radius)
-
-                title(text = participant.displayName)
-                listItemsWithImage(items = items) { _, index, _ ->
-                    var actionToTrigger = index
-                    if (participant.attendeePin == null || participant.attendeePin!!.isEmpty()) {
-                        actionToTrigger++
-                    }
-                    if (participant.type == Participant.ParticipantType.USER_FOLLOWING_LINK) {
-                        actionToTrigger++
-                    }
-
-                    if (actionToTrigger == 0) {
-                        // Pin, nothing to do
-                    } else if (actionToTrigger == 1) {
-                        // Promote/demote
-                        if (apiVersion >= ApiUtils.API_V4) {
-                            toggleModeratorStatus(apiVersion, participant)
-                        } else {
-                            toggleModeratorStatusLegacy(apiVersion, participant)
-                        }
-                    } else if (actionToTrigger == 2) {
-                        // Remove from conversation
-                        removeAttendeeFromConversation(apiVersion, participant)
-                    }
-                }
-            }
-        }
-        return true
     }
 
-    private fun setUpNotificationSettings(module: DatabaseStorageModule) {
-        binding.notificationSettingsView.notificationSettingsImportantConversation.setOnClickListener {
-            val isChecked = binding.notificationSettingsView.importantConversationSwitch.isChecked
-            binding.notificationSettingsView.importantConversationSwitch.isChecked = !isChecked
-            module.saveBoolean("important_conversation_switch", !isChecked)
-        }
-        binding.notificationSettingsView.notificationSettingsCallNotifications.setOnClickListener {
-            val isChecked = binding.notificationSettingsView.callNotificationsSwitch.isChecked
-            binding.notificationSettingsView.callNotificationsSwitch.isChecked = !isChecked
-            module.saveBoolean("call_notifications_switch", !isChecked)
-        }
-        binding.notificationSettingsView.conversationInfoMessageNotificationsDropdown
-            .setOnItemClickListener { _, _, position, _ ->
-                val value = resources.getStringArray(R.array.message_notification_levels_entry_values)[position]
-                Log.i(TAG, "saved $value to module from $position")
-                module.saveString("conversation_info_message_notifications_dropdown", value)
-            }
-
-        binding.notificationSettingsView.importantConversationSwitch.isChecked = module
-            .getBoolean("important_conversation_switch", false)
-
-        if (conversation!!.remoteServer.isNullOrEmpty()) {
-            binding.notificationSettingsView.notificationSettingsCallNotifications.visibility = VISIBLE
-            binding.notificationSettingsView.callNotificationsSwitch.isChecked = module
-                .getBoolean("call_notifications_switch", true)
+    private fun showParticipantActionError(e: Throwable) {
+        val messageRes = if (participantActionErrorReason(e) == ERROR_LAST_MODERATOR) {
+            R.string.nc_last_moderator_cannot_be_demoted
         } else {
-            binding.notificationSettingsView.notificationSettingsCallNotifications.visibility = GONE
+            R.string.nc_participant_type_change_failed
         }
+        showSnackbar(messageRes)
+    }
+
+    /**
+     * The moderators endpoint reports why it refused in the OCS data as
+     * `{"ocs":{"data":{"error":"<reason>"}}}`.
+     */
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private fun participantActionErrorReason(e: Throwable): String? =
+        try {
+            (e as? HttpException)?.response()?.errorBody()?.string()
+                ?.let { JSONObject(it) }
+                ?.optJSONObject("ocs")
+                ?.optJSONObject("data")
+                ?.optString("error")
+                ?.takeIf { it.isNotEmpty() }
+        } catch (exception: Exception) {
+            Log.w(TAG, "Could not read the participant action error", exception)
+            null
+        }
+
+    private fun changeParticipantType(
+        apiVersion: Int,
+        participant: ParticipantDto,
+        promote: Boolean,
+        participantType: Int
+    ) {
+        val url = ApiUtils.getUrlForRoomModerators(apiVersion, conversationUser.baseUrl!!, conversationToken)
+        val call = if (promote) {
+            ncApi.promoteAttendeeToModerator(credentials, url, participant.attendeeId, participantType)
+        } else {
+            ncApi.demoteAttendeeFromModerator(credentials, url, participant.attendeeId, participantType)
+        }
+        call?.subscribeOn(Schedulers.io())
+            ?.observeOn(AndroidSchedulers.mainThread())
+            ?.subscribe(participantActionObserver())
+    }
+
+    private fun handleBan(participant: ParticipantDto) {
+        val apiVersion = ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, 1))
+        val dialogBinding = DialogBanParticipantBinding.inflate(layoutInflater)
+        val dialog = MaterialAlertDialogBuilder(this).setView(dialogBinding.root).create()
+        dialogBinding.avatarImage.loadUserAvatar(
+            conversationUser,
+            participant.actorId!!,
+            requestBigSize = true,
+            ignoreCache = false
+        )
+        dialogBinding.displayNameText.text = participant.actorId
+        dialogBinding.buttonBan.setOnClickListener {
+            banActor(
+                EnumActorTypeConverter().convertToString(participant.actorType!!),
+                participant.actorId!!,
+                dialogBinding.banParticipantEdit.text.toString()
+            )
+            removeAttendeeFromConversation(apiVersion, participant)
+            dialog.dismiss()
+        }
+        dialogBinding.buttonClose.setOnClickListener { dialog.dismiss() }
+        viewThemeUtils.material.colorTextInputLayout(dialogBinding.banParticipantEditLayout)
+        viewThemeUtils.material.colorMaterialButtonPrimaryFilled(dialogBinding.buttonBan)
+        viewThemeUtils.material.colorMaterialButtonText(dialogBinding.buttonClose)
+        dialog.show()
     }
 
     companion object {
         private val TAG = ConversationInfoActivity::class.java.simpleName
-        private const val NOTIFICATION_LEVEL_ALWAYS: Int = 1
-        private const val NOTIFICATION_LEVEL_MENTION: Int = 2
-        private const val NOTIFICATION_LEVEL_NEVER: Int = 3
-        private const val LOW_EMPHASIS_OPACITY: Float = 0.38f
-        private const val RECORDING_CONSENT_NOT_REQUIRED_FOR_CONVERSATION: Int = 0
-        private const val RECORDING_CONSENT_REQUIRED_FOR_CONVERSATION: Int = 1
-    }
 
-    /**
-     * Comparator for participants, sorts by online-status, moderator-status and display name.
-     */
-    class ParticipantItemComparator : Comparator<ParticipantItem> {
-        override fun compare(left: ParticipantItem, right: ParticipantItem): Int {
-            val leftIsGroup = left.model.actorType == GROUPS || left.model.actorType == CIRCLES
-            val rightIsGroup = right.model.actorType == GROUPS || right.model.actorType == CIRCLES
-            if (leftIsGroup != rightIsGroup) {
-                // Groups below participants
-                return if (rightIsGroup) {
-                    -1
-                } else {
-                    1
+        private const val ERROR_LAST_MODERATOR = "last-moderator"
+
+        // Participant types the moderators endpoint accepts as a target level
+        private const val PARTICIPANT_TYPE_OWNER: Int = 1
+        private const val PARTICIPANT_TYPE_MODERATOR: Int = 2
+        private const val PARTICIPANT_TYPE_USER: Int = 3
+    }
+}
+
+/**
+ * What a password the user is asked for is meant to do, since the same dialog serves both.
+ */
+private enum class PasswordRequest {
+    SET,
+    ALLOW_GUESTS
+}
+
+@Composable
+private fun GuestAccessPasswordDialog(
+    validationState: PasswordValidationState,
+    onPasswordChanged: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onSave: (password: String, copyAfterSave: Boolean) -> Unit
+) {
+    var password by remember { mutableStateOf("") }
+    val isPasswordValid = password.isNotBlank() && validationState.isPasswordAccepted
+
+    ComposeAlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(text = stringResource(id = R.string.nc_guest_access_password_dialog_title)) },
+        text = {
+            PasswordPolicyField(
+                password = password,
+                onPasswordChange = {
+                    password = it
+                    onPasswordChanged(it)
+                },
+                validationState = validationState,
+                label = stringResource(id = R.string.nc_guest_access_password_dialog_hint),
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = { onSave(password, true) },
+                    enabled = isPasswordValid
+                ) {
+                    Text(text = stringResource(R.string.nc_copy_password))
+                }
+                TextButton(
+                    onClick = { onSave(password, false) },
+                    enabled = isPasswordValid
+                ) {
+                    Text(text = stringResource(R.string.save))
                 }
             }
-
-            if (left.isOnline && !right.isOnline) {
-                return -1
-            } else if (!left.isOnline && right.isOnline) {
-                return 1
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(text = stringResource(id = R.string.nc_cancel))
             }
-
-            val moderatorTypes = ArrayList<Participant.ParticipantType>()
-            moderatorTypes.add(Participant.ParticipantType.MODERATOR)
-            moderatorTypes.add(Participant.ParticipantType.OWNER)
-            moderatorTypes.add(Participant.ParticipantType.GUEST_MODERATOR)
-
-            if (moderatorTypes.contains(left.model.type) && !moderatorTypes.contains(right.model.type)) {
-                return -1
-            } else if (!moderatorTypes.contains(left.model.type) && moderatorTypes.contains(right.model.type)) {
-                return 1
-            }
-
-            return left.model.displayName!!.lowercase(Locale.ROOT).compareTo(
-                right.model.displayName!!.lowercase(Locale.ROOT)
-            )
         }
-    }
+    )
 }

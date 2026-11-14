@@ -14,6 +14,8 @@ import com.nextcloud.talk.application.NextcloudTalkApplication;
 import com.nextcloud.talk.data.user.model.User;
 import com.nextcloud.talk.events.EventStatus;
 import com.nextcloud.talk.models.json.generic.GenericOverall;
+import com.nextcloud.talk.conversationlist.DirectShareHelper;
+import com.nextcloud.talk.conversationlist.data.OfflineConversationsRepository;
 import com.nextcloud.talk.users.UserManager;
 import com.nextcloud.talk.utils.ApiUtils;
 import com.nextcloud.talk.utils.UserIdUtils;
@@ -33,6 +35,8 @@ import autodagger.AutoInjector;
 import io.reactivex.Observer;
 import io.reactivex.disposables.Disposable;
 import io.reactivex.schedulers.Schedulers;
+import kotlin.coroutines.EmptyCoroutineContext;
+import kotlinx.coroutines.BuildersKt;
 import okhttp3.JavaNetCookieJar;
 import okhttp3.OkHttpClient;
 import retrofit2.Retrofit;
@@ -51,6 +55,9 @@ public class DeleteConversationWorker extends Worker {
     @Inject
     EventBus eventBus;
 
+    @Inject
+    OfflineConversationsRepository conversationsRepository;
+
     NcApi ncApi;
 
     public DeleteConversationWorker(@NonNull Context context, @NonNull WorkerParameters workerParams) {
@@ -64,7 +71,15 @@ public class DeleteConversationWorker extends Worker {
         Data data = getInputData();
         long operationUserId = data.getLong(BundleKeys.KEY_INTERNAL_USER_ID, -1);
         String conversationToken = data.getString(BundleKeys.KEY_ROOM_TOKEN);
-        User operationUser = userManager.getUserWithId(operationUserId).blockingGet();
+        User operationUser;
+        try {
+            operationUser = BuildersKt.runBlocking(
+                EmptyCoroutineContext.INSTANCE,
+                (scope, continuation) -> userManager.getUserWithId(operationUserId, continuation));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Result.failure();
+        }
 
         if (operationUser != null) {
             int apiVersion = ApiUtils.getConversationApiVersion(operationUser, new int[]{ApiUtils.API_V4, 1});
@@ -93,7 +108,12 @@ public class DeleteConversationWorker extends Worker {
 
                     @Override
                     public void onNext(GenericOverall genericOverall) {
+                        conversationsRepository.requireFullSync(operationUserId);
                         eventBus.postSticky(eventStatus);
+                        if (conversationToken != null) {
+                            DirectShareHelper.INSTANCE.removeShortcutForConversation(
+                                getApplicationContext(), operationUserId, conversationToken);
+                        }
                     }
 
                     @Override

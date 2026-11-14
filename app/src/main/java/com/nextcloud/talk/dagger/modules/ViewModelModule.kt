@@ -7,25 +7,27 @@
  */
 package com.nextcloud.talk.dagger.modules
 
+import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import com.nextcloud.talk.chat.viewmodels.ChatViewModel
-import com.nextcloud.talk.conversation.viewmodel.ConversationViewModel
-import com.nextcloud.talk.conversation.viewmodel.RenameConversationViewModel
+import com.nextcloud.talk.account.viewmodels.BrowserLoginActivityViewModel
+import com.nextcloud.talk.activities.CallViewModel
+import com.nextcloud.talk.activities.DeepLinkRoutingViewModel
+import com.nextcloud.talk.attachmentpreview.FileAttachmentPreviewViewModel
+import com.nextcloud.talk.contextchat.ContextChatViewModel
 import com.nextcloud.talk.conversationinfo.viewmodel.ConversationInfoViewModel
 import com.nextcloud.talk.conversationinfoedit.viewmodel.ConversationInfoEditViewModel
-import com.nextcloud.talk.conversationlist.viewmodels.ConversationsListViewModel
 import com.nextcloud.talk.invitation.viewmodels.InvitationsViewModel
-import com.nextcloud.talk.messagesearch.MessageSearchViewModel
-import com.nextcloud.talk.openconversations.viewmodels.OpenConversationsViewModel
+import com.nextcloud.talk.location.viewmodels.LocationPickerViewModel
+import com.nextcloud.talk.logger.ui.LogsViewModel
+import com.nextcloud.talk.mediaviewer.viewmodels.MediaViewerViewModel
 import com.nextcloud.talk.polls.viewmodels.PollCreateViewModel
 import com.nextcloud.talk.polls.viewmodels.PollMainViewModel
 import com.nextcloud.talk.polls.viewmodels.PollResultsViewModel
 import com.nextcloud.talk.polls.viewmodels.PollVoteViewModel
 import com.nextcloud.talk.raisehand.viewmodel.RaiseHandViewModel
-import com.nextcloud.talk.remotefilebrowser.viewmodels.RemoteFileBrowserItemsViewModel
 import com.nextcloud.talk.shareditems.viewmodels.SharedItemsViewModel
-import com.nextcloud.talk.translate.viewmodels.TranslateViewModel
 import com.nextcloud.talk.viewmodels.CallRecordingViewModel
 import dagger.Binds
 import dagger.MapKey
@@ -40,6 +42,21 @@ class ViewModelFactory @Inject constructor(
 ) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T = viewModels[modelClass]?.get() as T
 }
+
+class ViewModelFactoryWithParams<T : ViewModel>(private val modelClass: Class<T>, private val create: () -> T) :
+    ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        @Suppress("UNCHECKED_CAST")
+        return create() as T
+    }
+}
+
+/**
+ * Lazily creates a view model with [create] on first access, scoped to this activity like [viewModels]. For view
+ * models that take arguments, e.g. via assisted injection. Everything [create] uses must be set before that access.
+ */
+inline fun <reified VM : ViewModel> ComponentActivity.assistedViewModels(noinline create: () -> VM): Lazy<VM> =
+    viewModels { ViewModelFactoryWithParams(VM::class.java, create) }
 
 @Target(AnnotationTarget.FUNCTION, AnnotationTarget.PROPERTY_GETTER, AnnotationTarget.PROPERTY_SETTER)
 @Retention(AnnotationRetention.RUNTIME)
@@ -60,8 +77,8 @@ abstract class ViewModelModule {
 
     @Binds
     @IntoMap
-    @ViewModelKey(MessageSearchViewModel::class)
-    abstract fun messageSearchViewModel(viewModel: MessageSearchViewModel): ViewModel
+    @ViewModelKey(MediaViewerViewModel::class)
+    abstract fun mediaViewerViewModel(viewModel: MediaViewerViewModel): ViewModel
 
     @Binds
     @IntoMap
@@ -85,38 +102,23 @@ abstract class ViewModelModule {
 
     @Binds
     @IntoMap
-    @ViewModelKey(RemoteFileBrowserItemsViewModel::class)
-    abstract fun remoteFileBrowserItemsViewModel(viewModel: RemoteFileBrowserItemsViewModel): ViewModel
+    @ViewModelKey(CallRecordingViewModel::class)
+    abstract fun callRecordingViewModel(viewModel: CallRecordingViewModel): ViewModel
 
     @Binds
     @IntoMap
-    @ViewModelKey(CallRecordingViewModel::class)
-    abstract fun callRecordingViewModel(viewModel: CallRecordingViewModel): ViewModel
+    @ViewModelKey(LocationPickerViewModel::class)
+    abstract fun locationPickerViewModel(viewModel: LocationPickerViewModel): ViewModel
 
     @Binds
     @IntoMap
     @ViewModelKey(RaiseHandViewModel::class)
     abstract fun raiseHandViewModel(viewModel: RaiseHandViewModel): ViewModel
 
-    @Binds
-    @IntoMap
-    @ViewModelKey(TranslateViewModel::class)
-    abstract fun translateViewModel(viewModel: TranslateViewModel): ViewModel
-
-    @Binds
-    @IntoMap
-    @ViewModelKey(OpenConversationsViewModel::class)
-    abstract fun openConversationsViewModel(viewModel: OpenConversationsViewModel): ViewModel
-
-    @Binds
-    @IntoMap
-    @ViewModelKey(ConversationsListViewModel::class)
-    abstract fun conversationsListViewModel(viewModel: ConversationsListViewModel): ViewModel
-
-    @Binds
-    @IntoMap
-    @ViewModelKey(ChatViewModel::class)
-    abstract fun chatViewModel(viewModel: ChatViewModel): ViewModel
+    // @Binds
+    // @IntoMap
+    // @ViewModelKey(ChatViewModel::class)
+    // abstract fun chatViewModel(viewModel: ChatViewModel): ViewModel
 
     @Binds
     @IntoMap
@@ -130,16 +132,36 @@ abstract class ViewModelModule {
 
     @Binds
     @IntoMap
-    @ViewModelKey(RenameConversationViewModel::class)
-    abstract fun renameConversationViewModel(viewModel: RenameConversationViewModel): ViewModel
-
-    @Binds
-    @IntoMap
-    @ViewModelKey(ConversationViewModel::class)
-    abstract fun conversationViewModel(viewModel: ConversationViewModel): ViewModel
-
-    @Binds
-    @IntoMap
     @ViewModelKey(InvitationsViewModel::class)
     abstract fun invitationsViewModel(viewModel: InvitationsViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(LogsViewModel::class)
+    abstract fun logsViewModel(viewModel: LogsViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(BrowserLoginActivityViewModel::class)
+    abstract fun browserLoginActivityViewModel(viewModel: BrowserLoginActivityViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(ContextChatViewModel::class)
+    abstract fun contextChatViewModel(viewModel: ContextChatViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(CallViewModel::class)
+    abstract fun callViewModel(viewModel: CallViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(DeepLinkRoutingViewModel::class)
+    abstract fun deepLinkRoutingViewModel(viewModel: DeepLinkRoutingViewModel): ViewModel
+
+    @Binds
+    @IntoMap
+    @ViewModelKey(FileAttachmentPreviewViewModel::class)
+    internal abstract fun fileAttachmentPreviewViewModel(viewModel: FileAttachmentPreviewViewModel): ViewModel
 }

@@ -1,0 +1,186 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024 Daniel Calviño Sánchez <danxuliu@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+package com.nextcloud.talk.call;
+
+import com.nextcloud.talk.activities.ParticipantUiState;
+import com.nextcloud.talk.models.json.signaling.DataChannelMessageDto;
+import com.nextcloud.talk.models.json.signaling.NCMessagePayloadDto;
+import com.nextcloud.talk.models.json.signaling.NCSignalingMessageDto;
+
+import java.util.Objects;
+
+import kotlinx.coroutines.flow.StateFlow;
+
+/**
+ * Helper class to send the local participant state to the other participants in the call.
+ * <p>
+ * Once created, and until destroyed, the LocalStateBroadcaster will send the changes in the local participant state to
+ * all the participants in the call. Note that the LocalStateBroadcaster does not check whether the local participant
+ * is actually in the call or not; it is expected that the LocalStateBroadcaster will be created and destroyed when the
+ * local participant joins and leaves the call.
+ * <p>
+ * The LocalStateBroadcaster also sends the current state to remote participants when they join (which implicitly
+ * sends it to all remote participants when the local participant joins the call) so they can set an initial state
+ * for the local participant.
+ */
+public abstract class LocalStateBroadcaster {
+
+    private final LocalCallParticipantModel localCallParticipantModel;
+
+    private final LocalCallParticipantModelObserver localCallParticipantModelObserver;
+
+    private final MessageSender messageSender;
+
+    private class LocalCallParticipantModelObserver implements LocalCallParticipantModel.Observer {
+
+        private Boolean audioEnabled;
+        private Boolean speaking;
+        private Boolean videoEnabled;
+
+        public LocalCallParticipantModelObserver(LocalCallParticipantModel localCallParticipantModel) {
+            audioEnabled = localCallParticipantModel.isAudioEnabled();
+            speaking = localCallParticipantModel.isSpeaking();
+            videoEnabled = localCallParticipantModel.isVideoEnabled();
+        }
+
+        @Override
+        public void onChange() {
+            if (!Objects.equals(audioEnabled, localCallParticipantModel.isAudioEnabled())) {
+                audioEnabled = localCallParticipantModel.isAudioEnabled();
+
+                messageSender.sendToAll(getDataChannelMessageForAudioState());
+                messageSender.sendToAll(getSignalingMessageForAudioState());
+            }
+
+            if (!Objects.equals(speaking, localCallParticipantModel.isSpeaking())) {
+                speaking = localCallParticipantModel.isSpeaking();
+
+                messageSender.sendToAll(getDataChannelMessageForSpeakingState());
+            }
+
+            if (!Objects.equals(videoEnabled, localCallParticipantModel.isVideoEnabled())) {
+                videoEnabled = localCallParticipantModel.isVideoEnabled();
+
+                messageSender.sendToAll(getDataChannelMessageForVideoState());
+                messageSender.sendToAll(getSignalingMessageForVideoState());
+            }
+        }
+    }
+
+    public LocalStateBroadcaster(LocalCallParticipantModel localCallParticipantModel,
+                                 MessageSender messageSender) {
+        this.localCallParticipantModel = localCallParticipantModel;
+        this.localCallParticipantModelObserver = new LocalCallParticipantModelObserver(localCallParticipantModel);
+        this.messageSender = messageSender;
+
+        this.localCallParticipantModel.addObserver(localCallParticipantModelObserver);
+    }
+
+    public void destroy() {
+        this.localCallParticipantModel.removeObserver(localCallParticipantModelObserver);
+    }
+
+    /**
+     * Passes the live StateFlow for the given participant so the broadcaster can react to each
+     * connection-state change.  The default implementation takes a snapshot of the current value
+     * and delegates to {@link #handleCallParticipantAdded(ParticipantUiState)}; subclasses that
+     * need to observe future emissions (e.g. {@code LocalStateBroadcasterNoMcu}) should override
+     * this method instead.
+     */
+    public void handleCallParticipantAdded(StateFlow<ParticipantUiState> uiStateFlow) {
+        if (uiStateFlow != null) {
+            handleCallParticipantAdded(uiStateFlow.getValue());
+        }
+    }
+
+    public abstract void handleCallParticipantAdded(ParticipantUiState uiState);
+    public abstract void handleCallParticipantRemoved(String sessionId);
+
+    protected DataChannelMessageDto getDataChannelMessageForAudioState() {
+        String type = "audioOff";
+        if (localCallParticipantModel.isAudioEnabled() != null && localCallParticipantModel.isAudioEnabled()) {
+            type = "audioOn";
+        }
+
+        return new DataChannelMessageDto(type);
+    }
+
+    protected DataChannelMessageDto getDataChannelMessageForSpeakingState() {
+        String type = "stoppedSpeaking";
+        if (localCallParticipantModel.isSpeaking() != null && localCallParticipantModel.isSpeaking()) {
+            type = "speaking";
+        }
+
+        return new DataChannelMessageDto(type);
+    }
+
+    protected DataChannelMessageDto getDataChannelMessageForVideoState() {
+        String type = "videoOff";
+        if (localCallParticipantModel.isVideoEnabled() != null && localCallParticipantModel.isVideoEnabled()) {
+            type = "videoOn";
+        }
+
+        return new DataChannelMessageDto(type);
+    }
+
+    /**
+     * Returns a signaling message with the common fields set (type and room type).
+     *
+     * @param type the type of the signaling message
+     * @return the signaling message
+     */
+    private NCSignalingMessageDto createBaseSignalingMessage(String type) {
+        NCSignalingMessageDto ncSignalingMessage = new NCSignalingMessageDto();
+        // "roomType" is not really relevant without a peer or when referring to the whole participant, but it is
+        // nevertheless expected in the message. As most of the signaling messages currently sent to all participants
+        // are related to audio/video state "video" is used as the room type.
+        ncSignalingMessage.setRoomType("video");
+        ncSignalingMessage.setType(type);
+
+        return ncSignalingMessage;
+    }
+
+    /**
+     * Returns a signaling message to notify current audio state.
+     *
+     * @return the signaling message
+     */
+    protected NCSignalingMessageDto getSignalingMessageForAudioState() {
+        String type = "mute";
+        if (localCallParticipantModel.isAudioEnabled() != null && localCallParticipantModel.isAudioEnabled()) {
+            type = "unmute";
+        }
+
+        NCSignalingMessageDto ncSignalingMessage = createBaseSignalingMessage(type);
+
+        NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
+        ncMessagePayload.setName("audio");
+        ncSignalingMessage.setPayload(ncMessagePayload);
+
+        return ncSignalingMessage;
+    }
+
+    /**
+     * Returns a signaling message to notify current video state.
+     *
+     * @return the signaling message
+     */
+    protected NCSignalingMessageDto getSignalingMessageForVideoState() {
+        String type = "mute";
+        if (localCallParticipantModel.isVideoEnabled() != null && localCallParticipantModel.isVideoEnabled()) {
+            type = "unmute";
+        }
+
+        NCSignalingMessageDto ncSignalingMessage = createBaseSignalingMessage(type);
+
+        NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
+        ncMessagePayload.setName("video");
+        ncSignalingMessage.setPayload(ncMessagePayload);
+
+        return ncSignalingMessage;
+    }
+}

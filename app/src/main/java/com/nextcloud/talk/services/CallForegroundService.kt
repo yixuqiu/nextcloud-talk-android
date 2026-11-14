@@ -1,0 +1,482 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+package com.nextcloud.talk.services
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Person
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.drawable.Icon
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ResultReceiver
+import android.util.Log
+import androidx.annotation.RequiresApi
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
+import com.nextcloud.talk.R
+import com.nextcloud.talk.activities.CallActivity
+import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.receivers.EndCallReceiver
+import com.nextcloud.talk.receivers.EndCallReceiver.Companion.END_CALL_ACTION
+import com.nextcloud.talk.utils.NotificationUtils
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_CALL_VOICE_ONLY
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_PARTICIPANT_PERMISSION_CAN_PUBLISH_VIDEO
+import com.nextcloud.talk.utils.singletons.ApplicationWideCurrentRoomHolder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+class CallForegroundService : Service() {
+
+    /**
+     * Data needed to resolve the conversation avatar for the notification. Passed explicitly rather
+     * than forwarded via the call intent extras or read from [ApplicationWideCurrentRoomHolder]: the
+     * extras on CallActivity's own launch intent don't reflect fallbacks CallActivity applies
+     * afterwards (e.g. baseUrl falling back to the current user's baseUrl), and the room holder is
+     * only populated once the call-join network request completes - both too late/unreliable for this.
+     */
+    data class AvatarInfo(
+        val roomToken: String?,
+        val baseUrl: String?,
+        val credentials: String?,
+        val isOneToOne: Boolean
+    )
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var currentCallExtras: Bundle? = null
+    private var currentConversationName: String? = null
+    private var currentRoomToken: String? = null
+    private var currentBaseUrl: String? = null
+    private var currentCredentials: String? = null
+    private var currentIsOneToOne = false
+    private var conversationAvatarBitmap: Bitmap? = null
+    private var isScreenSharing = false
+    private var isCallStarted = false
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    @SuppressLint("ForegroundServiceType")
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d(TAG, "onStartCommand called")
+
+        handleScreenSharingAction(intent, startId)?.let { return it }
+
+        isCallStarted = true
+        handler.removeCallbacksAndMessages(null)
+
+        val conversationName = intent?.getStringExtra(EXTRA_CONVERSATION_NAME)
+        val callExtras = intent?.getBundleExtra(EXTRA_CALL_INTENT_EXTRAS)
+        currentCallExtras = callExtras
+        currentConversationName = conversationName
+        currentRoomToken = intent?.getStringExtra(EXTRA_ROOM_TOKEN)
+        currentBaseUrl = intent?.getStringExtra(EXTRA_BASE_URL)
+        currentCredentials = intent?.getStringExtra(EXTRA_CREDENTIALS)
+        currentIsOneToOne = intent?.getBooleanExtra(EXTRA_IS_ONE_TO_ONE, false) ?: false
+        conversationAvatarBitmap = null
+        val notification = buildNotification(conversationName, callExtras)
+
+        val foregroundServiceType = resolveForegroundServiceType(callExtras)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && foregroundServiceType != FOREGROUND_SERVICE_TYPE_ZERO) {
+            startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        loadConversationAvatarAsync()
+        startTimeBasedNotificationUpdates()
+
+        return START_STICKY
+    }
+
+    /**
+     * Returns the value to return from onStartCommand if the intent was a screen sharing action, or null otherwise.
+     *
+     * Screen sharing actions are ignored if the service was started by them rather than by an ongoing call (for
+     * example, if the call ended in the meantime), as the service must not be kept running in that case.
+     */
+    private fun handleScreenSharingAction(intent: Intent?, startId: Int): Int? {
+        val action = intent?.action
+        val resultReceiver = intent?.let {
+            IntentCompat.getParcelableExtra(it, EXTRA_RESULT_RECEIVER, ResultReceiver::class.java)
+        }
+
+        return when {
+            action != ACTION_START_SCREEN_SHARING && action != ACTION_STOP_SCREEN_SHARING -> null
+
+            !isCallStarted -> {
+                Log.w(TAG, "Ignoring screen sharing action without an ongoing call")
+                resultReceiver?.send(RESULT_SCREEN_SHARING_FAILED, null)
+                stopSelf(startId)
+                START_NOT_STICKY
+            }
+
+            else -> {
+                if (action == ACTION_START_SCREEN_SHARING) {
+                    setScreenSharing(true, resultReceiver)
+                } else if (isScreenSharing) {
+                    setScreenSharing(false, null)
+                }
+                START_STICKY
+            }
+        }
+    }
+
+    /**
+     * Updates the foreground service type to include or exclude media projection, which is required to capture the
+     * screen. The result receiver is notified once the type was updated, as only then the capture can be started.
+     */
+    @SuppressLint("ForegroundServiceType")
+    private fun setScreenSharing(enabled: Boolean, resultReceiver: ResultReceiver?) {
+        isScreenSharing = enabled
+
+        var resultCode = RESULT_SCREEN_SHARING_READY
+        try {
+            val notification = buildNotification(currentConversationName, currentCallExtras)
+            val foregroundServiceType = resolveForegroundServiceType(currentCallExtras)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                foregroundServiceType != FOREGROUND_SERVICE_TYPE_ZERO
+            ) {
+                startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: SecurityException) {
+            resultCode = handleScreenSharingTypeUpdateFailure(e)
+        } catch (e: IllegalStateException) {
+            // Reconfiguring the foreground service while in background may not be allowed, which throws a
+            // ForegroundServiceStartNotAllowedException (an IllegalStateException), not a SecurityException.
+            resultCode = handleScreenSharingTypeUpdateFailure(e)
+        }
+
+        resultReceiver?.send(resultCode, null)
+    }
+
+    private fun handleScreenSharingTypeUpdateFailure(e: Exception): Int {
+        Log.e(TAG, "Failed to update foreground service type for screen sharing", e)
+        isScreenSharing = false
+        // The type may not be changed while in background, but the notification must not keep stating that the
+        // screen is shared.
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(currentConversationName, currentCallExtras))
+        return RESULT_SCREEN_SHARING_FAILED
+    }
+
+    override fun onDestroy() {
+        Log.d(TAG, "onDestroy called")
+        handler.removeCallbacksAndMessages(null)
+        serviceScope.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
+    }
+
+    private fun buildNotification(conversationName: String?, callExtras: Bundle?): Notification {
+        val channelId = NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_ONGOING_V1.name
+        ensureNotificationChannel()
+
+        val contentTitle = conversationName?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.nc_call_ongoing_notification_default_title)
+        val pendingIntent = createContentIntent(callExtras)
+
+        // Create action to return to call
+        val returnToCallAction = NotificationCompat.Action.Builder(
+            R.drawable.ic_call_white_24dp,
+            getString(R.string.nc_call_ongoing_notification_return_action),
+            pendingIntent
+        ).build()
+
+        // Create action to end call
+        val endCallPendingIntent = createEndCallIntent(callExtras)
+
+        val endCallAction = NotificationCompat.Action.Builder(
+            R.drawable.ic_baseline_close_24,
+            getString(R.string.nc_call_ongoing_notification_end_action),
+            endCallPendingIntent
+        ).build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return buildCallStyleNotification(contentTitle, pendingIntent)
+        }
+
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle(contentTitle)
+            .setContentText(getScreenSharingText() ?: getString(R.string.nc_call_ongoing_notification_content))
+            .setSmallIcon(getSmallIcon())
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(FOREGROUND_SERVICE_IMMEDIATE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(pendingIntent)
+            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
+            .addAction(returnToCallAction)
+            .addAction(endCallAction)
+            .setAutoCancel(false)
+            .build()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun buildCallStyleNotification(contentTitle: String, pendingIntent: PendingIntent): Notification {
+        val callerIcon = conversationAvatarBitmap?.let { Icon.createWithBitmap(it) }
+            ?: Icon.createWithResource(this, R.drawable.ic_call_white_24dp)
+
+        val caller = Person.Builder()
+            .setName(contentTitle)
+            .setIcon(callerIcon)
+            .setImportant(true)
+            .build()
+
+        val callStyle = Notification.CallStyle.forOngoingCall(
+            caller,
+            createHangupPendingIntent()
+        )
+
+        val channelId = NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_ONGOING_V1.name
+
+        val callStartTime = ApplicationWideCurrentRoomHolder.getInstance().callStartTime
+
+        return Notification.Builder(this, channelId)
+            .setStyle(callStyle)
+            .setSmallIcon(getSmallIcon())
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setCategory(Notification.CATEGORY_CALL)
+            .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
+            .also { builder ->
+                if (callStartTime != null && callStartTime > 0) {
+                    builder.setWhen(callStartTime)
+                    builder.setShowWhen(true)
+                }
+                getScreenSharingText()?.let { builder.setContentText(it) }
+            }
+            .build()
+    }
+
+    /**
+     * Returns the text shown while the screen is shared, or null to use the default text of the notification.
+     */
+    private fun getScreenSharingText(): String? =
+        if (isScreenSharing) {
+            getString(R.string.nc_call_ongoing_notification_screen_sharing)
+        } else {
+            null
+        }
+
+    /**
+     * The small icon is shown in the status bar, so it indicates when the screen is being shared.
+     */
+    private fun getSmallIcon(): Int =
+        if (isScreenSharing) {
+            R.drawable.ic_screen_share_white_24dp
+        } else {
+            R.drawable.ic_call_white_24dp
+        }
+
+    /**
+     * The CallStyle notification's Person icon defaults to a generic phone icon; this fetches the
+     * conversation avatar in the background and re-posts the notification once it is available.
+     */
+    private fun loadConversationAvatarAsync() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+
+        val roomToken = currentRoomToken
+        if (roomToken.isNullOrBlank()) {
+            Log.w(TAG, "loadConversationAvatarAsync: roomToken is blank, skipping avatar load")
+            return
+        }
+        if (currentBaseUrl.isNullOrBlank()) {
+            Log.w(TAG, "loadConversationAvatarAsync: baseUrl is blank, avatar load will likely fail")
+        }
+
+        serviceScope.launch {
+            val bitmap = NotificationUtils.loadConversationAvatarBitmapSync(
+                currentBaseUrl,
+                roomToken,
+                currentCredentials,
+                applicationContext,
+                currentIsOneToOne
+            )
+            Log.d(TAG, "loadConversationAvatarAsync: avatar bitmap loaded=${bitmap != null}")
+            if (bitmap != null) {
+                conversationAvatarBitmap = bitmap
+                withContext(Dispatchers.Main) { refreshCallStyleNotification() }
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun refreshCallStyleNotification() {
+        val contentTitle = currentConversationName?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.nc_call_ongoing_notification_default_title)
+        val pendingIntent = createContentIntent(currentCallExtras)
+        val notification = buildCallStyleNotification(contentTitle, pendingIntent)
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun startTimeBasedNotificationUpdates() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+
+        val updateRunnable = object : Runnable {
+            override fun run() {
+                val callStartTime = ApplicationWideCurrentRoomHolder.getInstance().callStartTime
+                if (callStartTime != null && callStartTime > 0) {
+                    val conversationName = ApplicationWideCurrentRoomHolder.getInstance()
+                        .userInRoom?.displayName
+                        ?: getString(R.string.nc_call_ongoing_notification_default_title)
+                    val pendingIntent = createContentIntent(currentCallExtras)
+                    val notification = buildCallStyleNotification(conversationName, pendingIntent)
+
+                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
+                }
+                handler.postDelayed(this, CALL_DURATION_UPDATE_INTERVAL)
+            }
+        }
+        handler.postDelayed(updateRunnable, CALL_DURATION_UPDATE_INTERVAL)
+    }
+
+    private fun ensureNotificationChannel() {
+        val app = NextcloudTalkApplication.sharedApplication ?: return
+        NotificationUtils.registerNotificationChannels(applicationContext, app.appPreferences)
+    }
+
+    private fun createContentIntent(callExtras: Bundle?): PendingIntent {
+        val intent = Intent(this, CallActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            callExtras?.let { putExtras(Bundle(it)) }
+        }
+
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getActivity(this, 0, intent, flags)
+    }
+
+    private fun createEndCallIntent(callExtras: Bundle?): PendingIntent {
+        val intent = Intent(this, EndCallReceiver::class.java).apply {
+            action = END_CALL_ACTION
+            callExtras?.let { putExtras(Bundle(it)) }
+        }
+
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getBroadcast(this, 1, intent, flags)
+    }
+
+    private fun createHangupPendingIntent(): PendingIntent {
+        val intent = Intent(this, EndCallReceiver::class.java).apply {
+            action = EndCallReceiver.END_CALL_ACTION
+        }
+        return PendingIntent.getBroadcast(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun resolveForegroundServiceType(callExtras: Bundle?): Int {
+        var serviceType = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+
+            val isVoiceOnlyCall = callExtras?.getBoolean(KEY_CALL_VOICE_ONLY, false) ?: false
+            val canPublishVideo = callExtras?.getBoolean(
+                KEY_PARTICIPANT_PERMISSION_CAN_PUBLISH_VIDEO,
+                false
+            ) ?: false
+
+            val isCameraPermissionGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!isVoiceOnlyCall && canPublishVideo && isCameraPermissionGranted) {
+                serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+
+            if (isScreenSharing) {
+                serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+        }
+        return serviceType
+    }
+
+    companion object {
+        private val TAG = CallForegroundService::class.java.simpleName
+        private const val NOTIFICATION_ID = 47001
+        private const val FOREGROUND_SERVICE_TYPE_ZERO = 0
+        private const val EXTRA_CONVERSATION_NAME = "extra_conversation_name"
+        private const val EXTRA_CALL_INTENT_EXTRAS = "extra_call_intent_extras"
+        private const val EXTRA_ROOM_TOKEN = "extra_room_token"
+        private const val EXTRA_BASE_URL = "extra_base_url"
+        private const val EXTRA_CREDENTIALS = "extra_credentials"
+        private const val EXTRA_IS_ONE_TO_ONE = "extra_is_one_to_one"
+        private const val CALL_DURATION_UPDATE_INTERVAL = 1000L
+        private const val ACTION_START_SCREEN_SHARING = "action_start_screen_sharing"
+        private const val ACTION_STOP_SCREEN_SHARING = "action_stop_screen_sharing"
+        private const val EXTRA_RESULT_RECEIVER = "extra_result_receiver"
+
+        const val RESULT_SCREEN_SHARING_READY = 0
+        const val RESULT_SCREEN_SHARING_FAILED = 1
+
+        fun start(context: Context, conversationName: String?, callIntentExtras: Bundle?, avatarInfo: AvatarInfo) {
+            val serviceIntent = Intent(context, CallForegroundService::class.java).apply {
+                putExtra(EXTRA_CONVERSATION_NAME, conversationName)
+                putExtra(EXTRA_ROOM_TOKEN, avatarInfo.roomToken)
+                putExtra(EXTRA_BASE_URL, avatarInfo.baseUrl)
+                putExtra(EXTRA_CREDENTIALS, avatarInfo.credentials)
+                putExtra(EXTRA_IS_ONE_TO_ONE, avatarInfo.isOneToOne)
+                callIntentExtras?.let { putExtra(EXTRA_CALL_INTENT_EXTRAS, Bundle(it)) }
+            }
+            ContextCompat.startForegroundService(context, serviceIntent)
+        }
+
+        /**
+         * Must be called after the user granted the media projection and before the screen capture is started. The
+         * result receiver is notified with [RESULT_SCREEN_SHARING_READY] or [RESULT_SCREEN_SHARING_FAILED].
+         */
+        fun startScreenSharing(context: Context, resultReceiver: ResultReceiver) {
+            val serviceIntent = Intent(context, CallForegroundService::class.java).apply {
+                action = ACTION_START_SCREEN_SHARING
+                putExtra(EXTRA_RESULT_RECEIVER, resultReceiver)
+            }
+            context.startService(serviceIntent)
+        }
+
+        fun stopScreenSharing(context: Context) {
+            val serviceIntent = Intent(context, CallForegroundService::class.java).apply {
+                action = ACTION_STOP_SCREEN_SHARING
+            }
+            context.startService(serviceIntent)
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, CallForegroundService::class.java))
+        }
+    }
+}

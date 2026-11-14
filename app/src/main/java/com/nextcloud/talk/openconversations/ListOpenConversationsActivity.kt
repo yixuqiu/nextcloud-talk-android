@@ -7,113 +7,77 @@
 package com.nextcloud.talk.openconversations
 
 import android.content.Intent
-import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.view.View
-import androidx.lifecycle.ViewModelProvider
+import androidx.activity.compose.setContent
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import autodagger.AutoInjector
-import com.google.android.material.snackbar.Snackbar
-import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
-import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.chat.ChatActivity
-import com.nextcloud.talk.databinding.ActivityOpenConversationsBinding
-import com.nextcloud.talk.openconversations.adapters.OpenConversationsAdapter
-import com.nextcloud.talk.openconversations.data.OpenConversation
+import com.nextcloud.talk.components.ColoredStatusBar
+import com.nextcloud.talk.dagger.modules.assistedViewModels
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.conversations.ConversationDto
 import com.nextcloud.talk.openconversations.viewmodels.OpenConversationsViewModel
-import com.nextcloud.talk.utils.bundle.BundleKeys
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.utils.adjustUIForAPILevel35
 import javax.inject.Inject
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.ui.LocalImageAuthHeader
+import androidx.compose.runtime.CompositionLocalProvider
 
 @AutoInjector(NextcloudTalkApplication::class)
 class ListOpenConversationsActivity : BaseActivity() {
 
-    private lateinit var binding: ActivityOpenConversationsBinding
-
     @Inject
-    lateinit var ncApi: NcApi
+    lateinit var viewModelFactory: OpenConversationsViewModel.Factory
 
-    @Inject
-    lateinit var viewModelFactory: ViewModelProvider.Factory
+    private lateinit var user: User
 
-    @Inject
-    lateinit var userProvider: CurrentUserProviderNew
-
-    lateinit var openConversationsViewModel: OpenConversationsViewModel
-
-    lateinit var adapter: OpenConversationsAdapter
+    private val openConversationsViewModel: OpenConversationsViewModel by assistedViewModels {
+        viewModelFactory.build(user)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        adjustUIForAPILevel35()
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
-
-        openConversationsViewModel = ViewModelProvider(this, viewModelFactory)[OpenConversationsViewModel::class.java]
+        user = setUpBoundUserOrFinish() ?: return
 
         openConversationsViewModel.fetchConversations()
 
-        binding = ActivityOpenConversationsBinding.inflate(layoutInflater)
-        setupActionBar()
-        setContentView(binding.root)
-        setupSystemColors()
+        setContent {
+            val colorScheme = viewThemeUtils.getColorScheme(this)
+            val viewState by openConversationsViewModel.viewState.collectAsStateWithLifecycle()
+            val searchTerm by openConversationsViewModel.searchTerm.collectAsStateWithLifecycle()
 
-        val user = userProvider.currentUser.blockingGet()
-
-        adapter = OpenConversationsAdapter(user) { conversation -> adapterOnClick(conversation) }
-        binding.openConversationsRecyclerView.adapter = adapter
-
-        initObservers()
-    }
-
-    private fun adapterOnClick(conversation: OpenConversation) {
-        val bundle = Bundle()
-        bundle.putString(BundleKeys.KEY_ROOM_TOKEN, conversation.roomToken)
-
-        val chatIntent = Intent(context, ChatActivity::class.java)
-        chatIntent.putExtras(bundle)
-        chatIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        startActivity(chatIntent)
-    }
-
-    private fun initObservers() {
-        openConversationsViewModel.viewState.observe(this) { state ->
-            when (state) {
-                is OpenConversationsViewModel.FetchConversationsStartState -> {
-                    binding.openConversationsRecyclerView.visibility = View.GONE
-                    binding.progressBarWrapper.visibility = View.VISIBLE
+            MaterialTheme(colorScheme = colorScheme) {
+                ColoredStatusBar()
+                CompositionLocalProvider(
+                    LocalImageAuthHeader provides ApiUtils.getCredentials(user.username, user.token)
+                ) {
+                    OpenConversationsScreen(
+                        viewState = viewState,
+                        searchTerm = searchTerm,
+                        userBaseUrl = user.baseUrl,
+                        listenerInput = OpenConversationsScreenListenerInput(
+                            onSearchTermChange = { term ->
+                                openConversationsViewModel.updateSearchTerm(term)
+                                openConversationsViewModel.fetchConversations()
+                            },
+                            onConversationClick = { conversation -> navigateToChat(user.id!!, conversation) },
+                            onBackClick = { onBackPressedDispatcher.onBackPressed() }
+                        )
+                    )
                 }
-                is OpenConversationsViewModel.FetchConversationsSuccessState -> {
-                    binding.openConversationsRecyclerView.visibility = View.VISIBLE
-                    binding.progressBarWrapper.visibility = View.GONE
-                    adapter.submitList(state.conversations)
-                }
-                is OpenConversationsViewModel.FetchConversationsEmptyState -> {
-                    binding.openConversationsRecyclerView.visibility = View.GONE
-                    binding.progressBarWrapper.visibility = View.GONE
-
-                    binding.emptyList.emptyListView.visibility = View.VISIBLE
-                    binding.emptyList.emptyListViewHeadline.text = getString(R.string.nc_no_open_conversations_headline)
-                    binding.emptyList.emptyListViewText.text = getString(R.string.nc_no_open_conversations_text)
-                    binding.emptyList.emptyListIcon.setImageResource(R.drawable.baseline_info_24)
-                    binding.emptyList.emptyListIcon.visibility = View.VISIBLE
-                    binding.emptyList.emptyListViewText.visibility = View.VISIBLE
-                }
-                is OpenConversationsViewModel.FetchConversationsErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                }
-                else -> {}
             }
         }
     }
 
-    private fun setupActionBar() {
-        setSupportActionBar(binding.openConversationsToolbar)
-        binding.openConversationsToolbar.setNavigationOnClickListener {
-            onBackPressedDispatcher.onBackPressed()
-        }
-        supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(R.color.transparent, null)))
-        viewThemeUtils.material.themeToolbar(binding.openConversationsToolbar)
+    private fun navigateToChat(userId: Long, conversation: ConversationDto) {
+        val chatIntent = ChatActivity.createIntent(this, userId, conversation.token)
+        chatIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        startActivity(chatIntent)
     }
 }

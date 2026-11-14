@@ -1,0 +1,852 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024-2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+@file:Suppress("DEPRECATION")
+
+package com.nextcloud.talk.conversationcreation
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.compose.ManagedActivityResultLauncher
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.colorResource
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.vectorResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import autodagger.AutoInjector
+import coil.compose.AsyncImage
+import com.nextcloud.talk.R
+import com.nextcloud.talk.activities.BaseActivity
+import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.components.AvatarEditPanel
+import com.nextcloud.talk.components.AvatarEditPanelCallbacks
+import com.nextcloud.talk.components.AvatarEditPanelState
+import com.nextcloud.talk.components.ColoredStatusBar
+import com.nextcloud.talk.contacts.ContactsActivity
+import com.nextcloud.talk.contacts.loadImage
+import com.nextcloud.talk.conversationcreation.ui.ConversationPresets
+import com.nextcloud.talk.conversationcreation.ui.CreationResultEffect
+import com.nextcloud.talk.conversationcreation.ui.ShareCreatedConversation
+import com.nextcloud.talk.conversationcreation.ui.openConversation
+import com.nextcloud.talk.conversationcreation.viewmodel.ConversationCreationViewModel
+import com.nextcloud.talk.dagger.modules.assistedViewModels
+import com.nextcloud.talk.extensions.getParcelableArrayListExtraProvider
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.autocomplete.AutocompleteUserDto
+import com.nextcloud.talk.passwordpolicy.PasswordPolicyField
+import com.nextcloud.talk.passwordpolicy.isPasswordAccepted
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.copyPasswordToClipboard
+import com.nextcloud.talk.utils.DisplayUtils
+import com.nextcloud.talk.utils.PickImage
+import com.nextcloud.talk.utils.bundle.BundleKeys
+import com.nextcloud.talk.utils.preview.ComposePreviewUtils
+import javax.inject.Inject
+
+@AutoInjector(NextcloudTalkApplication::class)
+class ConversationCreationActivity : BaseActivity() {
+    @Inject
+    lateinit var viewModelFactory: ConversationCreationViewModel.Factory
+
+    private lateinit var user: User
+
+    private val conversationCreationViewModel by assistedViewModels { viewModelFactory.build(user) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        user = setUpBoundUserOrFinish() ?: return
+        setContent {
+            val colorScheme = viewThemeUtils.getColorScheme(this)
+            val context = LocalContext.current
+            MaterialTheme(
+                colorScheme = colorScheme
+            ) {
+                val pickImage = remember(user) { PickImage(this@ConversationCreationActivity, user) }
+                ConversationCreationScreen(conversationCreationViewModel, context, pickImage)
+            }
+        }
+    }
+}
+
+@Suppress("LongMethod")
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConversationCreationScreen(
+    conversationCreationViewModel: ConversationCreationViewModel,
+    context: Context,
+    pickImage: PickImage? = null
+) {
+    val selectedImageUri = conversationCreationViewModel.selectedImageUri.collectAsState().value
+    val selectedEmoji = conversationCreationViewModel.selectedEmoji.collectAsState().value
+    val selectedEmojiColor = conversationCreationViewModel.selectedEmojiColor.collectAsState().value
+
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            pickImage?.onImagePickerResult(result.data) { uri ->
+                conversationCreationViewModel.updateSelectedImageUri(uri)
+            }
+        }
+    }
+
+    val remoteFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            pickImage?.onSelectRemoteFilesResult(imagePickerLauncher, result.data)
+        }
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            pickImage?.onTakePictureResult(imagePickerLauncher)
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+        onResult = { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val data = result.data
+                val selectedParticipants =
+                    data?.getParcelableArrayListExtraProvider<AutocompleteUserDto>("selectedParticipants")
+                        ?: emptyList()
+                val participants = selectedParticipants.toMutableList()
+                conversationCreationViewModel.updateSelectedParticipants(participants)
+            }
+        }
+    )
+
+    ColoredStatusBar()
+    Scaffold(
+        modifier = Modifier
+            .statusBarsPadding()
+            .displayCutoutPadding(),
+        topBar = {
+            TopAppBar(
+                title = { Text(text = stringResource(id = R.string.nc_new_conversation)) },
+                navigationIcon = {
+                    IconButton(onClick = {
+                        (context as? Activity)?.finish()
+                    }) {
+                        Icon(
+                            ImageVector.vectorResource(R.drawable.ic_arrow_back_black_24dp),
+                            contentDescription = stringResource(id = R.string.back_button)
+                        )
+                    }
+                }
+            )
+        },
+        content = { paddingValues ->
+            Column(
+                modifier = Modifier
+                    .background(colorResource(id = R.color.bg_default))
+                    .padding(0.dp, paddingValues.calculateTopPadding(), 0.dp, paddingValues.calculateBottomPadding())
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                DefaultUserAvatar(selectedImageUri, selectedEmoji, selectedEmojiColor)
+                if (pickImage != null) {
+                    UploadAvatar(
+                        pickImage = pickImage,
+                        imagePickerLauncher = imagePickerLauncher,
+                        remoteFilePickerLauncher = remoteFilePickerLauncher,
+                        cameraLauncher = cameraLauncher,
+                        selectedImageUri = selectedImageUri,
+                        selectedEmoji = selectedEmoji,
+                        selectedEmojiColor = selectedEmojiColor,
+                        onEmojiAvatarConfirmed = { emoji, color ->
+                            conversationCreationViewModel.updateSelectedEmojiAvatar(emoji, color)
+                        },
+                        onDeleteAvatar = {
+                            conversationCreationViewModel.updateSelectedImageUri(null)
+                            conversationCreationViewModel.updateSelectedEmojiAvatar(null)
+                        }
+                    )
+                }
+
+                ConversationNameAndDescription(conversationCreationViewModel)
+
+                if (conversationCreationViewModel.showPresetSelection) {
+                    ConversationPresets(conversationCreationViewModel)
+                }
+                AddParticipants(launcher, context, conversationCreationViewModel)
+                RoomCreationOptions(conversationCreationViewModel)
+                CreateConversation(conversationCreationViewModel, context)
+            }
+        }
+    )
+}
+
+@Composable
+fun DefaultUserAvatar(selectedImageUri: Uri?, selectedEmoji: String? = null, selectedEmojiColor: Int? = null) {
+    Box(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            selectedEmoji != null -> {
+                val backgroundColor = selectedEmojiColor?.let { Color(it) } ?: MaterialTheme.colorScheme.surfaceVariant
+                Box(
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .size(84.dp)
+                        .clip(CircleShape)
+                        .background(backgroundColor),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(text = selectedEmoji, fontSize = 36.sp)
+                }
+            }
+
+            selectedImageUri != null -> {
+                AsyncImage(
+                    model = selectedImageUri,
+                    contentDescription = stringResource(id = R.string.user_avatar),
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .size(84.dp)
+                        .clip(CircleShape)
+                )
+            }
+
+            else -> {
+                AsyncImage(
+                    model = R.drawable.ic_circular_group,
+                    contentDescription = stringResource(id = R.string.user_avatar),
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .size(84.dp)
+                        .clip(CircleShape)
+                )
+            }
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+fun UploadAvatar(
+    pickImage: PickImage,
+    imagePickerLauncher: ManagedActivityResultLauncher<Intent, ActivityResult>,
+    remoteFilePickerLauncher: ManagedActivityResultLauncher<Intent, ActivityResult>,
+    cameraLauncher: ManagedActivityResultLauncher<Intent, ActivityResult>,
+    selectedImageUri: Uri?,
+    selectedEmoji: String?,
+    selectedEmojiColor: Int?,
+    onEmojiAvatarConfirmed: (emoji: String, color: Int?) -> Unit,
+    onDeleteAvatar: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        AvatarEditPanel(
+            state = AvatarEditPanelState(
+                selectedEmoji = selectedEmoji,
+                selectedEmojiColor = selectedEmojiColor,
+                showDeleteButton = selectedImageUri != null || selectedEmoji != null
+            ),
+            callbacks = AvatarEditPanelCallbacks(
+                onCameraClick = { pickImage.takePicture(cameraLauncher) },
+                onUploadClick = { pickImage.selectLocal(imagePickerLauncher) },
+                onChooseClick = { pickImage.selectRemote(remoteFilePickerLauncher) },
+                onEmojiAvatarConfirmed = onEmojiAvatarConfirmed,
+                onDeleteClick = onDeleteAvatar
+            )
+        )
+    }
+}
+
+@Composable
+fun ConversationNameAndDescription(conversationCreationViewModel: ConversationCreationViewModel) {
+    val conversationRoomName = conversationCreationViewModel.roomName.collectAsState()
+    val conversationDescription = conversationCreationViewModel.conversationDescription.collectAsState()
+    OutlinedTextField(
+        value = conversationRoomName.value,
+        onValueChange = {
+            conversationCreationViewModel.updateRoomName(it)
+        },
+        label = { Text(text = stringResource(id = R.string.nc_call_name)) },
+        modifier = Modifier
+            .padding(start = 16.dp, end = 16.dp)
+            .fillMaxWidth(),
+        singleLine = true
+    )
+    OutlinedTextField(
+        value = conversationDescription.value,
+        onValueChange = {
+            if (it.length > conversationCreationViewModel.conversationDescriptionLength) {
+                conversationCreationViewModel.updateConversationDescription(
+                    it.take(conversationCreationViewModel.conversationDescriptionLength)
+                )
+            } else {
+                conversationCreationViewModel.updateConversationDescription(it)
+            }
+        },
+        label = { Text(text = stringResource(id = R.string.nc_conversation_description)) },
+        modifier = Modifier
+            .padding(top = 8.dp, start = 16.dp, end = 16.dp)
+            .fillMaxWidth()
+    )
+}
+
+@Suppress("LongMethod")
+@SuppressLint("SuspiciousIndentation")
+@Composable
+fun AddParticipants(
+    launcher: ManagedActivityResultLauncher<Intent, ActivityResult>,
+    context: Context,
+    conversationCreationViewModel: ConversationCreationViewModel
+) {
+    val participants = conversationCreationViewModel.selectedParticipants.collectAsState().value
+
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            .padding(start = 16.dp, end = 16.dp, top = 16.dp)
+    ) {
+        Row {
+            Text(
+                text = stringResource(id = R.string.nc_participants),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 0.dp, bottom = 16.dp)
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            if (participants.isNotEmpty()) {
+                Text(
+                    text = stringResource(id = R.string.nc_edit),
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .padding(start = 16.dp, bottom = 16.dp)
+                        .clickable {
+                            val intent = Intent(context, ContactsActivity::class.java)
+                            intent.putExtra(
+                                BundleKeys.KEY_INTERNAL_USER_ID,
+                                conversationCreationViewModel.currentUser.id
+                            )
+                            intent.putParcelableArrayListExtra(
+                                "selectedParticipants",
+                                participants as ArrayList<AutocompleteUserDto>
+                            )
+                            intent.putExtra(BundleKeys.KEY_ADD_PARTICIPANTS, true)
+                            intent.putExtra("isAddParticipantsEdit", true)
+                            intent.putExtra(
+                                BundleKeys.KEY_ONLY_LOCAL_PARTICIPANTS,
+                                conversationCreationViewModel.isLockedDown
+                            )
+                            launcher.launch(intent)
+                        },
+                    textAlign = TextAlign.Right
+                )
+            }
+        }
+        participants.toSet().forEach { participant ->
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                val avatarUser = conversationCreationViewModel.currentUser
+                val imageUri = participant.id?.let { avatarUri(avatarUser, it, DisplayUtils.isDarkModeOn(context)) }
+                val errorPlaceholderImage: Int = R.drawable.account_circle_96dp
+                val loadedImage = loadImage(imageUri, context, errorPlaceholderImage)
+                AsyncImage(
+                    model = loadedImage,
+                    contentDescription = stringResource(id = R.string.user_avatar),
+                    modifier = Modifier.size(width = 32.dp, height = 32.dp)
+                )
+                participant.label?.let {
+                    Text(
+                        text = it,
+                        modifier = Modifier.padding(all = 16.dp),
+                        fontSize = 15.sp
+                    )
+                }
+            }
+            HorizontalDivider(thickness = 0.1.dp, color = Color.Black)
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    val intent = Intent(context, ContactsActivity::class.java)
+                    intent.putExtra(
+                        BundleKeys.KEY_INTERNAL_USER_ID,
+                        conversationCreationViewModel.currentUser.id
+                    )
+                    intent.putExtra(BundleKeys.KEY_ADD_PARTICIPANTS, true)
+                    intent.putExtra(
+                        BundleKeys.KEY_ONLY_LOCAL_PARTICIPANTS,
+                        conversationCreationViewModel.isLockedDown
+                    )
+                    launcher.launch(intent)
+                },
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (participants.isEmpty()) {
+                Icon(
+                    painter = painterResource(id = R.drawable.ic_account_plus),
+                    contentDescription = null,
+                    modifier = Modifier.size(24.dp)
+                )
+                Text(
+                    text = stringResource(id = R.string.nc_add_participants),
+                    modifier = Modifier.padding(start = 16.dp)
+                )
+            }
+        }
+    }
+}
+
+@Suppress("LongMethod")
+@Composable
+fun RoomCreationOptions(conversationCreationViewModel: ConversationCreationViewModel) {
+    val context = LocalContext.current
+    val isGuestsAllowed = conversationCreationViewModel.isGuestsAllowed
+    val isConversationAvailableForRegisteredUsers = conversationCreationViewModel
+        .isConversationAvailableForRegisteredUsers
+    val isOpenForGuestAppUsers = conversationCreationViewModel.isOpenForGuestAppUsers
+
+    val isPasswordSet = conversationCreationViewModel.password.collectAsState().value.isNotEmpty()
+    var showPasswordDialog by rememberSaveable { mutableStateOf(false) }
+    var showPasswordChangeDialog by rememberSaveable { mutableStateOf(false) }
+    val isLockedDown = conversationCreationViewModel.isLockedDown
+    val isListableFixed = isLockedDown ||
+        ConversationParameter.LISTABLE in conversationCreationViewModel.pinnedParameters
+
+    Text(
+        text = stringResource(id = R.string.nc_new_conversation_visibility),
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 24.dp, start = 16.dp, end = 16.dp)
+    )
+    ConversationOption(
+        icon = R.drawable.ic_avatar_link,
+        text = R.string.nc_guest_access_allow_title,
+        switch = {
+            Switch(
+                checked = isGuestsAllowed,
+                enabled = !isLockedDown,
+                onCheckedChange = { conversationCreationViewModel.allowGuests(it) }
+            )
+        }
+    )
+
+    if (isGuestsAllowed && !isPasswordSet) {
+        ConversationOption(
+            icon = R.drawable.baseline_lock_open_24,
+            text = R.string.nc_set_password,
+            onClick = { showPasswordDialog = true }
+        )
+        if (conversationCreationViewModel.isPasswordEnforced) {
+            Text(
+                text = stringResource(id = R.string.nc_password_required),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+            )
+        }
+    }
+
+    if (isGuestsAllowed && isPasswordSet) {
+        ConversationOption(
+            icon = R.drawable.ic_lock_grey600_24px,
+            text = R.string.nc_change_password,
+            onClick = { showPasswordChangeDialog = true }
+        )
+    }
+
+    if (isGuestsAllowed && isPasswordSet) {
+        val appName = stringResource(R.string.nc_app_product_name)
+        ConversationOption(
+            icon = R.drawable.ic_content_copy,
+            text = R.string.nc_copy_password,
+            onClick = {
+                copyPasswordToClipboard(
+                    context = context,
+                    label = appName,
+                    password = conversationCreationViewModel.password.value
+                )
+            }
+        )
+    }
+
+    ConversationOption(
+        icon = R.drawable.baseline_format_list_bulleted_24,
+        text = R.string.nc_open_conversation_to_registered_users,
+        switch = {
+            Switch(
+                checked = isConversationAvailableForRegisteredUsers,
+                enabled = !isListableFixed,
+                onCheckedChange = { conversationCreationViewModel.openConversationToRegisteredUsers(it) }
+            )
+        }
+    )
+
+    if (isConversationAvailableForRegisteredUsers) {
+        ConversationOption(
+            text = R.string.nc_open_to_guest_app_users,
+            switch = {
+                Switch(
+                    checked = isOpenForGuestAppUsers,
+                    enabled = !isListableFixed,
+                    onCheckedChange = { conversationCreationViewModel.openConversationToGuestAppUsers(it) }
+                )
+            }
+        )
+    }
+
+    if (showPasswordDialog) {
+        ShowPasswordDialog(
+            onDismiss = { showPasswordDialog = false },
+            conversationCreationViewModel = conversationCreationViewModel
+        )
+    }
+    if (showPasswordChangeDialog) {
+        ShowChangePassword(
+            onDismiss = { showPasswordChangeDialog = false },
+            conversationCreationViewModel = conversationCreationViewModel
+        )
+    }
+}
+
+/**
+ * Puts a password the screen already holds through validation, so a dialog that opens on one is as
+ * ready to be saved as a typed password would be.
+ */
+@Composable
+private fun ValidateOnOpen(password: String, conversationCreationViewModel: ConversationCreationViewModel) {
+    LaunchedEffect(Unit) {
+        if (password.isNotEmpty()) {
+            conversationCreationViewModel.passwordValidation.validate(password)
+        }
+    }
+}
+
+@Composable
+fun ConversationOption(
+    icon: Int? = null,
+    text: Int,
+    switch: @Composable (() -> Unit)? = null,
+    onClick: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+            .then(onClick?.let { Modifier.clickable(onClick = it) } ?: Modifier),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            Icon(
+                painter = painterResource(id = icon),
+                contentDescription = null,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(16.dp))
+        } else {
+            Spacer(modifier = Modifier.width(40.dp))
+        }
+        Text(
+            text = stringResource(id = text),
+            modifier = Modifier.weight(1f)
+        )
+        if (switch != null) {
+            switch()
+        }
+    }
+}
+
+@Suppress("LongMethod")
+@Composable
+fun ShowChangePassword(onDismiss: () -> Unit, conversationCreationViewModel: ConversationCreationViewModel) {
+    var changedPassword by remember { mutableStateOf(conversationCreationViewModel.password.value) }
+    ValidateOnOpen(changedPassword, conversationCreationViewModel)
+    val passwordValidationState by conversationCreationViewModel.passwordValidation.state
+        .collectAsStateWithLifecycle()
+    Dialog(onDismissRequest = {
+        onDismiss()
+    }) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .wrapContentHeight()
+                .padding(32.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(color = colorResource(id = R.color.appbar))
+                .verticalScroll(rememberScrollState())
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(vertical = 16.dp, horizontal = 16.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(text = stringResource(id = R.string.nc_set_new_password), fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(16.dp))
+                PasswordPolicyField(
+                    password = changedPassword,
+                    onPasswordChange = {
+                        changedPassword = it
+                        conversationCreationViewModel.passwordValidation.validate(it)
+                    },
+                    validationState = passwordValidationState,
+                    label = stringResource(id = R.string.nc_password)
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    TextButton(
+                        onClick = {
+                            conversationCreationViewModel.updatePassword(changedPassword)
+                            conversationCreationViewModel.passwordValidation.reset()
+                            onDismiss()
+                        },
+                        enabled = changedPassword.isNotBlank() && passwordValidationState.isPasswordAccepted,
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Text(text = stringResource(id = R.string.nc_change_password))
+                    }
+                    if (!conversationCreationViewModel.isPasswordEnforced) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        TextButton(
+                            onClick = {
+                                conversationCreationViewModel.updatePassword("")
+                                conversationCreationViewModel.passwordValidation.reset()
+                                onDismiss()
+                            },
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                text = stringResource(id = R.string.nc_remove_password),
+                                color = colorResource(id = R.color.nc_darkRed)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    TextButton(
+                        onClick = {
+                            conversationCreationViewModel.passwordValidation.reset()
+                            onDismiss()
+                        },
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Text(text = stringResource(id = R.string.nc_cancel))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ShowPasswordDialog(onDismiss: () -> Unit, conversationCreationViewModel: ConversationCreationViewModel) {
+    var password by remember { mutableStateOf(conversationCreationViewModel.password.value) }
+    ValidateOnOpen(password, conversationCreationViewModel)
+    val passwordValidationState by conversationCreationViewModel.passwordValidation.state
+        .collectAsStateWithLifecycle()
+    AlertDialog(
+        containerColor = colorResource(id = R.color.dialog_background),
+        onDismissRequest = onDismiss,
+        title = { Text(text = stringResource(id = R.string.nc_set_password)) },
+        text = {
+            PasswordPolicyField(
+                password = password,
+                onPasswordChange = {
+                    password = it
+                    conversationCreationViewModel.passwordValidation.validate(it)
+                },
+                validationState = passwordValidationState,
+                label = stringResource(id = R.string.nc_guest_access_password_dialog_hint)
+            )
+        },
+        confirmButton = {
+            TextButton(
+                enabled = password.isNotBlank() && passwordValidationState.isPasswordAccepted,
+                onClick = {
+                    conversationCreationViewModel.updatePassword(password)
+                    conversationCreationViewModel.passwordValidation.reset()
+                    onDismiss()
+                }
+            ) {
+                Text(text = stringResource(id = R.string.save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                conversationCreationViewModel.passwordValidation.reset()
+                onDismiss()
+            }) {
+                Text(text = stringResource(id = R.string.nc_cancel))
+            }
+        }
+    )
+}
+
+@Composable
+fun CreateConversation(conversationCreationViewModel: ConversationCreationViewModel, context: Context) {
+    val isCreatingRoom by conversationCreationViewModel.isCreatingRoom.collectAsState()
+    val creationState by conversationCreationViewModel.creationState.collectAsState()
+    val password by conversationCreationViewModel.password.collectAsState()
+    val roomName by conversationCreationViewModel.roomName.collectAsState()
+    var createdPublicConversation by rememberSaveable { mutableStateOf<String?>(null) }
+    var createdWithPassword by rememberSaveable { mutableStateOf(false) }
+    val isPasswordMissing = conversationCreationViewModel.isPasswordEnforced &&
+        conversationCreationViewModel.isGuestsAllowed &&
+        password.isEmpty()
+
+    CreationResultEffect(
+        creationState = creationState,
+        context = context,
+        onPublicConversation = { roomToken, hasPassword ->
+            createdPublicConversation = roomToken
+            createdWithPassword = hasPassword
+        },
+        onHandled = { conversationCreationViewModel.clearCreationState() }
+    )
+
+    val currentUser = conversationCreationViewModel.currentUser
+    ShareCreatedConversation(
+        roomToken = createdPublicConversation,
+        password = password.takeIf { createdWithPassword },
+        currentUser = currentUser,
+        context = context,
+        onDismiss = { roomToken ->
+            createdPublicConversation = null
+            conversationCreationViewModel.clearCreationState()
+            currentUser.id?.let { openConversation(context, it, roomToken) }
+        }
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(all = 16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Button(
+            enabled = !isCreatingRoom &&
+                roomName.isNotBlank() &&
+                !conversationCreationViewModel.isLoadingPresets &&
+                !isPasswordMissing,
+            onClick = {
+                conversationCreationViewModel.createRoomAndAddParticipants()
+            }
+        ) {
+            if (isCreatingRoom) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = LocalContentColor.current
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            }
+            Text(text = stringResource(id = R.string.create_conversation))
+        }
+    }
+}
+
+@Preview(name = "Light Mode")
+@Preview(name = "Dark Mode", uiMode = android.content.res.Configuration.UI_MODE_NIGHT_YES)
+@Preview(name = "RTL / Arabic", locale = "ar")
+@Composable
+fun ConversationCreationScreenPreview() {
+    val context = LocalContext.current
+    val previewUtils = ComposePreviewUtils.getInstance(context)
+    val colorScheme = previewUtils.viewThemeUtils.getColorScheme(context)
+    MaterialTheme(colorScheme = colorScheme) {
+        ConversationCreationScreen(
+            conversationCreationViewModel = previewUtils.conversationCreationViewModel,
+            context = context
+        )
+    }
+}
+
+private fun avatarUri(user: User, avatarId: String, isDarkMode: Boolean): String =
+    ApiUtils.getUrlForAvatar(user.baseUrl, avatarId, true, darkMode = isDarkMode)

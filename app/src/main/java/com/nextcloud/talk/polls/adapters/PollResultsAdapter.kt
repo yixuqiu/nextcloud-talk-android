@@ -49,7 +49,7 @@ class PollResultsAdapter(
                     parent,
                     false
                 )
-                viewHolder = PollResultVotersOverviewViewHolder(user, roomToken, itemBinding)
+                viewHolder = PollResultVotersOverviewViewHolder(user, roomToken, itemBinding, viewThemeUtils)
             }
         }
         return viewHolder!!
@@ -72,11 +72,7 @@ class PollResultsAdapter(
         }
     }
 
-    override fun getItemCount(): Int {
-        return list.size
-    }
+    override fun getItemCount(): Int = list.size
 
-    override fun getItemViewType(position: Int): Int {
-        return list[position].getViewType()
-    }
+    override fun getItemViewType(position: Int): Int = list[position].getViewType()
 }

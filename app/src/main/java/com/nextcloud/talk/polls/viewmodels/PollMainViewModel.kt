@@ -14,6 +14,7 @@ import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.polls.model.Poll
 import com.nextcloud.talk.polls.repositories.PollRepository
 import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -58,6 +59,9 @@ class PollMainViewModel @Inject constructor(private val repository: PollReposito
 
     private var disposable: Disposable? = null
 
+    private val credentials: String?
+        get() = ApiUtils.getCredentials(user.username, user.token)
+
     fun setData(user: User, roomToken: String, isOwnerOrModerator: Boolean, pollId: String, pollTitle: String) {
         this.user = user
         this.roomToken = roomToken
@@ -83,7 +87,18 @@ class PollMainViewModel @Inject constructor(private val repository: PollReposito
 
     private fun loadPoll() {
         _viewState.value = LoadingState
-        repository.getPoll(roomToken, pollId)
+
+        val url = ApiUtils.getUrlForPoll(
+            user.baseUrl!!,
+            roomToken,
+            pollId
+        )
+        repository.getPoll(
+            credentials,
+            url,
+            roomToken,
+            pollId
+        )
             .doOnSubscribe { disposable = it }
             ?.subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
@@ -92,7 +107,19 @@ class PollMainViewModel @Inject constructor(private val repository: PollReposito
 
     fun endPoll() {
         _viewState.value = LoadingState
-        repository.closePoll(roomToken, pollId)
+
+        val url = ApiUtils.getUrlForPoll(
+            user.baseUrl!!,
+            roomToken,
+            pollId
+        )
+
+        repository.closePoll(
+            credentials,
+            url,
+            roomToken,
+            pollId
+        )
             .doOnSubscribe { disposable = it }
             ?.subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
@@ -100,7 +127,6 @@ class PollMainViewModel @Inject constructor(private val repository: PollReposito
     }
 
     override fun onCleared() {
-        super.onCleared()
         disposable?.dispose()
     }
 
@@ -138,35 +164,25 @@ class PollMainViewModel @Inject constructor(private val repository: PollReposito
         }
     }
 
-    private fun showEndPollButton(poll: Poll): Boolean {
-        return !editVotes && poll.status == Poll.STATUS_OPEN && (isPollCreatedByCurrentUser(poll) || isOwnerOrModerator)
-    }
+    private fun showEndPollButton(poll: Poll): Boolean =
+        !editVotes && poll.status == Poll.STATUS_OPEN && (isPollCreatedByCurrentUser(poll) || isOwnerOrModerator)
 
-    private fun showVotersAmount(poll: Poll): Boolean {
-        return votedForPublicPoll(poll) ||
+    private fun showVotersAmount(poll: Poll): Boolean =
+        votedForPublicPoll(poll) ||
             poll.status == Poll.STATUS_CLOSED ||
             isOwnerOrModerator ||
             isPollCreatedByCurrentUser(poll)
-    }
 
-    private fun votedForOpenHiddenPoll(poll: Poll): Boolean {
-        return poll.status == Poll.STATUS_OPEN &&
+    private fun votedForOpenHiddenPoll(poll: Poll): Boolean =
+        poll.status == Poll.STATUS_OPEN &&
             poll.resultMode == Poll.RESULT_MODE_HIDDEN &&
             poll.votedSelf?.isNotEmpty() == true
-    }
 
-    private fun votedForPublicPoll(poll: Poll): Boolean {
-        return poll.resultMode == Poll.RESULT_MODE_PUBLIC &&
+    private fun votedForPublicPoll(poll: Poll): Boolean =
+        poll.resultMode == Poll.RESULT_MODE_PUBLIC &&
             poll.votedSelf?.isNotEmpty() == true
-    }
 
-    private fun isPollCreatedByCurrentUser(poll: Poll): Boolean {
-        if (userManager.currentUser.isEmpty.blockingGet()) {
-            return false
-        } else {
-            return userManager.currentUser.blockingGet().userId == poll.actorId
-        }
-    }
+    private fun isPollCreatedByCurrentUser(poll: Poll): Boolean = user.userId == poll.actorId
 
     fun dismissDialog() {
         _viewState.value = DismissDialogState

@@ -26,9 +26,12 @@ import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.UserIdUtils.getIdForUser
 import com.nextcloud.talk.utils.preferences.AppPreferences
 import io.reactivex.Observer
-import io.reactivex.SingleObserver
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.greenrobot.eventbus.EventBus
 import java.io.File
 import java.io.FileInputStream
@@ -83,7 +86,7 @@ class PushUtils {
     fun verifySignature(signatureBytes: ByteArray?, subjectBytes: ByteArray?): SignatureVerification {
         val signatureVerification = SignatureVerification()
         signatureVerification.signatureValid = false
-        val users = userManager!!.users.blockingGet()
+        val users = runBlocking { userManager!!.getUsers() }
         try {
             val signature = Signature.getInstance("SHA512withRSA")
             if (users != null && users.size > 0) {
@@ -117,14 +120,13 @@ class PushUtils {
     private fun saveKeyToFile(key: Key, path: String): Int {
         val encoded = key.encoded
         try {
-            if (!File(path).exists()) {
-                if (!File(path).createNewFile()) {
-                    return -1
+            return if (!File(path).exists() && !File(path).createNewFile()) {
+                -1
+            } else {
+                FileOutputStream(path).use { keyFileOutputStream ->
+                    keyFileOutputStream.write(encoded)
+                    0
                 }
-            }
-            FileOutputStream(path).use { keyFileOutputStream ->
-                keyFileOutputStream.write(encoded)
-                return 0
             }
         } catch (e: FileNotFoundException) {
             Log.d(TAG, "Failed to save key to file")
@@ -150,38 +152,40 @@ class PushUtils {
         val result = StringBuilder()
         for (individualByte in bytes) {
             result.append(
-                Integer.toString((individualByte.toInt() and 0xff) + 0x100, 16)
+                ((individualByte.toInt() and BYTES_TO_HEX_SUFFIX) + BYTES_TO_HEX_SUFFIX_SUFFIX)
+                    .toString(BYTES_TO_HEX_RADIX)
                     .substring(1)
             )
         }
         return result.toString()
     }
 
+    @Suppress("ReturnCount")
     fun generateRsa2048KeyPair(): Int {
         if (!publicKeyFile.exists() && !privateKeyFile.exists()) {
             var keyGen: KeyPairGenerator? = null
             try {
                 keyGen = KeyPairGenerator.getInstance("RSA")
-                keyGen.initialize(2048)
+                keyGen.initialize(RSA_KEY_SIZE)
                 val pair = keyGen.generateKeyPair()
                 val statusPrivate = saveKeyToFile(pair.private, privateKeyFile.absolutePath)
                 val statusPublic = saveKeyToFile(pair.public, publicKeyFile.absolutePath)
                 return if (statusPrivate == 0 && statusPublic == 0) {
                     // all went well
-                    0
+                    RETURN_CODE_KEY_GENERATION_SUCCESSFUL
                 } else {
-                    -2
+                    RETURN_CODE_KEY_GENERATION_FAILED
                 }
             } catch (e: NoSuchAlgorithmException) {
                 Log.d(TAG, "RSA algorithm not supported")
             }
         } else {
             // We already have the key
-            return -1
+            return RETURN_CODE_KEY_ALREADY_EXISTS
         }
 
         // we failed to generate the key
-        return -2
+        return RETURN_CODE_KEY_GENERATION_FAILED
     }
 
     fun pushRegistrationToServer(ncApi: NcApi) {
@@ -197,7 +201,7 @@ class PushUtils {
                 devicePublicKeyBase64 = devicePublicKeyBase64.replace("(.{64})".toRegex(), "$1\n")
                 devicePublicKeyBase64 = "-----BEGIN PUBLIC KEY-----\n$devicePublicKeyBase64\n-----END PUBLIC KEY-----"
 
-                val users = userManager!!.users.blockingGet()
+                val users = runBlocking { userManager!!.getUsers() }
                 for (user in users) {
                     if (!user.scheduledForDeletion) {
                         val nextcloudRegisterPushMap: MutableMap<String, String> = HashMap()
@@ -221,6 +225,7 @@ class PushUtils {
         user: User
     ) {
         val credentials = ApiUtils.getCredentials(user.username, user.token)
+        Log.d(TAG, "Registering proxy push with ${user.userId}'s server.")
         ncApi.registerDeviceForNotificationsWithNextcloud(
             credentials,
             ApiUtils.getUrlNextcloudPush(user.baseUrl!!),
@@ -295,6 +300,7 @@ class PushUtils {
     }
 
     @Throws(IOException::class)
+    @Suppress("TooGenericExceptionCaught")
     private fun updatePushStateForUser(proxyMap: Map<String, String?>, user: User) {
         val pushConfigurationState = PushConfigurationState()
         pushConfigurationState.pushToken = proxyMap["pushToken"]
@@ -303,32 +309,23 @@ class PushUtils {
         pushConfigurationState.userPublicKey = proxyMap["userPublicKey"]
         pushConfigurationState.usesRegularPass = java.lang.Boolean.FALSE
         if (user.id != null) {
-            userManager!!.updatePushState(user.id!!, pushConfigurationState).subscribe(object : SingleObserver<Int?> {
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onSuccess(integer: Int) {
-                    eventBus!!.post(
-                        EventStatus(
-                            getIdForUser(user),
-                            EventStatus.EventType.PUSH_REGISTRATION,
-                            true
-                        )
-                    )
-                }
-
-                override fun onError(e: Throwable) {
+            val userId = user.id!!
+            CoroutineScope(Dispatchers.IO).launch {
+                val success = try {
+                    userManager!!.updatePushState(userId, pushConfigurationState)
+                    true
+                } catch (e: Exception) {
                     Log.e(TAG, "update push state for user failed", e)
-                    eventBus!!.post(
-                        EventStatus(
-                            getIdForUser(user),
-                            EventStatus.EventType.PUSH_REGISTRATION,
-                            false
-                        )
-                    )
+                    false
                 }
-            })
+                eventBus!!.post(
+                    EventStatus(
+                        getIdForUser(user),
+                        EventStatus.EventType.PUSH_REGISTRATION,
+                        success
+                    )
+                )
+            }
         } else {
             Log.e(TAG, "failed to update updatePushStateForUser. user.getId() was null")
         }
@@ -399,6 +396,13 @@ class PushUtils {
 
     companion object {
         private const val TAG = "PushUtils"
+        private const val RSA_KEY_SIZE: Int = 2048
+        private const val RETURN_CODE_KEY_GENERATION_SUCCESSFUL: Int = 0
+        private const val RETURN_CODE_KEY_ALREADY_EXISTS: Int = -1
+        private const val RETURN_CODE_KEY_GENERATION_FAILED: Int = -2
+        private const val BYTES_TO_HEX_RADIX: Int = 16
+        private const val BYTES_TO_HEX_SUFFIX = 0xff
+        private const val BYTES_TO_HEX_SUFFIX_SUFFIX = 0x100
         const val LATEST_PUSH_REGISTRATION_AT_SERVER: String = "LATEST_PUSH_REGISTRATION_AT_SERVER"
         const val LATEST_PUSH_REGISTRATION_AT_PUSH_PROXY: String = "LATEST_PUSH_REGISTRATION_AT_PUSH_PROXY"
     }

@@ -11,13 +11,14 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import com.github.aurae.retrofit2.LoganSquareConverterFactory;
-import com.nextcloud.talk.BuildConfig;
-import com.nextcloud.talk.R;
+import com.nextcloud.talk.api.LoggingHttpInterceptor;
 import com.nextcloud.talk.api.NcApi;
+import com.nextcloud.talk.api.NcApiCoroutines;
 import com.nextcloud.talk.application.NextcloudTalkApplication;
 import com.nextcloud.talk.users.UserManager;
+import com.nextcloud.talk.utils.AccountCookieInterceptor;
 import com.nextcloud.talk.utils.ApiUtils;
-import com.nextcloud.talk.utils.LoggingUtils;
+import com.nextcloud.talk.utils.RejectedCredentialsInterceptor;
 import com.nextcloud.talk.utils.preferences.AppPreferences;
 import com.nextcloud.talk.utils.ssl.KeyManager;
 import com.nextcloud.talk.utils.ssl.SSLSocketFactoryCompat;
@@ -54,8 +55,6 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.Route;
-import okhttp3.internal.tls.OkHostnameVerifier;
-import okhttp3.logging.HttpLoggingInterceptor;
 import retrofit2.Retrofit;
 import retrofit2.adapter.rxjava2.RxJava2CallAdapterFactory;
 
@@ -74,6 +73,13 @@ public class RestModule {
     NcApi provideNcApi(Retrofit retrofit) {
         return retrofit.create(NcApi.class);
     }
+
+    @Singleton
+    @Provides
+    NcApiCoroutines provideNcApiCoroutines(Retrofit retrofit) {
+        return retrofit.create(NcApiCoroutines.class);
+    }
+
 
     @Singleton
     @Provides
@@ -174,7 +180,10 @@ public class RestModule {
     OkHttpClient provideHttpClient(Proxy proxy, AppPreferences appPreferences,
                                    TrustManager trustManager,
                                    SSLSocketFactoryCompat sslSocketFactoryCompat, Cache cache,
-                                   CookieManager cookieManager, Dispatcher dispatcher) {
+                                   CookieManager cookieManager,
+                                   Dispatcher dispatcher,
+                                   LoggingHttpInterceptor loggingHttpInterceptor,
+                                   AccountCookieInterceptor accountCookieInterceptor) {
         OkHttpClient.Builder httpClient = new OkHttpClient.Builder();
 
         httpClient.retryOnConnectionFailure(true);
@@ -188,7 +197,8 @@ public class RestModule {
         // Trust own CA and all self-signed certs
         httpClient.sslSocketFactory(sslSocketFactoryCompat, trustManager);
         httpClient.retryOnConnectionFailure(true);
-        httpClient.hostnameVerifier(trustManager.getHostnameVerifier(OkHostnameVerifier.INSTANCE));
+        // okhttp's default verifier (OkHostnameVerifier), read through public API instead of okhttp3.internal
+        httpClient.hostnameVerifier(trustManager.getHostnameVerifier(new OkHttpClient().hostnameVerifier()));
 
         httpClient.dispatcher(dispatcher);
         if (!Proxy.NO_PROXY.equals(proxy)) {
@@ -207,48 +217,52 @@ public class RestModule {
         }
 
         httpClient.addInterceptor(new HeadersInterceptor());
-
-        if (BuildConfig.DEBUG && !context.getResources().getBoolean(R.bool.nc_is_debug)) {
-            HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor();
-            loggingInterceptor.setLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.redactHeader("Authorization");
-            loggingInterceptor.redactHeader("Proxy-Authorization");
-            httpClient.addInterceptor(loggingInterceptor);
-        } else if (context.getResources().getBoolean(R.bool.nc_is_debug)) {
-            HttpLoggingInterceptor.Logger fileLogger =
-                s -> LoggingUtils.INSTANCE.writeLogEntryToFile(context, s);
-            HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor(fileLogger);
-            loggingInterceptor.setLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.redactHeader("Authorization");
-            loggingInterceptor.redactHeader("Proxy-Authorization");
-            httpClient.addInterceptor(loggingInterceptor);
-        }
+        httpClient.addInterceptor(new RejectedCredentialsInterceptor());
+        httpClient.addInterceptor(loggingHttpInterceptor);
+        // Each account keeps its own cookies, so its server session is kept but never used by another account.
+        httpClient.addNetworkInterceptor(accountCookieInterceptor);
 
         return httpClient.build();
     }
 
     public static class HeadersInterceptor implements Interceptor {
 
+        private static final String OCS_V1_PATH = "/ocs/v1.php";
+        private static final String OCS_V2_PATH = "/ocs/v2.php";
+
         @NonNull
         @Override
         public Response intercept(@NonNull Chain chain) throws IOException {
             Request original = chain.request();
-            Request request = original.newBuilder()
-                .header("User-Agent", ApiUtils.getUserAgent())
-                .header("Accept", "application/json")
-                .header("OCS-APIRequest", "true")
+            Request.Builder requestBuilder = original.newBuilder()
                 .header("ngrok-skip-browser-warning", "true")
-                .method(original.method(), original.body())
-                .build();
+                .method(original.method(), original.body());
+
+            if (TextUtils.isEmpty(original.header("User-Agent"))) {
+                requestBuilder.header("User-Agent", ApiUtils.getUserAgent());
+            }
+
+            if (isOcsEndpoint(original)) {
+                requestBuilder
+                    .header("Accept", "application/json")
+                    .header("OCS-APIRequest", "true");
+            }
+
+            Request request = requestBuilder.build();
 
             return chain.proceed(request);
+        }
+
+        private boolean isOcsEndpoint(@NonNull Request request) {
+            String path = request.url().encodedPath();
+            return path.contains(OCS_V1_PATH) || path.contains(OCS_V2_PATH);
         }
     }
 
     public static class HttpAuthenticator implements Authenticator {
 
-        private String credentials;
-        private String authenticatorType;
+        private final String credentials;
+        private final String authenticatorType;
 
         public HttpAuthenticator(@NonNull String credentials, @NonNull String authenticatorType) {
             this.credentials = credentials;
@@ -281,7 +295,7 @@ public class RestModule {
 
     private class GetProxyRunnable implements Runnable {
         private volatile Proxy proxy;
-        private AppPreferences appPreferences;
+        private final AppPreferences appPreferences;
 
         GetProxyRunnable(AppPreferences appPreferences) {
             this.appPreferences = appPreferences;

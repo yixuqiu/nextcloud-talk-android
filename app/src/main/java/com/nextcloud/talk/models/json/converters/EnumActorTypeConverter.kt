@@ -8,29 +8,30 @@
 package com.nextcloud.talk.models.json.converters
 
 import com.bluelinelabs.logansquare.typeconverters.StringBasedTypeConverter
-import com.nextcloud.talk.models.json.participants.Participant
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.CIRCLES
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.DUMMY
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.EMAILS
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.FEDERATED
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.GROUPS
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.GUESTS
-import com.nextcloud.talk.models.json.participants.Participant.ActorType.USERS
+import com.nextcloud.talk.models.json.participants.ParticipantDto
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.CIRCLES
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.DUMMY
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.EMAILS
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.FEDERATED
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.GROUPS
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.GUESTS
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.USERS
+import com.nextcloud.talk.models.json.participants.ParticipantDto.ActorType.PHONES
 
-class EnumActorTypeConverter : StringBasedTypeConverter<Participant.ActorType>() {
-    override fun getFromString(string: String?): Participant.ActorType {
-        return when (string) {
+class EnumActorTypeConverter : StringBasedTypeConverter<ParticipantDto.ActorType>() {
+    override fun getFromString(string: String?): ParticipantDto.ActorType =
+        when (string) {
             "emails" -> EMAILS
             "groups" -> GROUPS
             "guests" -> GUESTS
             "users" -> USERS
             "circles" -> CIRCLES
             "federated_users" -> FEDERATED
+            "phones" -> PHONES
             else -> DUMMY
         }
-    }
 
-    override fun convertToString(`object`: Participant.ActorType?): String {
+    override fun convertToString(`object`: ParticipantDto.ActorType?): String {
         if (`object` == null) {
             return ""
         }
@@ -42,6 +43,7 @@ class EnumActorTypeConverter : StringBasedTypeConverter<Participant.ActorType>()
             USERS -> "users"
             CIRCLES -> "circles"
             FEDERATED -> "federated_users"
+            PHONES -> "phones"
             else -> ""
         }
     }

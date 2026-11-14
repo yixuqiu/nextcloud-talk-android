@@ -1,0 +1,1122 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.chat.data.network
+
+import android.os.Bundle
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.conversationlist.data.network.ConversationListUpdater
+import com.nextcloud.talk.data.database.dao.ChatBlocksDao
+import com.nextcloud.talk.data.database.dao.ChatMessagesDao
+import com.nextcloud.talk.data.database.dao.ConversationsDao
+import com.nextcloud.talk.data.database.mappers.asEntity
+import com.nextcloud.talk.data.database.model.ChatBlockEntity
+import com.nextcloud.talk.data.database.model.ChatMessageEntity
+import com.nextcloud.talk.data.database.model.ConversationEntity
+import com.nextcloud.talk.data.database.model.SendStatus
+import com.nextcloud.talk.data.network.NetworkMonitor
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.logger.Logger
+import com.nextcloud.talk.models.domain.ConversationModel
+import com.nextcloud.talk.models.json.capabilities.CapabilitiesDto
+import com.nextcloud.talk.models.json.capabilities.SpreedCapabilityDto
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
+import com.nextcloud.talk.models.json.chat.ChatOCS
+import com.nextcloud.talk.models.json.chat.ChatOCSSingleMessage
+import com.nextcloud.talk.models.json.chat.ChatOverall
+import com.nextcloud.talk.models.json.chat.ChatOverallSingleMessage
+import com.nextcloud.talk.models.json.generic.GenericMetaDto
+import com.nextcloud.talk.models.json.generic.GenericOverall
+import com.nextcloud.talk.models.json.conversations.ConversationDto
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.mockito.kotlin.after
+import org.mockito.kotlin.any
+import org.mockito.kotlin.argumentCaptor
+import org.mockito.kotlin.atLeastOnce
+import org.mockito.kotlin.clearInvocations
+import org.mockito.kotlin.eq
+import org.mockito.kotlin.doSuspendableAnswer
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
+import org.mockito.kotlin.timeout
+import org.mockito.kotlin.times
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.verifyBlocking
+import org.mockito.kotlin.whenever
+import org.mockito.kotlin.wheneverBlocking
+import retrofit2.HttpException
+import retrofit2.Response
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Covers the unread-boundary decisions of [OfflineFirstChatRepository.loadInitialMessages]: the
+ * cached window (the latest chat block) is only trusted when it reaches back to the conversation's
+ * last read message, otherwise the initial window is re-fetched — anchored at the boundary when
+ * the unread backlog calls for it.
+ */
+@Suppress("TooManyFunctions", "LargeClass")
+class OfflineFirstChatRepositoryTest {
+
+    private val logger: Logger = mock()
+    private val chatDao: ChatMessagesDao = mock()
+    private val chatBlocksDao: ChatBlocksDao = mock()
+    private val conversationsDao: ConversationsDao = mock()
+    private val network: ChatNetworkDataSource = mock()
+    private val networkMonitor: NetworkMonitor = mock()
+    private val conversationListUpdater = ConversationListUpdater(chatDao, chatBlocksDao, conversationsDao)
+
+    private lateinit var repository: OfflineFirstChatRepository
+
+    @Before
+    fun setUp() {
+        whenever(networkMonitor.isOnline).thenReturn(MutableStateFlow(true))
+        wheneverBlocking { chatDao.deleteExpiredMessages(eq(INTERNAL_CONVERSATION_ID), any()) }.thenReturn(0)
+        whenever(chatBlocksDao.getChatBlocksContainingMessageId(eq(INTERNAL_CONVERSATION_ID), eq(null), any()))
+            .thenReturn(flowOf(emptyList()))
+
+        repository = OfflineFirstChatRepository(
+            logger,
+            chatDao,
+            chatBlocksDao,
+            network,
+            networkMonitor,
+            ChatMessageSyncer(
+                chatDao,
+                chatBlocksDao,
+                network,
+                networkMonitor,
+                ConversationListUpdater(chatDao, chatBlocksDao, conversationsDao)
+            ),
+            conversationListUpdater
+        )
+        repository.initData(user(), CREDENTIALS, CHAT_URL, ROOM_TOKEN, null)
+    }
+
+    @Test
+    fun `long polling waits before the next request after a rejected one`() =
+        runBlocking {
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.error(HTTP_UNAUTHORIZED, "".toResponseBody("text/plain".toMediaType())))
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            // shorter than the wait after a failed request, so only the first request may have been sent
+            delay(LONG_POLLING_OBSERVATION_MILLIS)
+            polling.cancelAndJoin()
+
+            verifyBlocking(network, times(1)) { pullChatMessages(any(), any(), any()) }
+        }
+
+    @Test
+    fun `long polling keeps the wait after a rejected request when the chat is paused and resumed`() =
+        runBlocking {
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.error(HTTP_UNAUTHORIZED, "".toResponseBody("text/plain".toMediaType())))
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            verifyBlocking(network, timeout(AWAIT_TIMEOUT_MILLIS).times(1)) { pullChatMessages(any(), any(), any()) }
+            // a pause and resume during the wait after the failed request
+            repository.handleOnPause()
+            delay(LONG_POLLING_OBSERVATION_MILLIS)
+            repository.handleOnResume()
+
+            // the resume must not send the next request before the wait has passed
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `long polling does not wait longer after a failed request once the device is online again`() =
+        runBlocking {
+            val isOnline = MutableStateFlow(true)
+            whenever(networkMonitor.isOnline).thenReturn(isOnline)
+            val firstRequestSent = CompletableDeferred<Unit>()
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) } doSuspendableAnswer {
+                firstRequestSent.complete(Unit)
+                Response.error(HTTP_UNAUTHORIZED, "".toResponseBody("text/plain".toMediaType()))
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            // only go offline once the first request failed, so its wait is what the reconnect has to end
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { firstRequestSent.await() }
+            isOnline.value = false
+            delay(LONG_POLLING_OBSERVATION_MILLIS)
+            isOnline.value = true
+
+            // still shorter than the wait after a failed request
+            verify(network, timeout(LONG_POLLING_OBSERVATION_MILLIS * 2).times(2))
+                .pullChatMessages(any(), any(), any())
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `markPendingReadMarker registers the marker synchronously, without any suspension`() {
+        // Leaving the chat can race a room list sync triggered by the conversation list resuming
+        // at (almost) the same time - that race is only guarded correctly if the pending marker
+        // already exists by the time the sync's response is merged, so registering it must not
+        // wait on updateLocalReadState's database reads. Calling it outside of runTest/any
+        // coroutine proves no suspension is involved.
+        repository.markPendingReadMarker(42)
+
+        assertEquals(42, conversationListUpdater.pendingReadMarker(INTERNAL_CONVERSATION_ID))
+    }
+
+    @Test
+    fun `loadInitialMessages closes the backlog when the latest block reaches the last read message`() =
+        runTest {
+            givenLatestBlock(block(oldest = 10, newest = 50))
+            repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 5))
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.success(overall(message(51))))
+
+            repository.loadInitialMessages(Bundle())
+
+            val fieldMap = singleRequestFieldMap()
+            assertEquals(1, fieldMap["lookIntoFuture"])
+            assertEquals(0, fieldMap["includeLastKnown"])
+            assertEquals(50, fieldMap["lastKnownMessageId"])
+        }
+
+    @Test
+    fun `loadInitialMessages treats a block without history below as reaching the boundary`() =
+        runTest {
+            givenLatestBlock(block(oldest = 45, newest = 50, hasHistory = false))
+            repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 5))
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.success(overall(message(51))))
+
+            repository.loadInitialMessages(Bundle())
+
+            val fieldMap = singleRequestFieldMap()
+            assertEquals(1, fieldMap["lookIntoFuture"])
+            assertEquals(50, fieldMap["lastKnownMessageId"])
+        }
+
+    @Test
+    fun `loadInitialMessages anchors the repair fetch when the latest block floats above the boundary`() =
+        runTest {
+            givenLatestBlock(block(oldest = 100, newest = 199))
+            repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 160))
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.success(overall(message(40), message(41))))
+
+            repository.loadInitialMessages(Bundle())
+
+            val fieldMap = singleRequestFieldMap()
+            assertEquals(1, fieldMap["lookIntoFuture"])
+            assertEquals(1, fieldMap["includeLastKnown"])
+            assertEquals(40, fieldMap["lastKnownMessageId"])
+            // opening the chat clears notifications, so the fetch must not keep them
+            assertFalse(fieldMap.containsKey("markNotificationsAsRead"))
+        }
+
+    @Test
+    fun `loadInitialMessages anchors the initial fetch for an empty cache with a large backlog`() =
+        runTest {
+            givenLatestBlock(null)
+            repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 160))
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.success(overall(message(40), message(41))))
+
+            repository.loadInitialMessages(Bundle())
+
+            val fieldMap = singleRequestFieldMap()
+            assertEquals(1, fieldMap["lookIntoFuture"])
+            assertEquals(1, fieldMap["includeLastKnown"])
+            assertEquals(40, fieldMap["lastKnownMessageId"])
+        }
+
+    @Test
+    fun `loadInitialMessages fetches the newest messages for an empty cache with a small backlog`() =
+        runTest {
+            givenLatestBlock(null)
+            repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 5))
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+                .thenReturn(Response.success(overall(message(44), message(45))))
+
+            repository.loadInitialMessages(Bundle())
+
+            val fieldMap = singleRequestFieldMap()
+            assertEquals(0, fieldMap["lookIntoFuture"])
+            assertEquals(1, fieldMap["includeLastKnown"])
+            assertFalse(fieldMap.containsKey("lastKnownMessageId"))
+        }
+
+    @Test
+    fun `long polling keeps the open request on pause and opens the next one only after the resume`() =
+        runBlocking {
+            val requestsStarted = Channel<Unit>(Channel.UNLIMITED)
+            val answerFirstRequest = CompletableDeferred<Unit>()
+            // set on the thread of the request, read by the test
+            val firstRequestCancelled = AtomicBoolean(false)
+            var pullCount = 0
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                pullCount++
+                requestsStarted.trySend(Unit)
+                if (pullCount > 1) awaitCancellation()
+                try {
+                    answerFirstRequest.await()
+                } catch (e: CancellationException) {
+                    firstRequestCancelled.set(true)
+                    throw e
+                }
+                Response.success(overall())
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+
+            repository.handleOnPause()
+            // the server would keep processing a cancelled request anyway, so the open one is left running
+            delay(LONG_POLLING_OBSERVATION_MILLIS)
+            assertFalse(firstRequestCancelled.get())
+
+            answerFirstRequest.complete(Unit)
+            // no new request is opened while the chat stays paused
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+
+            repository.handleOnResume()
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `long polling waits for the network when the device went offline during the pause`() =
+        runBlocking {
+            val isOnline = MutableStateFlow(true)
+            whenever(networkMonitor.isOnline).thenReturn(isOnline)
+            val requestsStarted = Channel<Unit>(Channel.UNLIMITED)
+            val answerFirstRequest = CompletableDeferred<Unit>()
+            var pullCount = 0
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                pullCount++
+                requestsStarted.trySend(Unit)
+                if (pullCount > 1) awaitCancellation()
+                answerFirstRequest.await()
+                Response.success(overall())
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+            repository.handleOnPause()
+            answerFirstRequest.complete(Unit)
+            // the loop waits for the resume while the device is still online ...
+            delay(LONG_POLLING_OBSERVATION_MILLIS)
+            isOnline.value = false
+            repository.handleOnResume()
+
+            // ... and must not send the next request offline after the resume
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+            isOnline.value = true
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `long polling waits for the network instead of retrying a request that failed offline`() =
+        runBlocking {
+            val isOnline = MutableStateFlow(true)
+            whenever(networkMonitor.isOnline).thenReturn(isOnline)
+            val requestsStarted = Channel<Unit>(Channel.UNLIMITED)
+            var pullCount = 0
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                pullCount++
+                requestsStarted.trySend(Unit)
+                if (pullCount > 1) awaitCancellation()
+                isOnline.value = false
+                throw IOException("network lost")
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+
+            // the syncer would send its retry after one second
+            verifyBlocking(network, after(RETRY_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+            isOnline.value = true
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestsStarted.receive() }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `long polling does not retry a request that fails while the chat is paused`() =
+        runBlocking {
+            val requestStarted = CompletableDeferred<Unit>()
+            val failRequest = CompletableDeferred<Unit>()
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                requestStarted.complete(Unit)
+                failRequest.await()
+                throw IOException("socket closed by the system")
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            withTimeout(AWAIT_TIMEOUT_MILLIS) { requestStarted.await() }
+            repository.handleOnPause()
+            failRequest.complete(Unit)
+
+            // the syncer would send its retry after one second
+            verifyBlocking(network, after(RETRY_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `long polling repeats a failed first request without a timeout`() =
+        runBlocking {
+            var pullCount = 0
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                pullCount++
+                if (pullCount > 1) awaitCancellation()
+                Response.error<ChatOverall>(HTTP_UNAUTHORIZED, "".toResponseBody("text/plain".toMediaType()))
+            }
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+            verifyBlocking(network, timeout(AWAIT_TIMEOUT_MILLIS).times(2)) { pullChatMessages(any(), any(), any()) }
+            polling.cancelAndJoin()
+
+            val fieldMapCaptor = argumentCaptor<HashMap<String, Int>>()
+            verifyBlocking(network, times(2)) { pullChatMessages(any(), any(), fieldMapCaptor.capture()) }
+            assertEquals(listOf(0, 0), fieldMapCaptor.allValues.map { it["timeout"] })
+        }
+
+    @Test
+    fun `long polling backs off and goes on after a CancellationException that no pause caused`() =
+        runBlocking {
+            var pullCount = 0
+            wheneverBlocking { network.pullChatMessages(any(), any(), any()) }.doSuspendableAnswer {
+                pullCount++
+                // later long polls stay open like on a server without new messages
+                if (pullCount > 1) awaitCancellation()
+                Response.success(overall(message(1)))
+            }
+            whenever(chatBlocksDao.getChatBlocksContainingMessageId(eq(INTERNAL_CONVERSATION_ID), eq(null), any()))
+                .thenThrow(CancellationException("not caused by a pause"))
+                .thenReturn(flowOf(emptyList()))
+
+            val polling = launch(Dispatchers.Default) { repository.initLongPolling() }
+
+            // treated as a failed request: no immediate next request ...
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).times(1)) {
+                pullChatMessages(any(), any(), any())
+            }
+            // ... but the next one follows after the backoff instead of the polling stopping
+            verifyBlocking(network, timeout(AWAIT_TIMEOUT_MILLIS).times(2)) {
+                pullChatMessages(any(), any(), any())
+            }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `insurance requests are skipped while the chat is paused`() =
+        runTest {
+            givenHttpSyncedAnchor()
+            clearInvocations(network)
+            repository.handleOnPause()
+            val polling = launch { repository.initInsuranceRequests() }
+
+            advanceTimeBy(INSURANCE_DELAY_MS * 5 + 1)
+            runCurrent()
+
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).never()) {
+                pullChatMessages(any(), any(), any())
+            }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `insurance requests resume with the next tick after the chat is resumed`() =
+        runTest {
+            givenHttpSyncedAnchor()
+            clearInvocations(network)
+            repository.handleOnPause()
+            val polling = launch { repository.initInsuranceRequests() }
+            advanceTimeBy(INSURANCE_DELAY_MS * 3 + 1)
+            runCurrent()
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).never()) {
+                pullChatMessages(any(), any(), any())
+            }
+
+            repository.handleOnResume()
+            // the loop keeps its normal step: nothing is sent before the next tick ...
+            advanceTimeBy(INSURANCE_DELAY_MS / 2)
+            runCurrent()
+            verifyBlocking(network, after(LONG_POLLING_OBSERVATION_MILLIS).never()) {
+                pullChatMessages(any(), any(), any())
+            }
+
+            // ... and the request is sent on it, from the pull flow on Dispatchers.IO that runCurrent doesn't wait for
+            advanceTimeBy(INSURANCE_DELAY_MS / 2)
+            runCurrent()
+            verifyBlocking(network, timeout(AWAIT_TIMEOUT_MILLIS).times(1)) {
+                pullChatMessages(eq(CREDENTIALS), eq(CHAT_URL), any())
+            }
+            polling.cancelAndJoin()
+        }
+
+    @Test
+    fun `fetchNewMessages skips the request when no HTTP-synced anchor exists yet`() =
+        runTest {
+            // a fresh ChatMessageSyncer has recorded no HTTP sync for any conversation yet, so
+            // this is the state of a room whose initial load hasn't fetched anything so far —
+            // anchoring at 0 would try to close the backlog from the start of its history instead
+            val result = repository.fetchNewMessages()
+
+            assertFalse(result)
+            verifyBlocking(network, never()) { pullChatMessages(any(), any(), any()) }
+        }
+
+    @Test
+    fun `fetchNewMessages keeps notifications only while the chat is paused`() =
+        runTest {
+            givenHttpSyncedAnchor()
+            repository.fetchNewMessages()
+            assertFalse(lastRequestFieldMap().containsKey("markNotificationsAsRead"))
+
+            repository.handleOnPause()
+            repository.fetchNewMessages()
+            assertEquals(0, lastRequestFieldMap()["markNotificationsAsRead"])
+
+            repository.handleOnResume()
+            repository.fetchNewMessages()
+            assertFalse(lastRequestFieldMap().containsKey("markNotificationsAsRead"))
+        }
+
+    @Test
+    fun `addTemporaryMessage upserts a pending local echo and emits it on success`() =
+        runTest {
+            repository.updateConversation(conversation(lastReadMessage = 0, unreadMessages = 0))
+
+            val result = repository.addTemporaryMessage(
+                message = "hello",
+                displayName = "Me",
+                replyTo = 0,
+                sendWithoutNotification = false,
+                referenceId = "ref-1"
+            ).toList().single()
+
+            assertTrue(result.isSuccess)
+            assertEquals("hello", result.getOrNull()?.message)
+            assertEquals(SendStatus.PENDING, result.getOrNull()?.sendStatus)
+            assertEquals(true, result.getOrNull()?.isTemporary)
+
+            val entityCaptor = argumentCaptor<ChatMessageEntity>()
+            verifyBlocking(chatDao) { upsertChatMessage(entityCaptor.capture()) }
+            assertEquals(INTERNAL_CONVERSATION_ID, entityCaptor.firstValue.internalConversationId)
+            assertEquals("ref-1", entityCaptor.firstValue.referenceId)
+        }
+
+    @Test
+    fun `addTemporaryMessage tolerates a collector that stops after the first value`() =
+        runTest {
+            // first()/take(1) cancel the flow right after receiving one value, which used to
+            // surface as "Flow exception transparency is violated" because that cancellation was
+            // caught by addTemporaryMessage's own catch(Exception) block and turned into a second,
+            // illegal emit() call.
+            repository.updateConversation(conversation(lastReadMessage = 0, unreadMessages = 0))
+
+            val result = repository.addTemporaryMessage(
+                message = "hello",
+                displayName = "Me",
+                replyTo = 0,
+                sendWithoutNotification = false,
+                referenceId = "ref-1b"
+            ).first()
+
+            assertTrue(result.isSuccess)
+        }
+
+    @Test
+    fun `markMessageForResend resets a failed temp message back to PENDING without sending anything`() =
+        runTest {
+            val failedMessage = tempMessageEntity(referenceId = "ref-2", sendStatus = SendStatus.FAILED)
+            whenever(chatDao.getTempMessageForConversation(INTERNAL_CONVERSATION_ID, "ref-2", null))
+                .thenReturn(flowOf(failedMessage))
+
+            val result = repository.markMessageForResend("ref-2").toList().single()
+
+            assertTrue(result.isSuccess)
+            assertEquals(SendStatus.PENDING, result.getOrNull()?.sendStatus)
+            assertEquals(SendStatus.PENDING, failedMessage.sendStatus)
+            verify(chatDao).updateChatMessage(failedMessage)
+            // resending is only a local status reset - the actual send is left to SendMessageWorker
+            verifyBlocking(network, never()) { sendChatMessage(any(), any(), any(), any(), any(), any(), any(), any()) }
+        }
+
+    @Test
+    fun `markMessageForResend fails when no temp message exists for the reference id`() =
+        runTest {
+            whenever(chatDao.getTempMessageForConversation(INTERNAL_CONVERSATION_ID, "missing", null))
+                .thenReturn(flowOf(null))
+
+            val result = repository.markMessageForResend("missing").toList().single()
+
+            assertTrue(result.isFailure)
+            verify(chatDao, never()).updateChatMessage(any())
+        }
+
+    private fun tempMessageEntity(referenceId: String, sendStatus: SendStatus): ChatMessageEntity =
+        ChatMessageEntity(
+            internalId = "$INTERNAL_CONVERSATION_ID@_temp_$referenceId",
+            accountId = ACCOUNT_ID,
+            token = ROOM_TOKEN,
+            internalConversationId = INTERNAL_CONVERSATION_ID,
+            actorDisplayName = "Me",
+            message = "hello",
+            actorId = "me",
+            actorType = "users",
+            messageType = "comment",
+            systemMessageType = ChatMessage.SystemMessageType.DUMMY,
+            referenceId = referenceId,
+            isTemporary = true,
+            sendStatus = sendStatus
+        )
+
+    private fun givenLatestBlock(block: ChatBlockEntity?) {
+        whenever(chatBlocksDao.getLatestChatBlock(INTERNAL_CONVERSATION_ID, null))
+            .thenReturn(flowOf(block))
+    }
+
+    private fun lastRequestFieldMap(): HashMap<String, Int> {
+        val fieldMapCaptor = argumentCaptor<HashMap<String, Int>>()
+        verifyBlocking(network, atLeastOnce()) { pullChatMessages(any(), any(), fieldMapCaptor.capture()) }
+        assertEquals(51, fieldMapCaptor.lastValue["lastKnownMessageId"]) // insurance request, not the initial load
+        return fieldMapCaptor.lastValue
+    }
+
+    /** Records an HTTP sync anchor via the initial load, so fetchNewMessages does not skip. */
+    private suspend fun givenHttpSyncedAnchor() {
+        givenLatestBlock(block(oldest = 10, newest = 50))
+        repository.updateConversation(conversation(lastReadMessage = 40, unreadMessages = 5))
+        wheneverBlocking { network.pullChatMessages(any(), any(), any()) }
+            .thenReturn(Response.success(overall(message(51))))
+        repository.loadInitialMessages(Bundle())
+    }
+
+    private fun singleRequestFieldMap(): HashMap<String, Int> {
+        val fieldMapCaptor = argumentCaptor<HashMap<String, Int>>()
+        verifyBlocking(network) { pullChatMessages(eq(CREDENTIALS), eq(CHAT_URL), fieldMapCaptor.capture()) }
+        return fieldMapCaptor.firstValue
+    }
+
+    @Test
+    fun `deleteChatMessage marks the message as deleted before the server answers`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            val stateWhenAsked = mutableListOf<Pair<String, String>>()
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                stateWhenAsked.add(entity.messageType to entity.message)
+                deletedResponse()
+            }
+
+            val result = repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertEquals(listOf("comment_deleted" to DELETED_PLACEHOLDER), stateWhenAsked)
+            assertTrue(result.isSuccess)
+            assertEquals("comment_deleted", entity.messageType)
+            assertTrue(entity.deleted)
+        }
+
+    @Test
+    fun `deleteChatMessage restores the message when the server rejects the deletion`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            val result = repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertTrue(result.isFailure)
+            assertEquals("comment", entity.messageType)
+            assertEquals("message $MESSAGE_ID", entity.message)
+            assertFalse(entity.deleted)
+        }
+
+    @Test
+    fun `deleteChatMessage keeps the deletion when the server no longer knows the message`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_NOT_FOUND)
+            }
+
+            val result = repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertTrue(result.isSuccess)
+            assertNull(result.getOrThrow())
+            assertEquals("comment_deleted", entity.messageType)
+        }
+
+    @Test
+    fun `deleteChatMessage retries a transient failure once before giving up`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            var attempts = 0
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                attempts++
+                if (attempts == 1) throw IOException("connection reset")
+                deletedResponse()
+            }
+
+            val result = repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertEquals(2, attempts)
+            assertTrue(result.isSuccess)
+            assertEquals("comment_deleted", entity.messageType)
+        }
+
+    @Test
+    fun `editChatMessage writes the new text before the server answers`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            val textWhenAsked = mutableListOf<String>()
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                textWhenAsked.add(entity.message)
+                editedResponse(EDITED_TEXT)
+            }
+
+            val result = repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertEquals(listOf(EDITED_TEXT), textWhenAsked)
+            assertTrue(result.isSuccess)
+            assertEquals(EDITED_TEXT, entity.message)
+            assertEquals("me", entity.lastEditActorId)
+        }
+
+    @Test
+    fun `editChatMessage restores the previous text when the request fails`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            val result = repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertTrue(result.isFailure)
+            assertEquals("message $MESSAGE_ID", entity.message)
+            assertNull(entity.lastEditActorId)
+        }
+
+    @Test
+    fun `editChatMessage restores the previous text when the server refuses the edit`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                // e.g. a message that is too old to be edited
+                editedResponse(EDITED_TEXT, statusCode = HTTP_BAD_REQUEST)
+            }
+
+            val result = repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertTrue(result.isSuccess)
+            assertEquals("message $MESSAGE_ID", entity.message)
+        }
+
+    @Test
+    fun `editChatMessage persists the version the server confirmed`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                editedResponse(SERVER_TEXT, lastEditTimestamp = 1234L)
+            }
+
+            repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertEquals(SERVER_TEXT, entity.message)
+            assertEquals(1234L, entity.lastEditTimestamp)
+        }
+
+    @Test
+    fun `editChatMessage never stores the system message that reports the edit`() =
+        runTest {
+            // the response's own message is "You edited a message" - storing that as the message
+            // would replace the text the user just wrote
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                ChatOverallSingleMessage(
+                    ocs = ChatOCSSingleMessage(
+                        meta = GenericMetaDto(status = "ok", statusCode = HTTP_OK, message = null),
+                        data = message(SYSTEM_MESSAGE_ID).apply {
+                            message = "You edited a message"
+                            messageType = "system"
+                            systemMessageType = ChatMessage.SystemMessageType.MESSAGE_EDITED
+                        }
+                    )
+                )
+            }
+
+            repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertEquals(EDITED_TEXT, entity.message)
+        }
+
+    @Test
+    fun `pinMessage pins the message locally before the server answers`() =
+        runTest {
+            givenCachedConversation()
+            val pinnedWhenAsked = mutableListOf<Long?>()
+            wheneverBlocking { network.pinMessage(any(), any(), any()) } doSuspendableAnswer {
+                pinnedWhenAsked.add(storedConversation.lastPinnedId)
+                pinnedResponse()
+            }
+
+            val result = repository.pinMessage(CREDENTIALS, MESSAGE_URL, 0, MESSAGE_ID)
+
+            assertEquals(listOf(MESSAGE_ID), pinnedWhenAsked)
+            assertTrue(result.isSuccess)
+            assertEquals(MESSAGE_ID, storedConversation.lastPinnedId)
+        }
+
+    @Test
+    fun `pinMessage unpins the message again when the request fails`() =
+        runTest {
+            givenCachedConversation()
+            wheneverBlocking { network.pinMessage(any(), any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            val result = repository.pinMessage(CREDENTIALS, MESSAGE_URL, 0, MESSAGE_ID)
+
+            assertTrue(result.isFailure)
+            assertNull(storedConversation.lastPinnedId)
+        }
+
+    @Test
+    fun `unPinMessage clears the pinned message locally before the server answers`() =
+        runTest {
+            givenCachedConversation(pinnedId = MESSAGE_ID)
+            val pinnedWhenAsked = mutableListOf<Long?>()
+            wheneverBlocking { network.unPinMessage(any(), any()) } doSuspendableAnswer {
+                pinnedWhenAsked.add(storedConversation.lastPinnedId)
+                pinnedResponse()
+            }
+
+            val result = repository.unPinMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID)
+
+            assertEquals(listOf<Long?>(null), pinnedWhenAsked)
+            assertTrue(result.isSuccess)
+            assertNull(storedConversation.lastPinnedId)
+        }
+
+    @Test
+    fun `unPinMessage restores the pinned message when the request fails`() =
+        runTest {
+            givenCachedConversation(pinnedId = MESSAGE_ID)
+            wheneverBlocking { network.unPinMessage(any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            val result = repository.unPinMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID)
+
+            assertTrue(result.isFailure)
+            assertEquals(MESSAGE_ID, storedConversation.lastPinnedId)
+        }
+
+    private fun user(): User =
+        User(
+            id = ACCOUNT_ID,
+            userId = "me",
+            username = "me",
+            displayName = "Me",
+            baseUrl = "https://server.example.com",
+            capabilities = CapabilitiesDto().apply {
+                spreedCapability = SpreedCapabilityDto().apply { features = listOf("chat-keep-notifications") }
+            }
+        )
+
+    private fun conversation(lastReadMessage: Int, unreadMessages: Int): ConversationModel =
+        ConversationModel.mapToConversationModel(
+            ConversationDto(
+                token = ROOM_TOKEN,
+                lastReadMessage = lastReadMessage,
+                unreadMessages = unreadMessages
+            ),
+            user()
+        )
+
+    private fun block(oldest: Long, newest: Long, hasHistory: Boolean = true): ChatBlockEntity =
+        ChatBlockEntity(
+            internalConversationId = INTERNAL_CONVERSATION_ID,
+            accountId = ACCOUNT_ID,
+            token = ROOM_TOKEN,
+            threadId = null,
+            oldestMessageId = oldest,
+            newestMessageId = newest,
+            hasHistory = hasHistory
+        )
+
+    private fun message(id: Long): ChatMessageDto =
+        ChatMessageDto(
+            id = id,
+            token = ROOM_TOKEN,
+            actorType = "users",
+            actorId = "other",
+            actorDisplayName = "Other User",
+            timestamp = id,
+            message = "message $id",
+            messageType = "comment",
+            systemMessageType = ChatMessage.SystemMessageType.DUMMY
+        )
+
+    @Test
+    fun `deleting a shared file drops the attachment from the cached message`() =
+        runTest {
+            // a deleted message carries no file any more, so the bubble must stop rendering one
+            val entity = messageEntity(MESSAGE_ID).apply {
+                messageParameters = hashMapOf<String?, HashMap<String?, String?>>(
+                    "file" to hashMapOf<String?, String?>("id" to "1")
+                )
+            }
+            givenCachedMessage(entity)
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer { deletedResponse() }
+
+            repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertNull(entity.messageParameters)
+        }
+
+    @Test
+    fun `a rejected deletion puts the attachment back`() =
+        runTest {
+            val parameters = hashMapOf<String?, HashMap<String?, String?>>(
+                "file" to hashMapOf<String?, String?>("id" to "1")
+            )
+            val entity = messageEntity(MESSAGE_ID).apply { messageParameters = parameters }
+            givenCachedMessage(entity)
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+
+            assertEquals(parameters, entity.messageParameters)
+        }
+
+    @Test
+    fun `a deletion cancelled before it was answered puts the message back`() =
+        runTest {
+            // leaving the chat cancels the view model scope, which would otherwise skip every catch
+            // and leave the message deleted locally although the server may never have heard of it
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            val requestStarted = CompletableDeferred<Unit>()
+            wheneverBlocking { network.deleteChatMessage(any(), any()) } doSuspendableAnswer {
+                requestStarted.complete(Unit)
+                awaitCancellation()
+            }
+
+            val deletion = launch {
+                repository.deleteChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, DELETED_PLACEHOLDER)
+            }
+            requestStarted.await()
+            deletion.cancelAndJoin()
+
+            assertEquals("comment", entity.messageType)
+            assertEquals("message $MESSAGE_ID", entity.message)
+        }
+
+    @Test
+    fun `an edit cancelled before it was answered restores the previous text`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            val requestStarted = CompletableDeferred<Unit>()
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                requestStarted.complete(Unit)
+                awaitCancellation()
+            }
+
+            val edit = launch { repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT) }
+            requestStarted.await()
+            edit.cancelAndJoin()
+
+            assertEquals("message $MESSAGE_ID", entity.message)
+        }
+
+    @Test
+    fun `a refused edit is not sent a second time`() =
+        runTest {
+            val entity = messageEntity(MESSAGE_ID)
+            givenCachedMessage(entity)
+            var attempts = 0
+            wheneverBlocking { network.editChatMessage(any(), any(), any()) } doSuspendableAnswer {
+                attempts++
+                throw httpException(HTTP_BAD_REQUEST)
+            }
+
+            repository.editChatMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID, EDITED_TEXT)
+
+            assertEquals(1, attempts)
+            assertEquals("message $MESSAGE_ID", entity.message)
+        }
+
+    @Test
+    fun `hidePinnedMessage dismisses the banner before the server answers`() =
+        runTest {
+            givenCachedConversation(pinnedId = MESSAGE_ID)
+            val hiddenWhenAsked = mutableListOf<Long?>()
+            wheneverBlocking { network.hidePinnedMessage(any(), any()) } doSuspendableAnswer {
+                hiddenWhenAsked.add(storedConversation.hiddenPinnedId)
+                GenericOverall()
+            }
+
+            val result = repository.hidePinnedMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID)
+
+            assertEquals(listOf(MESSAGE_ID), hiddenWhenAsked)
+            assertTrue(result.isSuccess)
+            assertEquals(MESSAGE_ID, storedConversation.hiddenPinnedId)
+        }
+
+    @Test
+    fun `hidePinnedMessage brings the banner back when the request fails`() =
+        runTest {
+            givenCachedConversation(pinnedId = MESSAGE_ID)
+            wheneverBlocking { network.hidePinnedMessage(any(), any()) } doSuspendableAnswer {
+                throw httpException(HTTP_METHOD_NOT_ALLOWED)
+            }
+
+            val result = repository.hidePinnedMessage(CREDENTIALS, MESSAGE_URL, MESSAGE_ID)
+
+            assertTrue(result.isFailure)
+            assertNull(storedConversation.hiddenPinnedId)
+        }
+
+    private lateinit var storedConversation: ConversationEntity
+
+    private fun givenCachedConversation(pinnedId: Long? = null) {
+        storedConversation = ConversationDto(token = ROOM_TOKEN)
+            .asEntity(ACCOUNT_ID)
+            .copy(lastPinnedId = pinnedId)
+        whenever(conversationsDao.getConversationForUser(eq(ACCOUNT_ID), eq(ROOM_TOKEN)))
+            .thenAnswer { flowOf(storedConversation) }
+        whenever(conversationsDao.updateConversation(any())).thenAnswer {
+            storedConversation = it.getArgument(0)
+            Unit
+        }
+    }
+
+    private fun pinnedResponse(): ChatOverallSingleMessage =
+        ChatOverallSingleMessage(ocs = ChatOCSSingleMessage(meta = null, data = message(MESSAGE_ID)))
+
+    private fun messageEntity(id: Long): ChatMessageEntity =
+        ChatMessageEntity(
+            internalId = "$INTERNAL_CONVERSATION_ID@$id",
+            internalConversationId = INTERNAL_CONVERSATION_ID,
+            id = id,
+            accountId = ACCOUNT_ID,
+            token = ROOM_TOKEN,
+            actorDisplayName = "Me",
+            actorId = "me",
+            actorType = "users",
+            message = "message $id",
+            messageType = "comment",
+            systemMessageType = ChatMessage.SystemMessageType.DUMMY
+        )
+
+    private fun givenCachedMessage(entity: ChatMessageEntity) {
+        wheneverBlocking { chatDao.getChatMessageEntity(eq(INTERNAL_CONVERSATION_ID), eq(entity.id)) }
+            .thenReturn(entity)
+    }
+
+    private fun deletedResponse(): ChatOverallSingleMessage = ChatOverallSingleMessage(ocs = null)
+
+    private fun editedResponse(
+        text: String,
+        statusCode: Int = HTTP_OK,
+        lastEditTimestamp: Long? = null
+    ): ChatOverallSingleMessage =
+        ChatOverallSingleMessage(
+            ocs = ChatOCSSingleMessage(
+                meta = GenericMetaDto(status = "ok", statusCode = statusCode, message = null),
+                // the endpoint answers with the system message about the edit, the edited message
+                // itself is its parent
+                data = message(SYSTEM_MESSAGE_ID).apply {
+                    message = "You edited a message"
+                    messageType = "system"
+                    systemMessageType = ChatMessage.SystemMessageType.MESSAGE_EDITED
+                    parentMessage = message(MESSAGE_ID).apply {
+                        message = text
+                        this.lastEditTimestamp = lastEditTimestamp
+                        lastEditActorId = "me"
+                        lastEditActorType = "users"
+                        lastEditActorDisplayName = "Me"
+                    }
+                }
+            )
+        )
+
+    private fun httpException(code: Int) =
+        HttpException(Response.error<Any>(code, "".toResponseBody("text/plain".toMediaType())))
+
+    private fun overall(vararg messages: ChatMessageDto): ChatOverall =
+        ChatOverall(ocs = ChatOCS(meta = null, data = messages.toList()))
+
+    companion object {
+        private const val ACCOUNT_ID = 1L
+        private const val ROOM_TOKEN = "room1"
+        private const val INTERNAL_CONVERSATION_ID = "$ACCOUNT_ID@$ROOM_TOKEN"
+        private const val CREDENTIALS = "credentials"
+        private const val HTTP_UNAUTHORIZED = 401
+        private const val LONG_POLLING_OBSERVATION_MILLIS = 200L
+        private const val AWAIT_TIMEOUT_MILLIS = 2000L
+        private const val RETRY_OBSERVATION_MILLIS = 1500L
+        private const val CHAT_URL = "https://server.example.com/ocs/v2.php/apps/spreed/api/v1/chat/$ROOM_TOKEN"
+        private const val INSURANCE_DELAY_MS = 2 * 60 * 1000L
+        private const val MESSAGE_ID = 42L
+        private const val SYSTEM_MESSAGE_ID = 43L
+        private const val MESSAGE_URL = "$CHAT_URL/42"
+        private const val DELETED_PLACEHOLDER = "Message deleted by you"
+        private const val HTTP_OK = 200
+        private const val HTTP_BAD_REQUEST = 400
+        private const val HTTP_NOT_FOUND = 404
+        private const val HTTP_METHOD_NOT_ALLOWED = 405
+        private const val EDITED_TEXT = "edited text"
+        private const val SERVER_TEXT = "text as stored by the server"
+    }
+}

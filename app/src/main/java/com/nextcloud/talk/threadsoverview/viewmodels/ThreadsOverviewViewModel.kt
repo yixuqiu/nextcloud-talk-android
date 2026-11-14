@@ -1,0 +1,91 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2025 Marcel Hibbe <dev@mhibbe.de>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.threadsoverview.viewmodels
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
+import com.nextcloud.talk.conversationlist.viewmodels.ConversationsListViewModel.Companion.FOLLOWED_THREADS_EXIST
+import com.nextcloud.talk.conversationlist.viewmodels.ConversationsListViewModel.Companion.FOLLOWED_THREADS_EXIST_LAST_CHECK
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.logger.Logger
+import com.nextcloud.talk.models.json.threads.ThreadInfoDto
+import com.nextcloud.talk.models.json.threads.ThreadsOverall
+import com.nextcloud.talk.threadsoverview.data.ThreadsRepository
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.UserIdUtils
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+
+@Suppress("TooGenericExceptionCaught")
+class ThreadsOverviewViewModel @AssistedInject constructor(
+    private val threadsRepository: ThreadsRepository,
+    private val arbitraryStorageManager: ArbitraryStorageManager,
+    private val logger: Logger,
+    @Assisted val currentUser: User
+) : ViewModel() {
+    val credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token) ?: ""
+
+    private val _threadsListState = MutableStateFlow<ThreadsListUiState>(ThreadsListUiState.None)
+    val threadsListState: StateFlow<ThreadsListUiState> = _threadsListState
+
+    fun init(url: String) {
+        getThreads(credentials, url)
+    }
+
+    fun getThreads(credentials: String, url: String) {
+        viewModelScope.launch {
+            try {
+                val threads = threadsRepository.getThreads(credentials, url, null)
+                _threadsListState.value = ThreadsListUiState.Success(threads.ocs?.data)
+                updateFollowedThreadsIndicator(url, threads)
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to load threads for $url", exception)
+                _threadsListState.value = ThreadsListUiState.Error(exception)
+            }
+        }
+    }
+
+    private fun updateFollowedThreadsIndicator(url: String, threads: ThreadsOverall) {
+        val subscribedThreadsEndpoint = "subscribed-threads"
+        if (url.contains(subscribedThreadsEndpoint) && threads.ocs?.data?.isEmpty() == true) {
+            val accountId = UserIdUtils.getIdForUser(currentUser)
+            arbitraryStorageManager.storeStorageSetting(
+                accountId,
+                FOLLOWED_THREADS_EXIST,
+                false.toString(),
+                ""
+            )
+            arbitraryStorageManager.storeStorageSetting(
+                accountId,
+                FOLLOWED_THREADS_EXIST_LAST_CHECK,
+                null,
+                ""
+            )
+        }
+    }
+
+    sealed class ThreadsListUiState {
+        data object None : ThreadsListUiState()
+        data class Success(val threadsList: List<ThreadInfoDto>?) : ThreadsListUiState()
+        data class Error(val exception: Exception) : ThreadsListUiState()
+    }
+
+    @AssistedFactory
+    interface Factory {
+        fun build(user: User): ThreadsOverviewViewModel
+    }
+
+    companion object {
+        private val TAG = ThreadsOverviewViewModel::class.java.simpleName
+    }
+}

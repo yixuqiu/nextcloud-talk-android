@@ -25,10 +25,13 @@ import com.nextcloud.talk.polls.adapters.PollResultsAdapter
 import com.nextcloud.talk.polls.viewmodels.PollMainViewModel
 import com.nextcloud.talk.polls.viewmodels.PollResultsViewModel
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
-class PollResultsFragment : Fragment(), PollResultItemClickListener {
+class PollResultsFragment :
+    Fragment(),
+    PollResultItemClickListener {
 
     @Inject
     lateinit var viewModelFactory: ViewModelProvider.Factory
@@ -46,6 +49,7 @@ class PollResultsFragment : Fragment(), PollResultItemClickListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
         viewModel = ViewModelProvider(this, viewModelFactory)[PollResultsViewModel::class.java]
         parentViewModel = ViewModelProvider(requireParentFragment(), viewModelFactory)[PollMainViewModel::class.java]
     }
@@ -147,8 +151,6 @@ class PollResultsFragment : Fragment(), PollResultItemClickListener {
 
     companion object {
         @JvmStatic
-        fun newInstance(): PollResultsFragment {
-            return PollResultsFragment()
-        }
+        fun newInstance(): PollResultsFragment = PollResultsFragment()
     }
 }

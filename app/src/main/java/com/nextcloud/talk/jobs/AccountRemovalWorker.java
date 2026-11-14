@@ -9,19 +9,26 @@ package com.nextcloud.talk.jobs;
 
 import android.app.NotificationManager;
 import android.content.Context;
-import android.os.Build;
 import android.util.Log;
 
 import com.nextcloud.talk.R;
 import com.nextcloud.talk.api.NcApi;
 import com.nextcloud.talk.application.NextcloudTalkApplication;
 import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager;
+import com.nextcloud.talk.chat.audio.ChatAudioStore;
+import com.nextcloud.talk.data.database.dao.ChatBlocksDao;
+import com.nextcloud.talk.data.database.dao.ChatMessagesDao;
+import com.nextcloud.talk.data.database.dao.ConversationsDao;
 import com.nextcloud.talk.data.user.model.User;
-import com.nextcloud.talk.models.json.generic.GenericMeta;
+import com.nextcloud.talk.logger.Logger;
+import com.nextcloud.talk.models.json.generic.GenericMetaDto;
 import com.nextcloud.talk.models.json.generic.GenericOverall;
 import com.nextcloud.talk.models.json.push.PushConfigurationState;
+import com.nextcloud.talk.conversationlist.DirectShareHelper;
 import com.nextcloud.talk.users.UserManager;
+import com.nextcloud.talk.utils.AccountCookieInterceptor;
 import com.nextcloud.talk.utils.ApiUtils;
+import com.nextcloud.talk.utils.preferences.AppPreferences;
 import com.nextcloud.talk.webrtc.WebSocketConnectionHelper;
 
 import java.net.CookieManager;
@@ -36,8 +43,11 @@ import androidx.annotation.NonNull;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 import autodagger.AutoInjector;
+import io.reactivex.Observable;
 import io.reactivex.Observer;
 import io.reactivex.disposables.Disposable;
+import kotlin.coroutines.EmptyCoroutineContext;
+import kotlinx.coroutines.BuildersKt;
 import okhttp3.JavaNetCookieJar;
 import okhttp3.OkHttpClient;
 import retrofit2.Retrofit;
@@ -46,17 +56,27 @@ import retrofit2.Retrofit;
 public class AccountRemovalWorker extends Worker {
     public static final String TAG = "AccountRemovalWorker";
 
-    @Inject
-    UserManager userManager;
+    @Inject UserManager userManager;
 
-    @Inject
-    ArbitraryStorageManager arbitraryStorageManager;
+    @Inject ArbitraryStorageManager arbitraryStorageManager;
 
-    @Inject
-    Retrofit retrofit;
+    @Inject AppPreferences appPreferences;
 
-    @Inject
-    OkHttpClient okHttpClient;
+    @Inject Retrofit retrofit;
+
+    @Inject OkHttpClient okHttpClient;
+
+    @Inject ChatMessagesDao chatMessagesDao;
+
+    @Inject ConversationsDao conversationsDao;
+
+    @Inject ChatBlocksDao chatBlocksDao;
+
+    @Inject Logger logger;
+
+    @Inject AccountCookieInterceptor accountCookieInterceptor;
+
+    @Inject ChatAudioStore chatAudioStore;
 
     NcApi ncApi;
 
@@ -67,9 +87,17 @@ public class AccountRemovalWorker extends Worker {
     @NonNull
     @Override
     public Result doWork() {
-        NextcloudTalkApplication.Companion.getSharedApplication().getComponentApplication().inject(this);
+        Objects.requireNonNull(NextcloudTalkApplication.Companion.getSharedApplication()).getComponentApplication().inject(this);
 
-        List<User> users = userManager.getUsersScheduledForDeletion().blockingGet();
+        List<User> users;
+        try {
+            users = BuildersKt.runBlocking(
+                EmptyCoroutineContext.INSTANCE,
+                (scope, continuation) -> userManager.getUsersScheduledForDeletion(continuation));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Result.failure();
+        }
         for (User user : users) {
             if (user.getPushConfigurationState() != null) {
                 PushConfigurationState finalPushConfigurationState = user.getPushConfigurationState();
@@ -85,7 +113,7 @@ public class AccountRemovalWorker extends Worker {
 
                 ncApi.unregisterDeviceForNotificationsWithNextcloud(
                         ApiUtils.getCredentials(user.getUsername(), user.getToken()),
-                        ApiUtils.getUrlNextcloudPush(user.getBaseUrl()))
+                        ApiUtils.getUrlNextcloudPush(Objects.requireNonNull(user.getBaseUrl())))
                     .blockingSubscribe(new Observer<GenericOverall>() {
                         @Override
                         public void onSubscribe(@io.reactivex.annotations.NonNull Disposable d) {
@@ -94,7 +122,7 @@ public class AccountRemovalWorker extends Worker {
 
                         @Override
                         public void onNext(@io.reactivex.annotations.NonNull GenericOverall genericOverall) {
-                            GenericMeta meta = Objects.requireNonNull(genericOverall.getOcs()).getMeta();
+                            GenericMetaDto meta = Objects.requireNonNull(genericOverall.getOcs()).getMeta();
                             int statusCode = Objects.requireNonNull(meta).getStatusCode();
 
                             if (statusCode == 200 || statusCode == 202) {
@@ -105,6 +133,9 @@ public class AccountRemovalWorker extends Worker {
                                 queryMap.put("deviceIdentifierSignature",
                                              finalPushConfigurationState.getDeviceIdentifierSignature());
                                 unregisterDeviceForNotificationWithProxy(queryMap, user);
+                            } else {
+                                Log.e(TAG, "unregister Device For Notifications failed with status " + statusCode);
+                                initiateUserDeletion(user);
                             }
                         }
 
@@ -128,55 +159,51 @@ public class AccountRemovalWorker extends Worker {
     }
 
     private void unregisterDeviceForNotificationWithProxy(HashMap<String, String> queryMap, User user) {
-        ncApi.unregisterDeviceForNotificationsWithProxy
-                (ApiUtils.getUrlPushProxy(), queryMap)
-                .subscribe(new Observer<Void>() {
-                    @Override
-                    public void onSubscribe(Disposable d) {
-                        // unused atm
-                    }
+        Throwable error = awaitCompletion(
+            ncApi.unregisterDeviceForNotificationsWithProxy(ApiUtils.getUrlPushProxy(), queryMap));
 
-                    @Override
-                    public void onNext(Void aVoid) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            String groupName = String.format(
-                                getApplicationContext()
-                                    .getResources()
-                                    .getString(R.string.nc_notification_channel), user.getUserId(), user.getBaseUrl());
-                            CRC32 crc32 = new CRC32();
-                            crc32.update(groupName.getBytes());
-                            NotificationManager notificationManager =
-                                    (NotificationManager) getApplicationContext()
-                                        .getSystemService(Context.NOTIFICATION_SERVICE);
+        if (error == null) {
+            String groupName = String.format(
+                getApplicationContext()
+                    .getResources()
+                    .getString(R.string.nc_notification_channel), user.getUserId(), user.getBaseUrl());
+            CRC32 crc32 = new CRC32();
+            crc32.update(groupName.getBytes());
+            NotificationManager notificationManager =
+                (NotificationManager) getApplicationContext()
+                    .getSystemService(Context.NOTIFICATION_SERVICE);
 
-                            if (notificationManager != null) {
-                                notificationManager.deleteNotificationChannelGroup(
-                                    Long.toString(crc32.getValue()));
-                            }
-                        }
+            if (notificationManager != null) {
+                notificationManager.deleteNotificationChannelGroup(
+                    Long.toString(crc32.getValue()));
+            }
+        } else {
+            Log.e(TAG, "error while trying to unregister Device For Notification With Proxy", error);
+        }
 
-                        initiateUserDeletion(user);
-                    }
+        initiateUserDeletion(user);
+    }
 
-                    @Override
-                    public void onError(Throwable e) {
-                        Log.e(TAG, "error while trying to unregister Device For Notification With Proxy", e);
-                        initiateUserDeletion(user);
-                    }
-
-                    @Override
-                    public void onComplete() {
-                        // unused atm
-                    }
-                });
+    /**
+     * Blocks until the request ended, so that doWork() returns only after the user is deleted. Callers restart the
+     * app or log in again as soon as the work is SUCCEEDED, and the user must be gone by then.
+     * The elements are ignored: the body of the proxy answer is null, which a blocking subscriber can't take.
+     *
+     * @return the error, or null if the request succeeded
+     */
+    static Throwable awaitCompletion(Observable<?> request) {
+        return request.ignoreElements().blockingGet();
     }
 
     private void initiateUserDeletion(User user) {
         if (user.getId() != null) {
-            WebSocketConnectionHelper.deleteExternalSignalingInstanceForUserEntity(user.getId());
+            long id = user.getId();
+            DirectShareHelper.INSTANCE.removeShortcutsForUser(getApplicationContext(), id);
+            WebSocketConnectionHelper.deleteExternalSignalingInstanceForUserEntity(id);
+            chatAudioStore.forgetAccount(id);
 
             try {
-                arbitraryStorageManager.deleteAllEntriesForAccountIdentifier(user.getId());
+                arbitraryStorageManager.deleteAllEntriesForAccountIdentifier(id);
                 deleteUser(user);
             } catch (Throwable e) {
                 Log.e(TAG, "error while trying to delete All Entries For Account Identifier", e);
@@ -188,8 +215,17 @@ public class AccountRemovalWorker extends Worker {
         if (user.getId() != null) {
             String username = user.getUsername();
             try {
-                userManager.deleteUser(user.getId());
-                Log.d(TAG, "deleted user: " + username);
+                long id = user.getId();
+                BuildersKt.runBlocking(
+                    EmptyCoroutineContext.INSTANCE,
+                    (scope, continuation) -> userManager.deleteUser(id, continuation));
+                String credentials = ApiUtils.getCredentials(username, user.getToken());
+                if (credentials != null) {
+                    accountCookieInterceptor.removeCookiesOf(credentials);
+                }
+                if (username != null) {
+                    Log.d(TAG, "deleted user: " + username);
+                }
             } catch (Throwable e) {
                 Log.e(TAG, "error while trying to delete user", e);
             }

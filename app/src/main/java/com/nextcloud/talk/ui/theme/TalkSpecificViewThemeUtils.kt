@@ -7,15 +7,15 @@
  */
 package com.nextcloud.talk.ui.theme
 
-import android.annotation.TargetApi
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffColorFilter
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
-import android.os.Build
 import android.text.Spannable
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -25,6 +25,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.RelativeLayout
 import android.widget.TextView
+import androidx.annotation.ColorRes
 import androidx.annotation.DrawableRes
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.appcompat.widget.SearchView
@@ -34,13 +35,17 @@ import androidx.core.content.res.ResourcesCompat
 import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.DrawableCompat
 import androidx.core.view.ViewCompat
+import androidx.emoji2.emojipicker.EmojiPickerView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.chip.Chip
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.nextcloud.android.common.ui.theme.MaterialSchemes
 import com.nextcloud.android.common.ui.theme.ViewThemeUtilsBase
 import com.nextcloud.android.common.ui.theme.utils.AndroidXViewThemeUtils
+import com.nextcloud.android.common.ui.util.buildColorStateList
 import com.nextcloud.talk.R
+import com.nextcloud.talk.chat.data.model.ChatMessage
 import com.nextcloud.talk.databinding.ReactionsInsideMessageBinding
 import com.nextcloud.talk.ui.MicInputCloud
 import com.nextcloud.talk.ui.StatusDrawable
@@ -48,10 +53,9 @@ import com.nextcloud.talk.ui.WaveformSeekBar
 import com.nextcloud.talk.utils.DisplayUtils
 import com.nextcloud.talk.utils.DrawableUtils
 import com.nextcloud.talk.utils.message.MessageUtils
-import com.vanniktech.emoji.EmojiTextView
-import com.wooplr.spotlight.SpotlightView
+import dynamiccolor.DynamicScheme
 import dynamiccolor.MaterialDynamicColors
-import eu.davidea.flexibleadapter.utils.FlexibleUtils
+import java.util.Locale
 import javax.inject.Inject
 import kotlin.math.roundToInt
 
@@ -63,10 +67,16 @@ import kotlin.math.roundToInt
 class TalkSpecificViewThemeUtils @Inject constructor(
     schemes: MaterialSchemes,
     private val appcompat: AndroidXViewThemeUtils
-) :
-    ViewThemeUtilsBase(schemes) {
+) : ViewThemeUtilsBase(schemes) {
     private val dynamicColor = MaterialDynamicColors()
-    fun themeIncomingMessageBubble(bubble: View, grouped: Boolean, deleted: Boolean) {
+
+    fun themeCardView(cardView: MaterialCardView) {
+        withScheme(cardView) { scheme ->
+            cardView.backgroundTintList = ColorStateList.valueOf(dynamicColor.surfaceVariant().getArgb(scheme))
+        }
+    }
+
+    fun themeIncomingMessageBubble(bubble: View, grouped: Boolean, deleted: Boolean, isPlayed: Boolean = false) {
         val resources = bubble.resources
 
         var bubbleResource = R.drawable.shape_incoming_message
@@ -77,6 +87,8 @@ class TalkSpecificViewThemeUtils @Inject constructor(
 
         val bgBubbleColor = if (deleted) {
             resources.getColor(R.color.bg_message_list_incoming_bubble_deleted, null)
+        } else if (isPlayed) {
+            resources.getColor(R.color.bg_message_list_incoming_bubble_audio_played, null)
         } else {
             resources.getColor(R.color.bg_message_list_incoming_bubble, null)
         }
@@ -89,10 +101,12 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         ViewCompat.setBackground(bubble, bubbleDrawable)
     }
 
-    fun themeOutgoingMessageBubble(bubble: View, grouped: Boolean, deleted: Boolean) {
+    fun themeOutgoingMessageBubble(bubble: View, grouped: Boolean, deleted: Boolean, isPlayed: Boolean = false) {
         withScheme(bubble) { scheme ->
             val bgBubbleColor = if (deleted) {
                 ColorUtils.setAlphaComponent(dynamicColor.surfaceVariant().getArgb(scheme), HALF_ALPHA_INT)
+            } else if (isPlayed) {
+                ContextCompat.getColor(bubble.context, R.color.bg_message_list_outgoing_bubble_audio_played)
             } else {
                 dynamicColor.surfaceVariant().getArgb(scheme)
             }
@@ -112,6 +126,20 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         }
     }
 
+    fun getOutgoingMessageBubbleColor(context: Context, deleted: Boolean, isPlayed: Boolean): Int {
+        return withScheme(context) { scheme ->
+            val bgBubbleColor = if (deleted) {
+                ColorUtils.setAlphaComponent(dynamicColor.surfaceVariant().getArgb(scheme), HALF_ALPHA_INT)
+            } else if (isPlayed) {
+                ContextCompat.getColor(context, R.color.bg_message_list_outgoing_bubble_audio_played)
+            } else {
+                dynamicColor.surfaceVariant().getArgb(scheme)
+            }
+
+            return@withScheme bgBubbleColor
+        }
+    }
+
     fun colorOutgoingQuoteText(textView: TextView) {
         withScheme(textView) { scheme ->
             textView.setTextColor(dynamicColor.onSurfaceVariant().getArgb(scheme))
@@ -121,12 +149,6 @@ class TalkSpecificViewThemeUtils @Inject constructor(
     fun colorOutgoingQuoteAuthorText(textView: TextView) {
         withScheme(textView) { scheme ->
             ColorUtils.setAlphaComponent(dynamicColor.onSurfaceVariant().getArgb(scheme), ALPHA_80_INT)
-        }
-    }
-
-    fun colorOutgoingQuoteBackground(view: View) {
-        withScheme(view) { scheme ->
-            view.setBackgroundColor(dynamicColor.onSurfaceVariant().getArgb(scheme))
         }
     }
 
@@ -147,37 +169,54 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         appcompat.colorSwitchCompat(switch)
     }
 
-    fun setCheckedBackground(emoji: EmojiTextView) {
-        withScheme(emoji) { scheme ->
-            val drawable = AppCompatResources
-                .getDrawable(emoji.context, R.drawable.reaction_self_bottom_sheet_background)!!
-                .mutate()
-            DrawableCompat.setTintList(
-                drawable,
-                ColorStateList.valueOf(dynamicColor.primary().getArgb(scheme))
-            )
-            emoji.background = drawable
-        }
-    }
-
-    fun setCheckedBackground(linearLayout: LinearLayout, incoming: Boolean) {
+    fun setReactionsBackground(linearLayout: LinearLayout, outgoing: Boolean, isBubbled: Boolean) {
         withScheme(linearLayout) { scheme ->
             val drawable = AppCompatResources
                 .getDrawable(linearLayout.context, R.drawable.reaction_self_background)!!
                 .mutate()
-            val backgroundColor = if (incoming) {
+            val backgroundColor = if (isBubbled) {
                 dynamicColor.primaryContainer().getArgb(scheme)
             } else {
-                ContextCompat.getColor(
-                    linearLayout.context,
-                    R.color.bg_message_list_incoming_bubble
-                )
+                if (outgoing) {
+                    ContextCompat.getColor(
+                        linearLayout.context,
+                        R.color.bg_message_list_incoming_bubble
+                    )
+                } else {
+                    dynamicColor.surfaceVariant().getArgb(scheme)
+                }
             }
+
             DrawableCompat.setTintList(
                 drawable,
                 ColorStateList.valueOf(backgroundColor)
             )
             linearLayout.background = drawable
+        }
+    }
+
+    fun setReactionsBackground(card: MaterialCardView, outgoing: Boolean, isSelfReaction: Boolean, isBubbled: Boolean) {
+        withScheme(card) { scheme ->
+            if (isSelfReaction) {
+                card.setCardBackgroundColor(dynamicColor.primaryContainer().getArgb(scheme))
+                card.strokeColor = dynamicColor.primary().getArgb(scheme)
+            } else {
+                if (isBubbled) {
+                    card.setCardBackgroundColor(
+                        ContextCompat.getColor(
+                            card.context,
+                            R.color.bg_message_list_incoming_bubble
+                        )
+                    )
+                    card.strokeColor = dynamicColor.surface().getArgb(scheme)
+                } else {
+                    card.setCardBackgroundColor(dynamicColor.surface().getArgb(scheme))
+                    card.strokeColor = ContextCompat.getColor(
+                        card.context,
+                        R.color.bg_message_list_incoming_bubble
+                    )
+                }
+            }
         }
     }
 
@@ -187,7 +226,7 @@ class TalkSpecificViewThemeUtils @Inject constructor(
             context,
             drawableResourceId
         )
-        if (drawable != null && THEMEABLE_PLACEHOLDER_IDS.contains(drawableResourceId)) {
+        if (drawable != null && isThemeablePlaceholder(drawableResourceId)) {
             colorDrawable(context, drawable)
         }
         return drawable
@@ -199,7 +238,6 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         }
     }
 
-    @TargetApi(Build.VERSION_CODES.O)
     fun themePlaceholderAvatar(avatar: View, @DrawableRes foreground: Int): Drawable? {
         var drawable: LayerDrawable? = null
         withScheme(avatar) { scheme ->
@@ -214,6 +252,7 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         return drawable
     }
 
+    @SuppressLint("RestrictedApi")
     fun themeSearchView(searchView: SearchView) {
         withScheme(searchView) { scheme ->
             // hacky as no default way is provided
@@ -228,7 +267,6 @@ class TalkSpecificViewThemeUtils @Inject constructor(
 
     fun themeStatusCardView(cardView: MaterialCardView) {
         withScheme(cardView) { scheme ->
-            val background = cardView.context.getColor(R.color.grey_200)
             cardView.backgroundTintList =
                 ColorStateList(
                     arrayOf(
@@ -237,7 +275,7 @@ class TalkSpecificViewThemeUtils @Inject constructor(
                     ),
                     intArrayOf(
                         dynamicColor.secondaryContainer().getArgb(scheme),
-                        background
+                        dynamicColor.surfaceContainerHigh().getArgb(scheme)
                     )
                 )
             cardView.setStrokeColor(
@@ -274,24 +312,39 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         }
     }
 
+    fun themeDraftSubline(textView: TextView, fullText: String, draftText: String) {
+        withScheme(textView) { scheme ->
+            val prefixEnd = fullText.length - draftText.length
+            val spannable = android.text.SpannableStringBuilder(fullText)
+            spannable.setSpan(
+                StyleSpan(Typeface.BOLD),
+                0,
+                prefixEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            spannable.setSpan(
+                ForegroundColorSpan(dynamicColor.primary().getArgb(scheme)),
+                0,
+                prefixEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            textView.setTypeface(null, Typeface.NORMAL)
+            textView.setTextColor(ContextCompat.getColor(textView.context, R.color.textColorMaxContrast))
+            textView.setText(spannable, TextView.BufferType.SPANNABLE)
+        }
+    }
+
     fun themeForegroundColorSpan(context: Context): ForegroundColorSpan {
         return withScheme(context) { scheme ->
             return@withScheme ForegroundColorSpan(dynamicColor.primary().getArgb(scheme))
         }
     }
 
-    fun themeSpotlightView(context: Context, builder: SpotlightView.Builder): SpotlightView.Builder {
-        return withScheme(context) { scheme ->
-            return@withScheme builder.headingTvColor(dynamicColor.primary().getArgb(scheme))
-                .lineAndArcColor(dynamicColor.primary().getArgb(scheme))
-        }
-    }
-
     fun themeAndHighlightText(textView: TextView, originalText: String?, c: String?) {
         withScheme(textView) { scheme ->
             var constraint = c
-            constraint = FlexibleUtils.toLowerCase(constraint)
-            var start = FlexibleUtils.toLowerCase(originalText).indexOf(constraint)
+            constraint = (constraint ?: "").lowercase(Locale.getDefault())
+            var start = (originalText ?: "").lowercase(Locale.getDefault()).indexOf(constraint)
             if (start != -1) {
                 val spanText = Spannable.Factory.getInstance().newSpannable(originalText)
                 do {
@@ -303,7 +356,7 @@ class TalkSpecificViewThemeUtils @Inject constructor(
                         Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
                     )
                     spanText.setSpan(StyleSpan(Typeface.BOLD), start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    start = FlexibleUtils.toLowerCase(originalText)
+                    start = (originalText ?: "").lowercase(Locale.getDefault())
                         .indexOf(constraint, end + 1) // +1 skips the consecutive span
                 } while (start != -1)
                 textView.setText(spanText, TextView.BufferType.SPANNABLE)
@@ -366,6 +419,28 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         }
     }
 
+    fun themeParentMessage(
+        parentChatMessage: ChatMessage,
+        message: ChatMessage,
+        quoteColoredView: View,
+        @ColorRes quoteColorNonSelf: Int = R.color.textColorMaxContrast
+    ) {
+        withScheme(quoteColoredView) { scheme ->
+            val shapeRectangle = ContextCompat.getDrawable(
+                quoteColoredView.context,
+                R.drawable.reply_background
+            )
+                as LayerDrawable
+            val gradient = shapeRectangle.findDrawableByLayerId(R.id.quoteLine) as GradientDrawable
+            if (parentChatMessage.actorId?.equals(message.activeUser!!.userId) == true) {
+                gradient.setColor(dynamicColor.primary().getArgb(scheme))
+            } else {
+                gradient.setColor(dynamicColor.onSurfaceVariant().getArgb(scheme))
+            }
+            quoteColoredView.background = shapeRectangle
+        }
+    }
+
     fun getTextColor(isOutgoingMessage: Boolean, isSelfReaction: Boolean, binding: ReactionsInsideMessageBinding): Int {
         return withScheme(binding.root) { scheme ->
             return@withScheme if (!isOutgoingMessage || isSelfReaction) {
@@ -376,11 +451,69 @@ class TalkSpecificViewThemeUtils @Inject constructor(
         }
     }
 
+    private fun chipOutlineFilterColorList(scheme: DynamicScheme) =
+        buildColorStateList(
+            android.R.attr.state_checked to dynamicColor.secondaryContainer().getArgb(scheme),
+            -android.R.attr.state_checked to dynamicColor.outline().getArgb(scheme)
+        )
+
+    fun themeChipFilter(chip: Chip) {
+        withScheme(chip.context) { scheme ->
+            val backgroundColors =
+                buildColorStateList(
+                    android.R.attr.state_checked to dynamicColor.secondaryContainer().getArgb(scheme),
+                    -android.R.attr.state_checked to dynamicColor.surface().getArgb(scheme),
+                    android.R.attr.state_focused to dynamicColor.secondaryContainer().getArgb(scheme),
+                    android.R.attr.state_hovered to dynamicColor.secondaryContainer().getArgb(scheme),
+                    android.R.attr.state_pressed to dynamicColor.secondaryContainer().getArgb(scheme)
+                )
+
+            val iconColors =
+                buildColorStateList(
+                    android.R.attr.state_checked to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    -android.R.attr.state_checked to dynamicColor.surfaceVariant().getArgb(scheme),
+                    android.R.attr.state_focused to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    android.R.attr.state_hovered to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    android.R.attr.state_pressed to dynamicColor.onSecondaryContainer().getArgb(scheme)
+                )
+
+            val textColors =
+                buildColorStateList(
+                    android.R.attr.state_checked to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    -android.R.attr.state_checked to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    android.R.attr.state_hovered to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    android.R.attr.state_focused to dynamicColor.onSecondaryContainer().getArgb(scheme),
+                    android.R.attr.state_pressed to dynamicColor.onSecondaryContainer().getArgb(scheme)
+                )
+
+            chip.chipBackgroundColor = backgroundColors
+            chip.chipStrokeColor = chipOutlineFilterColorList(scheme)
+            chip.setTextColor(textColors)
+            chip.checkedIconTint = iconColors
+        }
+    }
+
+    fun themeEmojiPicker(emojiPickerView: EmojiPickerView) {
+        withScheme(emojiPickerView.context) { scheme ->
+            emojiPickerView.setBackgroundColor(dynamicColor.surfaceContainerLow().getArgb(scheme))
+            themeEmojiPickerCategoryTabs(
+                emojiPickerView,
+                dynamicColor.primary().getArgb(scheme),
+                dynamicColor.onSurfaceVariant().getArgb(scheme)
+            )
+            protectEmojiPickerScrollGesture(emojiPickerView)
+        }
+    }
+
     companion object {
         private val THEMEABLE_PLACEHOLDER_IDS = listOf(
             R.drawable.ic_mimetype_package_x_generic,
             R.drawable.ic_mimetype_folder
         )
+
+        /** Whether the mimetype placeholder [drawableResourceId] is monochrome and picks up the theme color. */
+        fun isThemeablePlaceholder(@DrawableRes drawableResourceId: Int): Boolean =
+            THEMEABLE_PLACEHOLDER_IDS.contains(drawableResourceId)
 
         private val ALPHA_80_INT: Int = (255 * 0.8).roundToInt()
 

@@ -11,8 +11,10 @@ import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.polls.model.Poll
 import com.nextcloud.talk.polls.repositories.PollRepository
+import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -62,11 +64,23 @@ class PollVoteViewModel @Inject constructor(private val repository: PollReposito
         _selectedOptions = _selectedOptions.minus(option)
     }
 
-    fun vote(roomToken: String, pollId: String) {
+    fun vote(user: User, roomToken: String, pollId: String) {
         if (_selectedOptions.isNotEmpty()) {
             _submitButtonEnabled.value = false
 
-            repository.vote(roomToken, pollId, _selectedOptions)
+            val url = ApiUtils.getUrlForPoll(
+                user.baseUrl!!,
+                roomToken,
+                pollId
+            )
+
+            repository.vote(
+                ApiUtils.getCredentials(user.username, user.token),
+                url,
+                roomToken,
+                pollId,
+                _selectedOptions
+            )
                 .doOnSubscribe { disposable = it }
                 ?.subscribeOn(Schedulers.io())
                 ?.observeOn(AndroidSchedulers.mainThread())
@@ -75,7 +89,6 @@ class PollVoteViewModel @Inject constructor(private val repository: PollReposito
     }
 
     override fun onCleared() {
-        super.onCleared()
         disposable?.dispose()
     }
 

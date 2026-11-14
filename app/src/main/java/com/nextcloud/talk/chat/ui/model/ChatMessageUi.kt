@@ -1,0 +1,393 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2017-2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.chat.ui.model
+
+import android.provider.Settings
+import androidx.compose.runtime.Stable
+import com.nextcloud.talk.R
+import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.data.database.model.SendStatus
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil
+import com.nextcloud.talk.utils.DrawableUtils
+import com.nextcloud.talk.utils.Mimetype
+import com.nextcloud.talk.utils.MimetypeUtils
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+
+// immutable class for chat message UI. only val, no vars!
+@Stable // Consider evaluating @Immutable once all nested types comply.
+data class ChatMessageUi(
+    val id: Int,
+    val message: String,
+    val plainMessage: String = "",
+    val renderMarkdown: Boolean,
+    val actorDisplayName: String,
+    val actorType: String? = null,
+    val actorId: String? = null,
+    val isThread: Boolean,
+    val threadTitle: String,
+    val threadTitleIconRes: Int = R.drawable.outline_forum_24,
+    val threadReplies: Int,
+    val incoming: Boolean,
+    val isDeleted: Boolean,
+    val avatarUrl: String?,
+    val statusIcon: MessageStatusIcon,
+    val timestamp: Long,
+    val date: LocalDate,
+    val content: MessageTypeContent?,
+    val roomToken: String? = null,
+    val activeUserId: String? = null,
+    val activeUserBaseUrl: String? = null,
+    val messageParameters: Map<String, Map<String, String>> = emptyMap(),
+    val reactions: List<MessageReactionUi> = emptyList(),
+    val isEdited: Boolean = false,
+    val parentMessage: ChatMessageUi? = null,
+    val replyable: Boolean = false,
+    val isGrouped: Boolean = false,
+    val isGroupedWithNext: Boolean = false,
+    val isSilent: Boolean = false,
+    val isExpandableParent: Boolean = false,
+    val expandableChildrenAmount: Int = 0,
+    val isHiddenByCollapse: Boolean = false,
+    val isExpanded: Boolean = false,
+    val referenceId: String? = null
+)
+
+data class MessageReactionUi(val emoji: String, val amount: Int, val isSelfReaction: Boolean)
+
+sealed interface MessageTypeContent {
+    object RegularText : MessageTypeContent
+    object SystemMessage : MessageTypeContent
+
+    /**
+     * [authHeader] authenticates images of the account's own server at [serverBaseUrl], e.g. reference previews.
+     */
+    data class LinkPreview(val url: String, val serverBaseUrl: String? = null, val authHeader: String? = null) :
+        MessageTypeContent
+
+    data class Media(
+        val previewUrl: String?,
+        val drawableResourceId: Int,
+        val mimeType: String,
+        val animateGif: Boolean = false,
+        val blurhash: String? = null,
+        val width: Int? = null,
+        val height: Int? = null,
+        val isClassified: Boolean = false,
+        // Credentials of the account, as the preview is always loaded from its server.
+        val authHeader: String? = null
+    ) : MessageTypeContent
+
+    data class UploadingMedia(
+        val localFileUri: String,
+        val fileName: String,
+        val caption: String?,
+        val mimeType: String?,
+        val drawableResourceId: Int
+    ) : MessageTypeContent
+
+    data class Geolocation(val id: String, val name: String, val lat: Double, val lon: Double) : MessageTypeContent
+
+    data class Poll(val pollId: String, val pollName: String) : MessageTypeContent
+
+    data class Deck(val cardName: String, val stackName: String, val boardName: String, val cardLink: String) :
+        MessageTypeContent
+
+    // The playback state of audio messages is not part of the message, see com.nextcloud.talk.ui.chat.ChatAudioUi
+    data object Voice : MessageTypeContent
+
+    data class AudioFile(val fileName: String) : MessageTypeContent
+}
+
+enum class MessageStatusIcon {
+    FAILED,
+    SENDING,
+    READ,
+    SENT,
+    SCHEDULED
+}
+
+// Domain model (ChatMessage) to UI model (ChatMessageUi)
+fun ChatMessage.toUiModel(
+    user: User,
+    chatMessage: ChatMessage,
+    lastCommonReadMessageId: Int,
+    parentMessage: ChatMessage?,
+    isClassified: Boolean = false
+): ChatMessageUi =
+    ChatMessageUi(
+        id = jsonMessageId,
+        message = getRichText(),
+        plainMessage = message.orEmpty(),
+        renderMarkdown = renderMarkdown == true,
+        actorDisplayName = getNullsafeActorDisplayName(),
+        actorType = actorType,
+        actorId = actorId,
+        threadTitle = threadTitle.orEmpty(),
+        isThread = isThread,
+        threadReplies = threadReplies ?: 0,
+        incoming = incoming,
+        isDeleted = isDeleted,
+        avatarUrl = avatarUrl,
+        statusIcon = resolveStatusIcon(
+            jsonMessageId,
+            lastCommonReadMessageId,
+            isTemporary,
+            sendStatus
+        ),
+        timestamp = timestamp,
+        date = dateKey(),
+        content = getMessageTypeContent(user, chatMessage, isClassified),
+        roomToken = token,
+        activeUserId = user.userId,
+        activeUserBaseUrl = user.baseUrl,
+        messageParameters = normalizeMessageParameters(),
+        reactions = getReactionUiModels(),
+        isEdited = lastEditTimestamp != 0L,
+        // setting parent message recursively might be a problem regarding recompositions? extract only what is needed
+        // for UI?
+        parentMessage = parentMessage?.toUiModel(
+            user = user,
+            chatMessage = parentMessage,
+            lastCommonReadMessageId = 0,
+            parentMessage = null
+        ),
+        replyable = replyable,
+        isGrouped = isGrouped,
+        isGroupedWithNext = isGroupedWithNext,
+        isSilent = silent,
+        isExpandableParent = expandableParent,
+        expandableChildrenAmount = expandableChildrenAmount,
+        isHiddenByCollapse = hiddenByCollapse,
+        referenceId = referenceId
+    )
+
+fun ChatMessage.toScheduledMessageUiModel(
+    user: User,
+    roomToken: String,
+    parentMessage: ChatMessage? = null
+): ChatMessageUi {
+    val sendAtTimestamp = sendAt?.toLong() ?: timestamp
+    return ChatMessageUi(
+        id = token?.toIntOrNull() ?: token.hashCode(),
+        message = getRichText(),
+        plainMessage = message.orEmpty(),
+        renderMarkdown = renderMarkdown != false,
+        actorDisplayName = getNullsafeActorDisplayName(),
+        actorType = actorType,
+        actorId = actorId,
+        isThread = isThread,
+        threadTitle = threadTitle.orEmpty(),
+        threadReplies = threadReplies ?: 0,
+        incoming = false,
+        isDeleted = isDeleted,
+        avatarUrl = null,
+        statusIcon = MessageStatusIcon.SCHEDULED,
+        timestamp = sendAtTimestamp,
+        date = Instant.ofEpochSecond(sendAtTimestamp).atZone(ZoneId.systemDefault()).toLocalDate(),
+        content = getMessageTypeContent(user, this),
+        roomToken = roomToken,
+        activeUserId = user.userId,
+        activeUserBaseUrl = user.baseUrl,
+        messageParameters = normalizeMessageParameters(),
+        reactions = emptyList(),
+        isEdited = lastEditTimestamp != 0L,
+        parentMessage = parentMessage?.toScheduledMessageUiModel(user, roomToken),
+        replyable = false,
+        isGrouped = false,
+        isGroupedWithNext = false,
+        isSilent = silent
+    )
+}
+
+private fun ChatMessage.normalizeMessageParameters(): Map<String, Map<String, String>> =
+    messageParameters
+        .orEmpty()
+        .mapNotNull { (key, params) ->
+            if (key == null) {
+                null
+            } else {
+                val normalizedParams = params
+                    .orEmpty()
+                    .mapNotNull { (nestedKey, value) ->
+                        if (nestedKey == null || value == null) {
+                            null
+                        } else {
+                            nestedKey to value
+                        }
+                    }
+                    .toMap()
+                key to normalizedParams
+            }
+        }
+        .toMap()
+
+private fun ChatMessage.getReactionUiModels(): List<MessageReactionUi> {
+    val selfReactions = reactionsSelf.orEmpty().toSet()
+
+    return reactions.orEmpty()
+        .filterValues { amount -> amount > 0 }
+        .map { (emoji, amount) ->
+            MessageReactionUi(
+                emoji = emoji,
+                amount = amount,
+                isSelfReaction = selfReactions.contains(emoji)
+            )
+        }
+        .sortedWith(compareByDescending<MessageReactionUi> { it.isSelfReaction }.thenByDescending { it.amount })
+}
+
+fun resolveStatusIcon(
+    jsonMessageId: Int,
+    lastCommonReadMessageId: Int,
+    isTemporary: Boolean,
+    sendStatus: SendStatus?
+): MessageStatusIcon =
+    when {
+        sendStatus == SendStatus.FAILED -> MessageStatusIcon.FAILED
+        sendStatus == SendStatus.SENT_PENDING_ACK -> MessageStatusIcon.SENT
+        isTemporary -> MessageStatusIcon.SENDING
+        jsonMessageId <= lastCommonReadMessageId -> MessageStatusIcon.READ
+        else -> MessageStatusIcon.SENT
+    }
+
+fun getMessageTypeContent(user: User, message: ChatMessage, isClassified: Boolean = false): MessageTypeContent? =
+
+    if (message.isSystemMessage) {
+        MessageTypeContent.SystemMessage
+    } else if (message.isVoiceMessage) {
+        MessageTypeContent.Voice
+    } else if (message.hasFileAttachment && message.isTemporary) {
+        getUploadingMediaContent(message)
+    } else if (message.hasFileAttachment && message.fileParameters.mimetype.startsWith(Mimetype.AUDIO_PREFIX)) {
+        getAudioFileContent(message)
+    } else if (message.hasFileAttachment) {
+        getMediaContent(user, message, isClassified)
+    } else if (message.hasGeoLocation) {
+        getGeolocationContent(message)
+    } else if (message.hasPoll) {
+        getPollContent(message)
+    } else if (message.hasDeckCard) {
+        getDeckContent(message)
+    } else {
+        message.extractLinkPreviewUrl(user)
+            ?.let {
+                MessageTypeContent.LinkPreview(
+                    url = it,
+                    serverBaseUrl = user.baseUrl,
+                    authHeader = ApiUtils.getCredentials(user.username, user.token)
+                )
+            }
+            ?: MessageTypeContent.RegularText
+    }
+
+private const val FILE_PLACEHOLDER_MESSAGE = "{file}"
+
+fun getUploadingMediaContent(message: ChatMessage): MessageTypeContent.UploadingMedia {
+    val mimetype = message.fileParameters.mimetype
+    val drawableResourceId = DrawableUtils.getDrawableResourceIdForMimeType(mimetype)
+    return MessageTypeContent.UploadingMedia(
+        localFileUri = message.fileParameters.path.orEmpty(),
+        fileName = message.fileParameters.name.orEmpty(),
+        caption = message.message.takeIf { it != FILE_PLACEHOLDER_MESSAGE },
+        mimeType = mimetype.takeIf { !it.isNullOrEmpty() },
+        drawableResourceId = drawableResourceId
+    )
+}
+
+fun getMediaContent(user: User, message: ChatMessage, isClassified: Boolean = false): MessageTypeContent.Media {
+    val mimetype = message.fileParameters.mimetype
+    val drawableResourceId = DrawableUtils.getDrawableResourceIdForMimeType(mimetype)
+
+    val animateGif = shouldAnimateGif(user, message, mimetype)
+    val previewUrl = if (animateGif) {
+        ApiUtils.getUrlForFileDownload(
+            user.baseUrl!!,
+            user.userId!!,
+            message.fileParameters.path
+        )
+    } else {
+        getPreviewImageUrl(user, message)
+    }
+
+    return MessageTypeContent.Media(
+        previewUrl = previewUrl,
+        drawableResourceId = drawableResourceId,
+        mimeType = mimetype,
+        animateGif = animateGif,
+        blurhash = message.fileParameters.blurhash,
+        width = message.fileParameters.width,
+        height = message.fileParameters.height,
+        isClassified = isClassified,
+        authHeader = ApiUtils.getCredentials(user.username, user.token)
+    )
+}
+
+private fun shouldAnimateGif(user: User, message: ChatMessage, mimetype: String): Boolean {
+    val fileSize = message.fileParameters.size
+    val spreedCapabilities = user.capabilities?.spreedCapability
+    return MimetypeUtils.isGif(mimetype) &&
+        fileSize != null &&
+        message.fileParameters.path.isNotEmpty() &&
+        spreedCapabilities != null &&
+        fileSize <= CapabilitiesUtil.getMaxGifSize(spreedCapabilities) &&
+        !isReduceAnimationsEnabled()
+}
+
+/**
+ * Returns true if the user has the accessibility option
+ * for Remove/Reduce animations turned on
+ */
+private fun isReduceAnimationsEnabled(): Boolean {
+    val context = sharedApplication ?: return false
+    return Settings.Global.getFloat(
+        context.contentResolver,
+        Settings.Global.ANIMATOR_DURATION_SCALE,
+        1f
+    ) == 0f
+}
+
+fun getPreviewImageUrl(user: User, message: ChatMessage): String? {
+    if (message.fileParameters.previewAvailable) {
+        return ApiUtils.getUrlForFilePreviewWithFileId(
+            user.baseUrl!!,
+            message.fileParameters.id,
+            sharedApplication!!.resources.getDimensionPixelSize(R.dimen.maximum_file_preview_size)
+        )
+    }
+    return null
+}
+
+fun getGeolocationContent(message: ChatMessage): MessageTypeContent.Geolocation =
+    MessageTypeContent.Geolocation(
+        id = message.geoLocationParameters.id,
+        name = message.geoLocationParameters.name,
+        lat = message.geoLocationParameters.latitude!!,
+        lon = message.geoLocationParameters.longitude!!
+    )
+
+fun getPollContent(message: ChatMessage): MessageTypeContent.Poll =
+    MessageTypeContent.Poll(
+        pollId = message.pollParameters.id,
+        pollName = message.pollParameters.name
+    )
+
+fun getDeckContent(message: ChatMessage): MessageTypeContent.Deck =
+    MessageTypeContent.Deck(
+        cardName = message.deckCardParameters.name,
+        stackName = message.deckCardParameters.stackName,
+        boardName = message.deckCardParameters.boardName,
+        cardLink = message.deckCardParameters.link
+    )
+
+fun getAudioFileContent(message: ChatMessage): MessageTypeContent.AudioFile =
+    MessageTypeContent.AudioFile(fileName = message.fileParameters.name)

@@ -6,14 +6,17 @@
  */
 package com.nextcloud.talk.receivers
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.text.SpannableStringBuilder
 import android.text.style.ForegroundColorSpan
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -23,18 +26,21 @@ import com.nextcloud.talk.R
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.models.json.generic.GenericOverall
+import com.nextcloud.talk.models.json.chat.ChatOverallSingleMessage
 import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.DisplayUtils
 import com.nextcloud.talk.utils.NotificationUtils
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_INTERNAL_USER_ID
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SYSTEM_NOTIFICATION_ID
+import com.nextcloud.talk.utils.message.SendMessageUtils
 import io.reactivex.Observer
 import io.reactivex.Single
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
@@ -64,31 +70,41 @@ class DirectReplyReceiver : BroadcastReceiver() {
         systemNotificationId = intent!!.getIntExtra(KEY_SYSTEM_NOTIFICATION_ID, 0)
         roomToken = intent.getStringExtra(KEY_ROOM_TOKEN)
 
-        val id = intent.getLongExtra(KEY_INTERNAL_USER_ID, userManager.currentUser.blockingGet().id!!)
-        currentUser = userManager.getUserWithId(id).blockingGet()
+        val id = intent.getLongExtra(KEY_INTERNAL_USER_ID, 0L)
+        currentUser = runBlocking { userManager.getUserWithId(id) } ?: run {
+            Log.e(TAG, "No user found for id $id")
+            return
+        }
 
         replyMessage = getMessageText(intent)
         sendDirectReply()
     }
 
-    private fun getMessageText(intent: Intent): CharSequence? {
-        return RemoteInput.getResultsFromIntent(intent)?.getCharSequence(NotificationUtils.KEY_DIRECT_REPLY)
-    }
+    private fun getMessageText(intent: Intent): CharSequence? =
+        RemoteInput.getResultsFromIntent(intent)?.getCharSequence(NotificationUtils.KEY_DIRECT_REPLY)
 
     private fun sendDirectReply() {
         val credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token)
         val apiVersion = ApiUtils.getChatApiVersion(currentUser.capabilities!!.spreedCapability!!, intArrayOf(1))
         val url = ApiUtils.getUrlForChat(apiVersion, currentUser.baseUrl!!, roomToken!!)
 
-        ncApi.sendChatMessage(credentials, url, replyMessage, currentUser.displayName, null, false)
+        ncApi.sendChatMessage(
+            credentials,
+            url,
+            replyMessage,
+            currentUser.displayName,
+            null,
+            false,
+            SendMessageUtils().generateReferenceId()
+        )
             ?.subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
+            ?.subscribe(object : Observer<ChatOverallSingleMessage> {
                 override fun onSubscribe(d: Disposable) {
                     // unused atm
                 }
 
-                override fun onNext(genericOverall: GenericOverall) {
+                override fun onNext(message: ChatOverallSingleMessage) {
                     confirmReplySent()
                 }
 
@@ -139,7 +155,12 @@ class DirectReplyReceiver : BroadcastReceiver() {
 
         // Add reply
         Single.fromCallable {
-            val avatarUrl = ApiUtils.getUrlForAvatar(currentUser.baseUrl!!, currentUser.userId, false)
+            val avatarUrl = ApiUtils.getUrlForAvatar(
+                currentUser.baseUrl!!,
+                currentUser.userId,
+                false,
+                darkMode = DisplayUtils.isDarkModeOn(context)
+            )
             val me = Person.Builder()
                 .setName(currentUser.displayName)
                 .setIcon(NotificationUtils.loadAvatarSync(avatarUrl, context))
@@ -150,9 +171,15 @@ class DirectReplyReceiver : BroadcastReceiver() {
             // Set the updated style
             previousBuilder.setStyle(previousStyle)
 
-            // Check if notification still exists
-            if (findActiveNotification(systemNotificationId!!) != null) {
-                NotificationManagerCompat.from(context).notify(systemNotificationId!!, previousBuilder.build())
+            if (ActivityCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                // Check if notification still exists
+                if (findActiveNotification(systemNotificationId!!) != null) {
+                    NotificationManagerCompat.from(context).notify(systemNotificationId!!, previousBuilder.build())
+                }
             }
         }
             .subscribeOn(Schedulers.io())

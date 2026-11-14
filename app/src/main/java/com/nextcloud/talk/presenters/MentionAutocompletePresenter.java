@@ -11,15 +11,16 @@ package com.nextcloud.talk.presenters;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.util.Log;
-import android.view.View;
 import android.view.ViewGroup;
 
 import com.nextcloud.talk.adapters.items.MentionAutocompleteItem;
 import com.nextcloud.talk.api.NcApi;
 import com.nextcloud.talk.application.NextcloudTalkApplication;
+import com.nextcloud.talk.chat.MentionAutocompleteAdapter;
 import com.nextcloud.talk.data.user.model.User;
-import com.nextcloud.talk.models.json.mention.Mention;
+import com.nextcloud.talk.models.json.mention.MentionDto;
 import com.nextcloud.talk.models.json.mention.MentionOverall;
+import com.nextcloud.talk.ui.theme.HostViewThemeUtils;
 import com.nextcloud.talk.ui.theme.ViewThemeUtils;
 import com.nextcloud.talk.users.UserManager;
 import com.nextcloud.talk.utils.ApiUtils;
@@ -35,8 +36,6 @@ import javax.inject.Inject;
 import androidx.annotation.Nullable;
 import androidx.recyclerview.widget.RecyclerView;
 import autodagger.AutoInjector;
-import eu.davidea.flexibleadapter.FlexibleAdapter;
-import eu.davidea.flexibleadapter.items.AbstractFlexibleItem;
 import io.reactivex.Observer;
 import io.reactivex.android.schedulers.AndroidSchedulers;
 import io.reactivex.annotations.NonNull;
@@ -44,7 +43,7 @@ import io.reactivex.disposables.Disposable;
 import io.reactivex.schedulers.Schedulers;
 
 @AutoInjector(NextcloudTalkApplication.class)
-public class MentionAutocompletePresenter extends RecyclerViewPresenter<Mention> implements FlexibleAdapter.OnItemClickListener {
+public class MentionAutocompletePresenter extends RecyclerViewPresenter<MentionDto> {
     private static final String TAG = "MentionAutocompletePresenter";
 
     @Inject
@@ -57,35 +56,37 @@ public class MentionAutocompletePresenter extends RecyclerViewPresenter<Mention>
     ViewThemeUtils viewThemeUtils;
 
     private User currentUser;
-    private FlexibleAdapter<AbstractFlexibleItem> adapter;
+    private MentionAutocompleteAdapter mentionAdapter;
     private Context context;
 
     private String roomToken;
     private int chatApiVersion;
 
-    private List<AbstractFlexibleItem> abstractFlexibleItemList = new ArrayList<>();
-
-    public MentionAutocompletePresenter(Context context) {
+    public MentionAutocompletePresenter(Context context, User user, String roomToken, int chatApiVersion) {
         super(context);
-        this.context = context;
-        NextcloudTalkApplication.Companion.getSharedApplication().getComponentApplication().inject(this);
-        currentUser = userManager.getCurrentUser().blockingGet();
-    }
-
-    public MentionAutocompletePresenter(Context context, String roomToken, int chatApiVersion) {
-        super(context);
+        this.currentUser = user;
         this.roomToken = roomToken;
         this.context = context;
         this.chatApiVersion = chatApiVersion;
         NextcloudTalkApplication.Companion.getSharedApplication().getComponentApplication().inject(this);
-        currentUser = userManager.getCurrentUser().blockingGet();
+        viewThemeUtils = HostViewThemeUtils.hostViewThemeUtils(context, viewThemeUtils);
     }
 
     @Override
     protected RecyclerView.Adapter instantiateAdapter() {
-        adapter = new FlexibleAdapter<>(abstractFlexibleItemList, context, false);
-        adapter.addListener(this);
-        return adapter;
+        mentionAdapter = new MentionAutocompleteAdapter(context, currentUser, viewThemeUtils, roomToken, mention -> {
+            MentionDto result = new MentionDto();
+            if (mention.mentionId != null) {
+                result.setMentionId(mention.mentionId);
+            }
+            result.setId(mention.objectId);
+            result.setLabel(mention.displayName);
+            result.setSource(mention.source);
+            result.setRoomToken(mention.roomToken);
+            dispatchClick(result);
+            return null;
+        });
+        return mentionAdapter;
     }
 
     @Override
@@ -106,7 +107,7 @@ public class MentionAutocompletePresenter extends RecyclerViewPresenter<Mention>
             queryString = "";
         }
 
-        adapter.setFilter(queryString);
+        mentionAdapter.setFilterQuery(queryString);
 
         Map<String, String> queryMap = new HashMap<>();
         queryMap.put("includeStatus", "true");
@@ -126,35 +127,33 @@ public class MentionAutocompletePresenter extends RecyclerViewPresenter<Mention>
 
                 @Override
                 public void onNext(@NonNull MentionOverall mentionOverall) {
-                    List<Mention> mentionsList = mentionOverall.getOcs().getData();
+                    if (mentionOverall.getOcs() != null) {
+                        List<MentionDto> mentionsList = mentionOverall.getOcs().getData();
 
-                    if (mentionsList.size() == 0) {
-                        adapter.clear();
-                    } else {
-                        List<AbstractFlexibleItem> internalAbstractFlexibleItemList =
-                            new ArrayList<>(mentionsList.size());
-                        for (Mention mention : mentionsList) {
-                            internalAbstractFlexibleItemList.add(
-                                new MentionAutocompleteItem(
-                                    mention,
-                                    currentUser,
-                                    context,
-                                    roomToken,
-                                    viewThemeUtils));
+                        if (mentionsList != null) {
+
+                            if (mentionsList.isEmpty()) {
+                                mentionAdapter.clear();
+                            } else {
+                                List<MentionAutocompleteItem> itemList = new ArrayList<>(mentionsList.size());
+                                for (MentionDto mention : mentionsList) {
+                                    itemList.add(new MentionAutocompleteItem(mention, context, roomToken));
+                                }
+
+                                if (mentionAdapter.getItemCount() != 0) {
+                                    mentionAdapter.clear();
+                                }
+
+                                mentionAdapter.updateDataSet(itemList);
+                            }
                         }
-
-                        if (adapter.getItemCount() != 0) {
-                            adapter.clear();
-                        }
-
-                        adapter.updateDataSet(internalAbstractFlexibleItemList);
                     }
                 }
 
                 @SuppressLint("LongLogTag")
                 @Override
                 public void onError(@NonNull Throwable e) {
-                    adapter.clear();
+                    mentionAdapter.clear();
                     Log.e(TAG, "failed to get MentionAutocompleteSuggestions", e);
                 }
 
@@ -163,23 +162,5 @@ public class MentionAutocompletePresenter extends RecyclerViewPresenter<Mention>
                     // no actions atm
                 }
             });
-    }
-
-    @Override
-    public boolean onItemClick(View view, int position) {
-        Mention mention = new Mention();
-        MentionAutocompleteItem mentionAutocompleteItem = (MentionAutocompleteItem) adapter.getItem(position);
-        if (mentionAutocompleteItem != null) {
-            String mentionId = mentionAutocompleteItem.mentionId;
-            if (mentionId != null) {
-                mention.setMentionId(mentionId);
-            }
-            mention.setId(mentionAutocompleteItem.objectId);
-            mention.setLabel(mentionAutocompleteItem.displayName);
-            mention.setSource(mentionAutocompleteItem.source);
-            mention.setRoomToken(mentionAutocompleteItem.roomToken);
-            dispatchClick(mention);
-        }
-        return true;
     }
 }

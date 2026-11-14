@@ -10,14 +10,25 @@
 
 package com.nextcloud.talk.extensions
 
+import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.LayerDrawable
-import android.os.Build
 import android.util.Log
 import android.widget.ImageView
 import androidx.core.content.ContextCompat
-import androidx.core.content.res.ResourcesCompat
+import androidx.core.graphics.drawable.toBitmap
 import coil.annotation.ExperimentalCoilApi
+import coil.dispose
 import coil.imageLoader
 import coil.load
 import coil.request.CachePolicy
@@ -26,16 +37,20 @@ import coil.request.SuccessResult
 import coil.result
 import coil.transform.CircleCropTransformation
 import coil.transform.RoundedCornersTransformation
-import com.amulyakhare.textdrawable.TextDrawable
 import com.nextcloud.talk.R
+import com.nextcloud.talk.chat.data.model.ChatMessage
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.models.domain.ConversationModel
-import com.nextcloud.talk.models.domain.ConversationType
-import com.nextcloud.talk.models.json.chat.ChatMessage
-import com.nextcloud.talk.models.json.conversations.Conversation
+import com.nextcloud.talk.models.json.conversations.ConversationDto
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
+import com.nextcloud.talk.ui.toDrawable
+import com.nextcloud.talk.utils.ActorAvatar
 import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CharacterAvatarUtils
 import com.nextcloud.talk.utils.DisplayUtils
+import com.nextcloud.talk.utils.UriUtils
+import kotlin.math.min
 
 private const val ROUNDING_PIXEL = 16f
 private const val TAG = "ImageViewExtensions"
@@ -43,17 +58,16 @@ private const val TAG = "ImageViewExtensions"
 @Deprecated("use other constructor that expects com.nextcloud.talk.models.domain.ConversationModel")
 fun ImageView.loadConversationAvatar(
     user: User,
-    conversation: Conversation,
+    conversation: ConversationDto,
     ignoreCache: Boolean,
     viewThemeUtils: ViewThemeUtils?
-): io.reactivex.disposables.Disposable {
-    return loadConversationAvatar(
+): io.reactivex.disposables.Disposable =
+    loadConversationAvatar(
         user,
-        ConversationModel.mapToConversationModel(conversation),
+        ConversationModel.mapToConversationModel(conversation, user),
         ignoreCache,
         viewThemeUtils
     )
-}
 
 @Suppress("ReturnCount")
 fun ImageView.loadConversationAvatar(
@@ -72,10 +86,10 @@ fun ImageView.loadConversationAvatar(
 
     if (conversation.avatarVersion.isNullOrEmpty() && viewThemeUtils != null) {
         when (conversation.type) {
-            ConversationType.ROOM_GROUP_CALL ->
+            ConversationEnums.ConversationType.ROOM_GROUP_CALL ->
                 return loadDefaultGroupCallAvatar(viewThemeUtils)
 
-            ConversationType.ROOM_PUBLIC_CALL ->
+            ConversationEnums.ConversationType.ROOM_PUBLIC_CALL ->
                 return loadDefaultPublicCallAvatar(viewThemeUtils)
 
             else -> {}
@@ -86,10 +100,10 @@ fun ImageView.loadConversationAvatar(
     // when no own images are set. (although these default avatars can not be themed for the android app..)
     val errorPlaceholder =
         when (conversation.type) {
-            ConversationType.ROOM_GROUP_CALL ->
+            ConversationEnums.ConversationType.ROOM_GROUP_CALL ->
                 ContextCompat.getDrawable(context, R.drawable.ic_circular_group)
 
-            ConversationType.ROOM_PUBLIC_CALL ->
+            ConversationEnums.ConversationType.ROOM_PUBLIC_CALL ->
                 ContextCompat.getDrawable(context, R.drawable.ic_circular_link)
 
             else -> ContextCompat.getDrawable(context, R.drawable.account_circle_96dp)
@@ -107,7 +121,8 @@ fun ImageView.loadUserAvatar(
     val imageRequestUri = ApiUtils.getUrlForAvatar(
         user.baseUrl!!,
         avatarId,
-        requestBigSize
+        requestBigSize,
+        darkMode = DisplayUtils.isDarkModeOn(this.context)
     )
 
     return loadAvatarInternal(user, imageRequestUri, ignoreCache, null)
@@ -196,9 +211,8 @@ private fun ImageView.loadAvatarInternal(
 }
 
 @Deprecated("Use function loadAvatar", level = DeprecationLevel.WARNING)
-fun ImageView.loadAvatarWithUrl(user: User? = null, url: String): io.reactivex.disposables.Disposable {
-    return loadAvatarInternal(user, url, false, null)
-}
+fun ImageView.loadAvatarWithUrl(user: User? = null, url: String): io.reactivex.disposables.Disposable =
+    loadAvatarInternal(user, url, false, null)
 
 fun ImageView.loadThumbnail(url: String, user: User): io.reactivex.disposables.Disposable {
     val requestBuilder = ImageRequest.Builder(context)
@@ -207,17 +221,13 @@ fun ImageView.loadThumbnail(url: String, user: User): io.reactivex.disposables.D
         .target(this)
         .transformations(CircleCropTransformation())
 
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        val layers = arrayOfNulls<Drawable>(2)
-        layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
-        layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground)
-        requestBuilder.placeholder(LayerDrawable(layers))
-    } else {
-        requestBuilder.placeholder(R.mipmap.ic_launcher)
-    }
+    val layers = arrayOfNulls<Drawable>(2)
+    layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
+    layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground)
+    requestBuilder.placeholder(LayerDrawable(layers))
 
-    if (url.startsWith(user.baseUrl!!) &&
-        (url.contains("index.php/core/preview") || url.contains("/avatar/"))
+    if (UriUtils.isOnServer(url, user.baseUrl!!) &&
+        (url.contains("index.php/core/preview") || url.contains("/avatar/") || url.contains("remote.php/dav/"))
     ) {
         requestBuilder.addHeader(
             "Authorization",
@@ -242,8 +252,8 @@ fun ImageView.loadImage(url: String, user: User, placeholder: Drawable? = null):
         .error(finalPlaceholder)
         .transformations(RoundedCornersTransformation(ROUNDING_PIXEL, ROUNDING_PIXEL, ROUNDING_PIXEL, ROUNDING_PIXEL))
 
-    if (url.startsWith(user.baseUrl!!) &&
-        (url.contains("index.php/core/preview") || url.contains("/avatar/"))
+    if (UriUtils.isOnServer(url, user.baseUrl!!) &&
+        (url.contains("index.php/core/preview") || url.contains("/avatar/") || url.contains("remote.php/dav/"))
     ) {
         requestBuilder.addHeader(
             "Authorization",
@@ -258,32 +268,26 @@ fun ImageView.loadAvatarOrImagePreview(
     url: String,
     user: User,
     placeholder: Drawable? = null
-): io.reactivex.disposables.Disposable {
-    return if (url.contains("/avatar/")) {
+): io.reactivex.disposables.Disposable =
+    if (url.contains("/avatar/")) {
         loadAvatarInternal(user, url, false, null)
     } else {
         loadImage(url, user, placeholder)
     }
-}
 
-fun ImageView.loadUserAvatar(any: Any?): io.reactivex.disposables.Disposable {
-    return DisposableWrapper(
+fun ImageView.loadUserAvatar(any: Any?): io.reactivex.disposables.Disposable =
+    DisposableWrapper(
         load(any) {
             transformations(CircleCropTransformation())
         }
     )
-}
 
 fun ImageView.loadSystemAvatar(): io.reactivex.disposables.Disposable {
-    val data: Any = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        val layers = arrayOfNulls<Drawable>(2)
-        layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
-        layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground)
-        val layerDrawable = LayerDrawable(layers)
-        layerDrawable
-    } else {
-        R.mipmap.ic_launcher
-    }
+    val layers = arrayOfNulls<Drawable>(2)
+    layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
+    layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground)
+    val layerDrawable = LayerDrawable(layers)
+    val data: Any = layerDrawable
 
     return DisposableWrapper(
         load(data) {
@@ -292,96 +296,135 @@ fun ImageView.loadSystemAvatar(): io.reactivex.disposables.Disposable {
     )
 }
 
-fun ImageView.loadNoteToSelfAvatar(): io.reactivex.disposables.Disposable {
-    val data: Any = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        val layers = arrayOfNulls<Drawable>(2)
-        layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
-        layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_note_to_self)
-        val layerDrawable = LayerDrawable(layers)
-        layerDrawable
-    } else {
-        R.mipmap.ic_launcher
-    }
-
-    return DisposableWrapper(
-        load(data) {
-            transformations(CircleCropTransformation())
-        }
-    )
-}
-
-fun ImageView.loadChangelogBotAvatar(): io.reactivex.disposables.Disposable {
-    return loadSystemAvatar()
-}
-
-fun ImageView.loadBotsAvatar(): io.reactivex.disposables.Disposable {
-    return loadUserAvatar(
-        TextDrawable.builder()
-            .beginConfig()
-            .bold()
-            .endConfig()
-            .buildRound(
-                ">",
-                ResourcesCompat.getColor(context.resources, R.color.black, null)
-            )
-    )
+fun ImageView.loadNoteToSelfAvatar() {
+    val layers = arrayOfNulls<Drawable>(2)
+    layers[0] = ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
+    layers[1] = ContextCompat.getDrawable(context, R.drawable.ic_note_to_self)
+    val layerDrawable = LayerDrawable(layers)
+    setImageDrawable(CircularDrawable(layerDrawable))
 }
 
 fun ImageView.loadDefaultGroupCallAvatar(viewThemeUtils: ViewThemeUtils): io.reactivex.disposables.Disposable {
-    val data: Any = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_group) as Any
-    } else {
-        R.drawable.ic_circular_group
-    }
+    val data: Any = viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_group_small) as Any
+    return loadUserAvatar(data)
+}
+
+fun ImageView.loadDefaultAvatar(viewThemeUtils: ViewThemeUtils): io.reactivex.disposables.Disposable {
+    val data: Any = viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.account_circle_96dp) as Any
     return loadUserAvatar(data)
 }
 
 fun ImageView.loadDefaultPublicCallAvatar(viewThemeUtils: ViewThemeUtils): io.reactivex.disposables.Disposable {
-    val data: Any = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_link) as Any
-    } else {
-        R.drawable.ic_circular_link
-    }
+    val data: Any = viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_link) as Any
     return loadUserAvatar(data)
 }
 
 fun ImageView.loadMailAvatar(viewThemeUtils: ViewThemeUtils): io.reactivex.disposables.Disposable {
-    val data: Any = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_mail) as Any
-    } else {
-        R.drawable.ic_circular_mail
-    }
+    val data: Any = viewThemeUtils.talk.themePlaceholderAvatar(this, R.drawable.ic_avatar_mail) as Any
     return loadUserAvatar(data)
 }
 
-fun ImageView.loadGuestAvatar(user: User, name: String, big: Boolean): io.reactivex.disposables.Disposable {
-    return loadGuestAvatar(user.baseUrl!!, name, big)
-}
-
-fun ImageView.loadGuestAvatar(baseUrl: String, name: String, big: Boolean): io.reactivex.disposables.Disposable {
-    val imageRequestUri = ApiUtils.getUrlForGuestAvatar(
-        baseUrl,
-        name,
-        big
-    )
-    return DisposableWrapper(
-        load(imageRequestUri) {
-            transformations(CircleCropTransformation())
-            listener(onError = { _, result ->
-                Log.w(TAG, "Can't load guest avatar with URL: $imageRequestUri", result.throwable)
-            })
+/**
+ * Client-side avatar for guest and email actors, which have no avatar on the server: a guest who
+ * gave us their name gets the first character of it drawn on a circle, an unnamed one the generic
+ * person icon. Nothing is requested from the server for either, matching the web client.
+ *
+ * Any avatar request still in flight for the view is cancelled first, so a recycled view cannot be
+ * overwritten by its predecessor's avatar.
+ */
+fun ImageView.loadGuestAvatar(displayName: String?, viewThemeUtils: ViewThemeUtils) {
+    when (val avatar = CharacterAvatarUtils.guestAvatar(displayName, context.getString(R.string.nc_guest))) {
+        is ActorAvatar.Character -> {
+            dispose()
+            setImageDrawable(avatar.toDrawable(context))
         }
-    )
+
+        ActorAvatar.AppIcon -> loadSystemAvatar()
+        ActorAvatar.PersonIcon -> loadDefaultAvatar(viewThemeUtils)
+    }
 }
 
-private class DisposableWrapper(private val disposable: coil.request.Disposable) : io.reactivex.disposables
-    .Disposable {
+private class DisposableWrapper(private val disposable: coil.request.Disposable) :
+    io.reactivex.disposables
+        .Disposable {
 
     override fun dispose() {
         disposable.dispose()
     }
 
-    override fun isDisposed(): Boolean {
-        return disposable.isDisposed
+    override fun isDisposed(): Boolean = disposable.isDisposed
+}
+
+private class CircularDrawable(private val sourceDrawable: Drawable) : Drawable() {
+
+    private val bitmap: Bitmap = drawableToBitmap(sourceDrawable)
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+    }
+
+    private val rect = RectF()
+    private var radius = 0f
+
+    override fun onBoundsChange(bounds: Rect) {
+        super.onBoundsChange(bounds)
+        rect.set(bounds)
+
+        radius = min(rect.width() / 2.0f, rect.height() / 2.0f)
+
+        val matrix = Matrix()
+        val scale: Float
+        var dx = 0f
+        var dy = 0f
+
+        if (bitmap.width * rect.height() > rect.width() * bitmap.height) {
+            // Taller than wide, scale to height and center horizontally
+            scale = rect.height() / bitmap.height.toFloat()
+            dx = (rect.width() - bitmap.width * scale) / 2.0f
+        } else {
+            // Wider than tall, scale to width and center vertically
+            scale = rect.width() / bitmap.width.toFloat()
+            dy = (rect.height() - bitmap.height * scale) / 2.0f
+        }
+
+        matrix.setScale(scale, scale)
+        matrix.postTranslate(dx.toInt().toFloat() + rect.left, dy.toInt().toFloat() + rect.top)
+        paint.shader.setLocalMatrix(matrix)
+    }
+
+    override fun draw(canvas: Canvas) {
+        canvas.drawCircle(rect.centerX(), rect.centerY(), radius, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {
+        paint.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated(
+        "This method is no longer used in graphics optimizations",
+        ReplaceWith("PixelFormat.TRANSLUCENT", "android.graphics.PixelFormat")
+    )
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+    override fun getIntrinsicWidth(): Int = sourceDrawable.intrinsicWidth
+
+    override fun getIntrinsicHeight(): Int = sourceDrawable.intrinsicHeight
+
+    companion object {
+
+        private fun drawableToBitmap(drawable: Drawable): Bitmap {
+            if (drawable is BitmapDrawable) {
+                if (drawable.bitmap != null) {
+                    return drawable.bitmap
+                }
+            }
+
+            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 1
+            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 1
+            return drawable.toBitmap(width, height, Bitmap.Config.ARGB_8888)
+        }
     }
 }

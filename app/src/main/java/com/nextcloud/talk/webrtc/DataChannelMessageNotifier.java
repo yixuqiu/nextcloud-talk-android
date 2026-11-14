@@ -12,7 +12,7 @@ import java.util.Set;
 
 /**
  * Helper class to register and notify DataChannelMessageListeners.
- *
+ * <p>
  * This class is only meant for internal use by PeerConnectionWrapper; listeners must register themselves against
  * a PeerConnectionWrapper rather than against a DataChannelMessageNotifier.
  */
@@ -54,6 +54,18 @@ public class DataChannelMessageNotifier {
     public synchronized void notifyVideoOff() {
         for (PeerConnectionWrapper.DataChannelMessageListener listener : new ArrayList<>(dataChannelMessageListeners)) {
             listener.onVideoOff();
+        }
+    }
+
+    public synchronized void notifySpeaking() {
+        for (PeerConnectionWrapper.DataChannelMessageListener listener : new ArrayList<>(dataChannelMessageListeners)) {
+            listener.onSpeaking();
+        }
+    }
+
+    public synchronized void notifyStoppedSpeaking() {
+        for (PeerConnectionWrapper.DataChannelMessageListener listener : new ArrayList<>(dataChannelMessageListeners)) {
+            listener.onStoppedSpeaking();
         }
     }
 

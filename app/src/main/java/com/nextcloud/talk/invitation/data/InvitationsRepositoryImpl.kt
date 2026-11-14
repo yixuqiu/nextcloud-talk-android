@@ -7,11 +7,12 @@
 package com.nextcloud.talk.invitation.data
 
 import com.nextcloud.talk.api.NcApi
+import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observable
 
-class InvitationsRepositoryImpl(private val ncApi: NcApi) :
+class InvitationsRepositoryImpl(private val ncApi: NcApi, private val ncApiCoroutines: NcApiCoroutines) :
     InvitationsRepository {
 
     override fun fetchInvitations(user: User): Observable<InvitationsModel> {
@@ -41,9 +42,19 @@ class InvitationsRepositoryImpl(private val ncApi: NcApi) :
         ).map { InvitationActionModel(ActionEnum.REJECT, it.ocs?.meta?.statusCode!!, invitation) }
     }
 
+    override suspend fun getInvitations(user: User): InvitationsModel {
+        val credentials: String = ApiUtils.getCredentials(user.username, user.token)!!
+
+        val invitationsOverall = ncApiCoroutines.getInvitations(
+            credentials,
+            ApiUtils.getUrlForInvitation(user.baseUrl!!)
+        )
+        return mapToInvitationsModel(user, invitationsOverall.ocs?.data!!)
+    }
+
     private fun mapToInvitationsModel(
         user: User,
-        invitations: List<com.nextcloud.talk.models.json.invitation.Invitation>
+        invitations: List<com.nextcloud.talk.models.json.invitation.InvitationDto>
     ): InvitationsModel {
         val filteredInvitations = invitations.filter { it.state == OPEN_PENDING_INVITATION }
 

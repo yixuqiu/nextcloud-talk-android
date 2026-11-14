@@ -6,7 +6,7 @@
  */
 package com.nextcloud.talk.call;
 
-import com.nextcloud.talk.models.json.participants.Participant;
+import com.nextcloud.talk.models.json.participants.ParticipantDto;
 import com.nextcloud.talk.signaling.SignalingMessageReceiver;
 
 import java.util.ArrayList;
@@ -17,7 +17,7 @@ import java.util.Map;
 
 /**
  * Helper class to keep track of the participants in a call based on the signaling messages.
- *
+ * <p>
  * The CallParticipantList adds a listener for participant list messages as soon as it is created and starts tracking
  * the call participants until destroyed. Notifications about the changes can be received by adding an observer to the
  * CallParticipantList; note that no sorting is guaranteed on the participants.
@@ -29,46 +29,79 @@ public class CallParticipantList {
     private final SignalingMessageReceiver signalingMessageReceiver;
 
     public interface Observer {
-        void onCallParticipantsChanged(Collection<Participant> joined, Collection<Participant> updated,
-                                       Collection<Participant> left, Collection<Participant> unchanged);
+        void onCallParticipantsChanged(Collection<ParticipantDto> joined, Collection<ParticipantDto> updated,
+                                       Collection<ParticipantDto> left, Collection<ParticipantDto> unchanged);
         void onCallEndedForAll();
     }
 
     private final SignalingMessageReceiver.ParticipantListMessageListener participantListMessageListener =
             new SignalingMessageReceiver.ParticipantListMessageListener() {
 
-        private final Map<String, Participant> callParticipants = new HashMap<>();
+        private final Map<String, ParticipantDto> callParticipants = new HashMap<>();
 
         @Override
-        public void onUsersInRoom(List<Participant> participants) {
-            processParticipantList(participants);
+        public void onUsersInRoom(List<ParticipantDto> participants) {
+            // Internal signaling: full participant list; participants absent from the list have left.
+            Collection<ParticipantDto> joined = new ArrayList<>();
+            Collection<ParticipantDto> updated = new ArrayList<>();
+            Collection<ParticipantDto> left = new ArrayList<>();
+            Collection<ParticipantDto> unchanged = new ArrayList<>();
+
+            Collection<ParticipantDto> notFound = classifyParticipants(participants, joined, updated, left, unchanged);
+
+            for (ParticipantDto callParticipant : notFound) {
+                callParticipants.remove(callParticipant.getSessionId());
+                // No need to copy it, as it will be no longer used.
+                callParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
+            }
+            left.addAll(notFound);
+
+            notifyIfChanged(joined, updated, left, unchanged);
         }
 
         @Override
-        public void onParticipantsUpdate(List<Participant> participants) {
-            processParticipantList(participants);
+        public void onParticipantsUpdate(List<ParticipantDto> participants) {
+            // HPB external signaling: partial update containing only changed participants.
+            // Participants absent from this list are still in the call — move them to "unchanged"
+            // so that observers (e.g. CallActivity) see the full set of active participants.
+            Collection<ParticipantDto> joined = new ArrayList<>();
+            Collection<ParticipantDto> updated = new ArrayList<>();
+            Collection<ParticipantDto> left = new ArrayList<>();
+            Collection<ParticipantDto> unchanged = new ArrayList<>();
+
+            Collection<ParticipantDto> notFound = classifyParticipants(participants, joined, updated, left, unchanged);
+
+            for (ParticipantDto callParticipant : notFound) {
+                unchanged.add(copyParticipant(callParticipant));
+            }
+
+            notifyIfChanged(joined, updated, left, unchanged);
         }
 
-        private void processParticipantList(List<Participant> participants) {
-            Collection<Participant> joined = new ArrayList<>();
-            Collection<Participant> updated = new ArrayList<>();
-            Collection<Participant> left = new ArrayList<>();
-            Collection<Participant> unchanged = new ArrayList<>();
+        /**
+         * Classifies each participant in the given list into joined/updated/left/unchanged based on
+         * the current known call participants. Returns the set of previously known participants that
+         * were not present in the list (callers decide what to do with them).
+         */
+        private Collection<ParticipantDto> classifyParticipants(List<ParticipantDto> participants,
+                                                             Collection<ParticipantDto> joined,
+                                                             Collection<ParticipantDto> updated,
+                                                             Collection<ParticipantDto> left,
+                                                             Collection<ParticipantDto> unchanged) {
+            Collection<ParticipantDto> notFound = new ArrayList<>(callParticipants.values());
 
-            Collection<Participant> knownCallParticipantsNotFound = new ArrayList<>(callParticipants.values());
-
-            for (Participant participant : participants) {
+            for (ParticipantDto participant : participants) {
                 String sessionId = participant.getSessionId();
-                Participant callParticipant = callParticipants.get(sessionId);
+                ParticipantDto callParticipant = callParticipants.get(sessionId);
 
                 boolean knownCallParticipant = callParticipant != null;
-                if (!knownCallParticipant && participant.getInCall() != Participant.InCallFlags.DISCONNECTED) {
+                if (!knownCallParticipant && participant.getInCall() != ParticipantDto.InCallFlags.DISCONNECTED) {
                     callParticipants.put(sessionId, copyParticipant(participant));
                     joined.add(copyParticipant(participant));
-                } else if (knownCallParticipant && participant.getInCall() == Participant.InCallFlags.DISCONNECTED) {
+                } else if (knownCallParticipant && participant.getInCall() == ParticipantDto.InCallFlags.DISCONNECTED) {
                     callParticipants.remove(sessionId);
                     // No need to copy it, as it will be no longer used.
-                    callParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+                    callParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
                     left.add(callParticipant);
                 } else if (knownCallParticipant && callParticipant.getInCall() != participant.getInCall()) {
                     callParticipant.setInCall(participant.getInCall());
@@ -78,17 +111,15 @@ public class CallParticipantList {
                 }
 
                 if (knownCallParticipant) {
-                    knownCallParticipantsNotFound.remove(callParticipant);
+                    notFound.remove(callParticipant);
                 }
             }
 
-            for (Participant callParticipant : knownCallParticipantsNotFound) {
-                callParticipants.remove(callParticipant.getSessionId());
-                // No need to copy it, as it will be no longer used.
-                callParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
-                left.add(callParticipant);
-            }
+            return notFound;
+        }
 
+        private void notifyIfChanged(Collection<ParticipantDto> joined, Collection<ParticipantDto> updated,
+                                     Collection<ParticipantDto> left, Collection<ParticipantDto> unchanged) {
             if (!joined.isEmpty() || !updated.isEmpty() || !left.isEmpty()) {
                 callParticipantListNotifier.notifyChanged(joined, updated, left, unchanged);
             }
@@ -96,21 +127,21 @@ public class CallParticipantList {
 
         @Override
         public void onAllParticipantsUpdate(long inCall) {
-            if (inCall != Participant.InCallFlags.DISCONNECTED) {
+            if (inCall != ParticipantDto.InCallFlags.DISCONNECTED) {
                 // Updating all participants is expected to happen only to disconnect them.
                 return;
             }
 
             callParticipantListNotifier.notifyCallEndedForAll();
 
-            Collection<Participant> joined = new ArrayList<>();
-            Collection<Participant> updated = new ArrayList<>();
-            Collection<Participant> left = new ArrayList<>(callParticipants.size());
-            Collection<Participant> unchanged = new ArrayList<>();
+            Collection<ParticipantDto> joined = new ArrayList<>();
+            Collection<ParticipantDto> updated = new ArrayList<>();
+            Collection<ParticipantDto> left = new ArrayList<>(callParticipants.size());
+            Collection<ParticipantDto> unchanged = new ArrayList<>();
 
-            for (Participant callParticipant : callParticipants.values()) {
+            for (ParticipantDto callParticipant : callParticipants.values()) {
                 // No need to copy it, as it will be no longer used.
-                callParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+                callParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
                 left.add(callParticipant);
             }
             callParticipants.clear();
@@ -120,8 +151,10 @@ public class CallParticipantList {
             }
         }
 
-        private Participant copyParticipant(Participant participant) {
-            Participant copiedParticipant = new Participant();
+        private ParticipantDto copyParticipant(ParticipantDto participant) {
+            ParticipantDto copiedParticipant = new ParticipantDto();
+            copiedParticipant.setActorId(participant.getActorId());
+            copiedParticipant.setActorType(participant.getActorType());
             copiedParticipant.setInCall(participant.getInCall());
             copiedParticipant.setInternal(participant.getInternal());
             copiedParticipant.setLastPing(participant.getLastPing());

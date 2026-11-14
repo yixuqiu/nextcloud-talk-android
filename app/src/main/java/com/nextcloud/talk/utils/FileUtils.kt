@@ -11,10 +11,11 @@ package com.nextcloud.talk.utils
 
 import android.content.ContentResolver
 import android.content.Context
-import android.database.Cursor
 import android.net.Uri
+import android.os.Process
 import android.provider.OpenableColumns
 import android.util.Log
+import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
@@ -27,6 +28,125 @@ object FileUtils {
     private val TAG = FileUtils::class.java.simpleName
     private const val RADIX: Int = 16
     private const val MD5_LENGTH: Int = 32
+    internal const val SHARED_ATTACHMENTS_DIRECTORY = "shared_attachments"
+
+    // the copies of the files other apps share, see SharedFileCopies; kept apart from the shared attachments, which are
+    // named by their senders, so an attachment can't take the place of the copies. In the files directory, not in the
+    // cache, which the system clears when the storage runs low, also while their uploads still wait for the network.
+    internal const val SHARED_FILE_COPIES_DIRECTORY = "shared_file_copies"
+
+    /**
+     * Returns the dedicated cache directory used for externally shared attachments.
+     */
+    fun getSharedAttachmentsDirectory(cacheDir: File): File? {
+        val directory = File(cacheDir, SHARED_ATTACHMENTS_DIRECTORY)
+        if (directory.exists()) {
+            return if (directory.isDirectory) directory else null
+        }
+        return if (directory.mkdirs()) directory else null
+    }
+
+    /**
+     * Resolves a shared attachment file inside the dedicated cache directory.
+     */
+    fun resolveSharedAttachmentFile(cacheDir: File, untrustedFileName: String?): File? {
+        val sharedDirectory = getSharedAttachmentsDirectory(cacheDir) ?: return null
+        return resolveFileInDirectory(sharedDirectory, untrustedFileName)
+    }
+
+    /**
+     * Resolves a shared attachment file inside a per-[fileId] subdirectory of the dedicated cache
+     * directory. [untrustedFileName] alone is sender-controlled and not unique - two different
+     * attachments (e.g. two pasted screenshots both named "image.png") can share it, which would
+     * otherwise let concurrent downloads (see MediaViewerViewModel's prefetch) resolve to, and
+     * overwrite, the very same cache file. Nesting under the server-assigned [fileId] keeps every
+     * attachment's cache slot unique regardless of what its sender named it.
+     * Without a [fileId], the file is resolved directly inside the dedicated cache directory.
+     */
+    fun resolveSharedAttachmentFile(cacheDir: File, fileId: String?, untrustedFileName: String?): File? {
+        if (fileId.isNullOrEmpty()) return resolveSharedAttachmentFile(cacheDir, untrustedFileName)
+        val fileIdDirectory = getSharedAttachmentsDirectory(cacheDir)
+            ?.let { resolveFileInDirectory(it, fileId) }
+            ?.takeIf { it.exists() || it.mkdirs() }
+        return fileIdDirectory?.let { resolveFileInDirectory(it, untrustedFileName) }
+    }
+
+    /**
+     * The file that the [pathSegments] of an own FileProvider uri point to, if it is inside the dedicated shared
+     * attachments directory in [cacheDir] or the one of the copies of shared files in [filesDir], else null.
+     */
+    fun sharedAttachmentProviderFile(cacheDir: File, filesDir: File, pathSegments: List<String>): File? {
+        val root = when (pathSegments.firstOrNull()) {
+            SHARED_ATTACHMENTS_DIRECTORY -> cacheDir
+            SHARED_FILE_COPIES_DIRECTORY -> filesDir
+            else -> null
+        }
+        if (pathSegments.size < 2 || root == null) return null
+        var resolvedFile: File? = File(root, pathSegments.first())
+        for (segment in pathSegments.drop(1)) {
+            resolvedFile = resolvedFile?.let { resolveFileInDirectory(it, segment) }
+        }
+        return resolvedFile
+    }
+
+    /**
+     * Checks whether an externally provided [uri] may be uploaded: only content uris are accepted,
+     * and uris of the own app only when they point into the shared attachments cache or the copies
+     * of shared files of its FileProvider.
+     */
+    fun isTrustedShareUri(uri: Uri?, context: Context): Boolean =
+        isTrustedShareUri(uri, context.packageName, context.cacheDir, context.filesDir) { authority ->
+            context.packageManager.resolveContentProvider(authority, 0)?.packageName
+        }
+
+    /**
+     * See [isTrustedShareUri]. Every provider of the own app ([packageName]) is rejected, as e.g. the one of the
+     * ImagePicker library serves all its files, except the paths of its FileProvider (authority [packageName]) that
+     * [sharedAttachmentProviderFile] allows. A user id prefix ("10@authority") is ignored, so the providers of the
+     * app of another user, e.g. in another profile, are rejected the same way. [packageOfAuthority] gives the package
+     * of the provider of an authority.
+     */
+    fun isTrustedShareUri(
+        uri: Uri?,
+        packageName: String,
+        cacheDir: File,
+        filesDir: File,
+        packageOfAuthority: (String) -> String?
+    ): Boolean {
+        val contentUri = uri?.takeIf { ContentResolver.SCHEME_CONTENT == it.scheme }
+        val authority = contentUri?.authorityWithoutUser ?: return false
+        val isOwnProvider = authority == packageName || packageOfAuthority(authority) == packageName
+        val isSharedFileOfFileProvider =
+            authority == packageName &&
+                sharedAttachmentProviderFile(cacheDir, filesDir, contentUri.pathSegments) != null
+        return !isOwnProvider || isSharedFileOfFileProvider
+    }
+
+    /**
+     * Resolves an untrusted file name inside [baseDirectory] and rejects traversal attempts.
+     */
+    fun resolveFileInDirectory(baseDirectory: File, untrustedFileName: String?): File? {
+        val fileName = untrustedFileName?.trim().orEmpty()
+        val isSimpleFileName = fileName.isNotEmpty() &&
+            fileName != "." &&
+            fileName != ".." &&
+            !fileName.contains('/') &&
+            !fileName.contains('\\') &&
+            File(fileName).name == fileName
+
+        val resolvedFile = if (isSimpleFileName) {
+            val canonicalBase = baseDirectory.canonicalFile
+            val candidate = File(canonicalBase, fileName).canonicalFile
+            if (candidate.path.startsWith(canonicalBase.path + File.separator)) {
+                candidate
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+        return resolvedFile
+    }
 
     /**
      * Creates a new [File]
@@ -34,7 +154,11 @@ object FileUtils {
     @Suppress("ThrowsCount")
     @JvmStatic
     fun getTempCacheFile(context: Context, fileName: String): File {
-        val cacheFile = File(context.applicationContext.filesDir.absolutePath + "/" + fileName)
+        val cacheRoot = context.applicationContext.cacheDir.canonicalFile
+        val cacheFile = File(cacheRoot, fileName).canonicalFile
+        if (!cacheFile.path.startsWith(cacheRoot.path + File.separator)) {
+            throw IOException("Temporary file must stay inside cache directory.")
+        }
         Log.v(TAG, "Full path for new cache file:" + cacheFile.absolutePath)
         val tempDir = cacheFile.parentFile ?: throw FileNotFoundException("could not cacheFile.getParentFile()")
         if (!tempDir.exists()) {
@@ -61,7 +185,11 @@ object FileUtils {
      * Creates a new [File]
      */
     fun removeTempCacheFile(context: Context, fileName: String) {
-        val cacheFile = File(context.applicationContext.filesDir.absolutePath + "/" + fileName)
+        val cacheRoot = context.applicationContext.cacheDir.canonicalFile
+        val cacheFile = File(cacheRoot, fileName).canonicalFile
+        if (!cacheFile.path.startsWith(cacheRoot.path + File.separator)) {
+            throw IOException("Temporary file must stay inside cache directory.")
+        }
         Log.v(TAG, "Full path for new cache file:" + cacheFile.absolutePath)
         if (cacheFile.exists()) {
             if (cacheFile.delete()) {
@@ -81,12 +209,21 @@ object FileUtils {
             Log.d(TAG, "relative uri: " + sourceFileUri.path)
             throw IllegalArgumentException("relative paths are not supported")
         } else if (ContentResolver.SCHEME_CONTENT == scheme) {
-            copyFileToCache(context, sourceFileUri, fileName)
+            // a shared file the app already copied is used as it is, instead of copying it again
+            val ownSharedFile = sourceFileUri.takeIf { it.authorityOfOwnUser == context.packageName }
+                ?.let { sharedAttachmentProviderFile(context.cacheDir, context.filesDir, it.pathSegments) }
+                ?.takeIf { it.isFile }
+            ownSharedFile ?: copyFileToCache(context, sourceFileUri, fileName)
         } else if (ContentResolver.SCHEME_FILE == scheme) {
-            if (sourceFileUri.path != null) {
-                sourceFileUri.path?.let { File(it) }
+            val path = sourceFileUri.path
+                ?: throw IllegalArgumentException("uri does not contain path")
+            val cacheRoot = context.applicationContext.cacheDir.canonicalFile
+            val candidate = File(path).canonicalFile
+            if (candidate.path.startsWith(cacheRoot.path + File.separator)) {
+                candidate
             } else {
-                throw IllegalArgumentException("uri does not contain path")
+                Log.w(TAG, "Rejecting file:// uri outside of the app cache directory.")
+                null
             }
         } else {
             throw IllegalArgumentException("unsupported scheme: " + sourceFileUri.path)
@@ -98,7 +235,7 @@ object FileUtils {
     fun copyFileToCache(context: Context, sourceFileUri: Uri, filename: String): File? {
         val cachedFile = File(context.cacheDir, filename)
 
-        if (!cachedFile.canonicalPath.startsWith(context.cacheDir.canonicalPath, true)) {
+        if (!cachedFile.toPath().normalize().startsWith(context.cacheDir.toPath())) {
             Log.w(TAG, "cachedFile was not created in cacheDir. Aborting for security reasons.")
             cachedFile.delete()
             return null
@@ -118,6 +255,11 @@ object FileUtils {
                 outputStream.flush()
             } catch (e: FileNotFoundException) {
                 Log.w(TAG, "failed to copy file to cache", e)
+            } catch (e: SecurityException) {
+                // Most notably the system Photo Picker's ephemeral uris, whose read grant can be
+                // revoked at any point after it was first handed to us, well before we're done
+                // using it - this must never crash the caller, just leave the file uncopied.
+                Log.w(TAG, "no longer permitted to read $sourceFileUri", e)
             }
         }
         return cachedFile
@@ -126,16 +268,9 @@ object FileUtils {
     fun getFileName(uri: Uri, context: Context?): String {
         var filename: String? = null
         if (uri.scheme == "content" && context != null) {
-            val cursor: Cursor? = context.contentResolver.query(uri, null, null, null, null)
-            try {
-                if (cursor != null && cursor.moveToFirst()) {
-                    filename = cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
-                }
-            } finally {
-                cursor?.close()
-            }
+            filename = queryDisplayName(context, uri)
         }
-        // if it was no content uri, read filename from path
+        // if it was no content uri (or the query above couldn't read one), read filename from path
         if (filename == null) {
             filename = uri.path
         }
@@ -147,6 +282,43 @@ object FileUtils {
 
         return filename
     }
+
+    // The content provider behind a uri (most notably the system Photo Picker's ephemeral uris)
+    // can revoke read access at any point after it was first granted, turning a plain metadata
+    // query into a SecurityException well after the uri was handed to us - this must never crash
+    // the caller, just fall back to deriving the filename from the uri's own path instead.
+    @Suppress("TooGenericExceptionCaught")
+    private fun queryDisplayName(context: Context, uri: Uri): String? =
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val displayNameColumnIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (cursor.moveToFirst() && displayNameColumnIndex != -1) {
+                    cursor.getString(displayNameColumnIndex)
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "failed to query display name for $uri", e)
+            null
+        }
+
+    /**
+     * Resolves the MIME type of [uri]. [ContentResolver.getType] only resolves `content://` URIs, so for
+     * `file://` URIs (e.g. the in-app camera writes plain files) this falls back to guessing from the
+     * file extension. Also falls back there if the provider's read grant for [uri] was revoked in the
+     * meantime (most notably the system Photo Picker's ephemeral uris) - never lets that crash the caller.
+     */
+    @Suppress("TooGenericExceptionCaught")
+    fun resolveMimeType(context: Context, uri: Uri): String? =
+        try {
+            context.contentResolver.getType(uri)
+        } catch (e: Exception) {
+            Log.w(TAG, "failed to resolve mime type for $uri", e)
+            null
+        } ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(
+            MimeTypeMap.getFileExtensionFromUrl(uri.toString()).lowercase()
+        )
 
     @JvmStatic
     fun md5Sum(file: File): String {
@@ -161,3 +333,22 @@ object FileUtils {
         return md5String.toString()
     }
 }
+
+// the authority without a user id prefix ("10@authority"), which names the user whose provider serves the uri
+internal val Uri.authorityWithoutUser: String?
+    get() = authority?.substringAfterLast('@')
+
+/**
+ * The authority of a provider of the own user, without a prefix that names the own user ("0@authority"). Null for a
+ * provider of another user, e.g. of the app in another profile, whose files aren't the ones of the app here.
+ */
+internal val Uri.authorityOfOwnUser: String?
+    get() {
+        val authority = authority ?: return null
+        val userId = authority.substringBeforeLast('@', missingDelimiterValue = "")
+        val isOwnUser = userId.isEmpty() || userId == (Process.myUid() / PER_USER_UID_RANGE).toString()
+        return if (isOwnUser) authority.substringAfterLast('@') else null
+    }
+
+// the range of uids of each user, see android.os.UserHandle.PER_USER_RANGE
+private const val PER_USER_UID_RANGE = 100_000

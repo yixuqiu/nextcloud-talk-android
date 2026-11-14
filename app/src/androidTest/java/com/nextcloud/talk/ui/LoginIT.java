@@ -11,7 +11,8 @@ package com.nextcloud.talk.ui;
 import android.os.Bundle;
 
 import com.nextcloud.talk.R;
-import com.nextcloud.talk.activities.MainActivity;
+import com.nextcloud.talk.conversationlist.ConversationsListActivity;
+import com.nextcloud.talk.utils.AppTasks;
 
 import org.junit.Ignore;
 import org.junit.Test;
@@ -19,6 +20,7 @@ import org.junit.Test;
 import java.util.Objects;
 
 import androidx.test.core.app.ActivityScenario;
+import androidx.test.core.app.ApplicationProvider;
 import androidx.test.espresso.NoMatchingViewException;
 import androidx.test.espresso.web.webdriver.DriverAtoms;
 import androidx.test.espresso.web.webdriver.Locator;
@@ -44,7 +46,9 @@ public class LoginIT {
     @Test
     public void login() throws InterruptedException {
 
-        ActivityScenario<MainActivity> activityScenario = ActivityScenario.launch(MainActivity.class);
+        // started like by the launcher, without an account
+        ActivityScenario<ConversationsListActivity> activityScenario = ActivityScenario.launch(
+            AppTasks.INSTANCE.createLauncherIntent(ApplicationProvider.getApplicationContext()));
 
         Bundle arguments = androidx.test.platform.app.InstrumentationRegistry.getArguments();
 
@@ -67,8 +71,7 @@ public class LoginIT {
 
             try {
                 // Delete account if exists
-                onView(withId(R.id.switch_account_button)).perform(click());
-                onView(withId(R.id.manage_settings)).perform(click());
+                onView(withContentDescription(R.string.nc_settings)).perform(click());
                 onView(withId(R.id.settings_remove_account)).perform(click());
                 onView(withText(R.string.nc_settings_remove)).perform(click());
                 // The remove button must be clicked two times
@@ -121,12 +124,12 @@ public class LoginIT {
 
         Thread.sleep(5 * 1000);
 
-        onView(withId(R.id.switch_account_button)).perform(click());
+        onView(withContentDescription(R.string.nc_settings)).perform(click());
         onView(withId(R.id.user_name)).check(matches(withText("User One")));
 
         activityScenario.onActivity(activity -> {
             assertEquals(loginName,
-                         Objects.requireNonNull(activity.userManager.getCurrentUser().blockingGet()).getUserId());
+                         Objects.requireNonNull(activity.defaultAccountProvider.getDefaultUserBlocking()).getUserId());
         });
     }
 }

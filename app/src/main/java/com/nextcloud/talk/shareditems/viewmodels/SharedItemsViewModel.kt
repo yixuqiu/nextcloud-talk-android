@@ -21,10 +21,7 @@ import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
 import javax.inject.Inject
 
-class SharedItemsViewModel @Inject constructor(
-    private val repository: SharedItemsRepository
-) :
-    ViewModel() {
+class SharedItemsViewModel @Inject constructor(private val repository: SharedItemsRepository) : ViewModel() {
 
     private lateinit var repositoryParameters: SharedItemsRepository.Parameters
 
@@ -44,7 +41,8 @@ class SharedItemsViewModel @Inject constructor(
 
     fun initialize(user: User, roomToken: String) {
         repositoryParameters = SharedItemsRepository.Parameters(
-            user.userId!!,
+            // The login name, as it authenticates the requests. The user id can differ from it.
+            user.username!!,
             user.token!!,
             user.baseUrl!!,
             roomToken

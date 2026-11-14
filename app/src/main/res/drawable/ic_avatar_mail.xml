@@ -1,17 +1,15 @@
 <!--
   ~ Nextcloud Talk - Android Client
   ~
-  ~ SPDX-FileCopyrightText: 2022-2024 Nextcloud GmbH and Nextcloud contributors
-  ~ SPDX-License-Identifier: GPL-3.0-or-later
+  ~ SPDX-FileCopyrightText: 2018-2025 Google LLC
+  ~ SPDX-License-Identifier: Apache-2.0
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
-    android:autoMirrored="true"
-    android:viewportWidth="24"
-    android:viewportHeight="24">
+    android:viewportWidth="960"
+    android:viewportHeight="960">
     <path
-        android:fillColor="#ffffff"
-        android:fillType="nonZero"
-        android:pathData="M6.6675,8.25C6.2985,8.25 6,8.55 6,8.9175L6,15.0825C6,15.4522 6.3,15.75 6.6675,15.75L17.3325,15.75C17.7015,15.75 18,15.45 18,15.0825L18,8.9175C18,8.5485 17.7,8.25 17.3325,8.25L6.6675,8.25ZM7.23,9.021L11.7922,13.5825L12.1875,13.5825L16.7708,9.021L17.229,9.4792L14.4998,12.249L16.5623,14.3527L16.104,14.811L14.0002,12.7072L12.48,14.2485L11.5215,14.2485L10.0013,12.7072L7.8975,14.8312L7.4385,14.352L9.522,12.2483L6.7725,9.4785L7.23,9.021Z" />
+        android:fillColor="@android:color/white"
+        android:pathData="M160,800Q127,800 103.5,776.5Q80,753 80,720L80,240Q80,207 103.5,183.5Q127,160 160,160L800,160Q833,160 856.5,183.5Q880,207 880,240L880,720Q880,753 856.5,776.5Q833,800 800,800L160,800ZM480,520L160,320L160,720Q160,720 160,720Q160,720 160,720L800,720Q800,720 800,720Q800,720 800,720L800,320L480,520ZM480,440L800,240L160,240L480,440ZM160,320L160,240L160,240L160,320L160,720Q160,720 160,720Q160,720 160,720L160,720Q160,720 160,720Q160,720 160,720L160,320Z" />
 </vector>

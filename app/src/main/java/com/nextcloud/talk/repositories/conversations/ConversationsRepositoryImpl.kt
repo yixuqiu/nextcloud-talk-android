@@ -7,91 +7,176 @@
  */
 package com.nextcloud.talk.repositories.conversations
 
-import com.bluelinelabs.logansquare.LoganSquare
 import com.nextcloud.talk.api.NcApi
+import com.nextcloud.talk.api.NcApiCoroutines
+import com.nextcloud.talk.conversationinfo.CreateRoomRequestDto
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.models.json.conversations.password.PasswordOverall
-import com.nextcloud.talk.repositories.conversations.ConversationsRepository.AllowGuestsResult
-import com.nextcloud.talk.repositories.conversations.ConversationsRepository.PasswordResult
+import com.nextcloud.talk.models.json.conversations.RoomOverall
+import com.nextcloud.talk.models.json.generic.GenericOverall
+import com.nextcloud.talk.models.json.participants.TalkBanDto
+import com.nextcloud.talk.models.json.profile.ProfileDto
 import com.nextcloud.talk.repositories.conversations.ConversationsRepository.ResendInvitationsResult
 import com.nextcloud.talk.utils.ApiUtils
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.utils.CapabilitiesUtil
+import com.nextcloud.talk.utils.SpreedFeatures
 import io.reactivex.Observable
 
-class ConversationsRepositoryImpl(private val api: NcApi, private val userProvider: CurrentUserProviderNew) :
+class ConversationsRepositoryImpl(private val api: NcApi, private val coroutineApi: NcApiCoroutines) :
     ConversationsRepository {
-
-    private val user: User
-        get() = userProvider.currentUser.blockingGet()
-
-    private val credentials: String
-        get() = ApiUtils.getCredentials(user.username, user.token)!!
-
-    override fun allowGuests(token: String, allow: Boolean): Observable<AllowGuestsResult> {
-        val url = ApiUtils.getUrlForRoomPublic(
-            apiVersion(),
-            user.baseUrl!!,
-            token
-        )
-
-        val apiObservable = if (allow) {
-            api.makeRoomPublic(
+    override suspend fun allowGuests(
+        user: User,
+        url: String,
+        token: String,
+        allow: Boolean,
+        password: String
+    ): GenericOverall {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)!!
+        val sendsPassword = password.isNotEmpty() &&
+            CapabilitiesUtil.hasSpreedFeatureCapability(
+                user.capabilities?.spreedCapability,
+                SpreedFeatures.CONVERSATION_CREATION_PASSWORD
+            )
+        val result: GenericOverall = when {
+            allow && sendsPassword -> coroutineApi.makeRoomPublicWithPassword(
+                credentials,
+                url,
+                password
+            )
+            allow -> coroutineApi.makeRoomPublic(
                 credentials,
                 url
             )
-        } else {
-            api.makeRoomPrivate(
+            else -> coroutineApi.makeRoomPrivate(
                 credentials,
                 url
             )
         }
-
-        return apiObservable.map { AllowGuestsResult(it.ocs!!.meta!!.statusCode == STATUS_CODE_OK && allow) }
+        return result
     }
 
-    override fun password(password: String, token: String): Observable<PasswordResult> {
-        val apiObservable = api.setPassword2(
-            credentials,
-            ApiUtils.getUrlForRoomPassword(
-                apiVersion(),
-                user.baseUrl!!,
-                token
-            ),
-            password
-        )
-        return apiObservable.map {
-            val passwordPolicyMessage = if (it.code() == STATUS_CODE_BAD_REQUEST) {
-                LoganSquare.parse(it.errorBody()!!.string(), PasswordOverall::class.java).ocs!!.data!!
-                    .message!!
-            } else {
-                ""
-            }
-
-            PasswordResult(it.isSuccessful, passwordPolicyMessage.isNotEmpty(), passwordPolicyMessage)
-        }
-    }
-
-    override fun resendInvitations(token: String): Observable<ResendInvitationsResult> {
+    override fun resendInvitations(user: User, url: String): Observable<ResendInvitationsResult> {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)!!
         val apiObservable = api.resendParticipantInvitations(
             credentials,
-            ApiUtils.getUrlForParticipantsResendInvitations(
-                apiVersion(),
-                user.baseUrl!!,
-                token
-            )
+            url
         )
-
         return apiObservable.map {
             ResendInvitationsResult(true)
         }
     }
 
-    private fun apiVersion(): Int {
-        return ApiUtils.getConversationApiVersion(user, intArrayOf(ApiUtils.API_V4))
+    override suspend fun archiveConversation(credentials: String, url: String): GenericOverall =
+        coroutineApi.archiveConversation(credentials, url)
+
+    override suspend fun unarchiveConversation(credentials: String, url: String): GenericOverall =
+        coroutineApi.unarchiveConversation(credentials, url)
+
+    override suspend fun setConversationReadOnly(user: User, url: String, state: Int): GenericOverall {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)!!
+        val result = coroutineApi.setConversationReadOnly(
+            credentials,
+            url,
+            state
+        )
+        return result
     }
+
+    override suspend fun setPassword(user: User, url: String, password: String): GenericOverall {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)!!
+        val result = coroutineApi.setPassword(
+            credentials,
+            url,
+            password
+        )
+        return result
+    }
+
+    override suspend fun clearChatHistory(user: User, url: String): GenericOverall {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)!!
+        val result = coroutineApi.clearChatHistory(
+            credentials,
+            url
+        )
+        return result
+    }
+
+    override suspend fun createRoom(credentials: String, url: String, body: CreateRoomRequestDto): RoomOverall {
+        val response = coroutineApi.createRoomWithBody(
+            credentials,
+            url,
+            body
+        )
+        return response
+    }
+
+    override suspend fun getProfile(credentials: String, url: String): ProfileDto? =
+        coroutineApi.getProfile(credentials, url).ocs?.data
+
+    override suspend fun markConversationAsSensitive(
+        credentials: String,
+        baseUrl: String,
+        roomToken: String
+    ): GenericOverall {
+        val url = ApiUtils.getUrlForSensitiveConversation(baseUrl, roomToken)
+        return coroutineApi.markConversationAsSensitive(credentials, url)
+    }
+
+    override suspend fun markConversationAsInsensitive(
+        credentials: String,
+        baseUrl: String,
+        roomToken: String
+    ): GenericOverall {
+        val url = ApiUtils.getUrlForSensitiveConversation(baseUrl, roomToken)
+        return coroutineApi.markConversationAsInsensitive(credentials, url)
+    }
+
+    override suspend fun markConversationAsImportant(
+        credentials: String,
+        baseUrl: String,
+        roomToken: String
+    ): GenericOverall {
+        val url = ApiUtils.getUrlForImportantConversation(baseUrl, roomToken)
+        return coroutineApi.markConversationAsImportant(credentials, url)
+    }
+
+    override suspend fun markConversationAsUnImportant(
+        credentials: String,
+        baseUrl: String,
+        roomToken: String
+    ): GenericOverall {
+        val url = ApiUtils.getUrlForImportantConversation(baseUrl, roomToken)
+        return coroutineApi.markConversationAsUnimportant(credentials, url)
+    }
+
+    override suspend fun banActor(
+        credentials: String,
+        url: String,
+        actorType: String,
+        actorId: String,
+        internalNote: String
+    ): TalkBanDto = coroutineApi.banActor(credentials, url, actorType, actorId, internalNote)
+
+    override suspend fun listBans(credentials: String, url: String): List<TalkBanDto> {
+        val talkBanOverall = coroutineApi.listBans(credentials, url)
+        return talkBanOverall.ocs?.data!!
+    }
+
+    override suspend fun unbanActor(credentials: String, url: String): GenericOverall =
+        coroutineApi.unbanActor(credentials, url)
+
+    override suspend fun markConversationAsRead(credentials: String, url: String, messageId: Int?): GenericOverall =
+        coroutineApi.setChatReadMarker(credentials, url, messageId)
+
+    override suspend fun markConversationAsUnread(credentials: String, url: String): GenericOverall =
+        coroutineApi.markRoomAsUnread(credentials, url)
+
+    override suspend fun addConversationToFavorites(credentials: String, url: String): GenericOverall =
+        coroutineApi.addConversationToFavorites(credentials, url)
+
+    override suspend fun removeConversationFromFavorites(credentials: String, url: String): GenericOverall =
+        coroutineApi.removeConversationFromFavorites(credentials, url)
 
     companion object {
         const val STATUS_CODE_OK = 200
-        const val STATUS_CODE_BAD_REQUEST = 400
     }
 }

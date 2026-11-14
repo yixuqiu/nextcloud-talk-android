@@ -1,24 +1,24 @@
 /*
  * Nextcloud Talk - Android Client
  *
- * SPDX-FileCopyrightText: 2022 Andy Scherzinger <info@andy-scherzinger.de>
- * SPDX-FileCopyrightText: 2022 Marcel Hibbe <dev@mhibbe.de>
- * SPDX-FileCopyrightText: 2022 Tim Krüger <t@timkrueger.me>
- * SPDX-FileCopyrightText: 2017 Mario Danic <mario@lovelyhq.com>
+ * SPDX-FileCopyrightText: 2017-2026 Nextcloud GmbH and Nextcloud contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 package com.nextcloud.talk.application
 
-import android.content.Context
+import android.app.Activity
+import android.app.Application
+import android.content.pm.PackageManager
 import android.os.Build.VERSION.SDK_INT
 import android.os.Build.VERSION_CODES.P
 import android.util.Log
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.emoji2.bundled.BundledEmojiCompatConfig
 import androidx.emoji2.text.EmojiCompat
+import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleObserver
-import androidx.multidex.MultiDex
-import androidx.multidex.MultiDexApplication
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.OneTimeWorkRequest
 import androidx.work.PeriodicWorkRequest
@@ -33,34 +33,50 @@ import coil.decode.SvgDecoder
 import coil.memory.MemoryCache
 import coil.util.DebugLogger
 import com.nextcloud.talk.BuildConfig
-import com.nextcloud.talk.components.filebrowser.webdav.DavUtils
+import com.nextcloud.talk.account.AccountVerificationActivity
+import com.nextcloud.talk.diagnosis.buildDiagnosisElements
+import com.nextcloud.talk.diagnosis.toMarkdown
+import com.nextcloud.talk.errorhandling.ExceptionHandler
+import com.nextcloud.talk.logger.LoggerImpl
+import com.nextcloud.talk.account.BrowserLoginActivity
+import com.nextcloud.talk.dagger.modules.ApplicationScope
 import com.nextcloud.talk.dagger.modules.BusModule
 import com.nextcloud.talk.dagger.modules.ContextModule
+import com.nextcloud.talk.dagger.modules.DaosModule
 import com.nextcloud.talk.dagger.modules.DatabaseModule
+import com.nextcloud.talk.dagger.modules.ManagerModule
 import com.nextcloud.talk.dagger.modules.RepositoryModule
 import com.nextcloud.talk.dagger.modules.RestModule
 import com.nextcloud.talk.dagger.modules.UtilsModule
 import com.nextcloud.talk.dagger.modules.ViewModelModule
+import com.nextcloud.talk.filebrowser.webdav.DavUtils
 import com.nextcloud.talk.jobs.AccountRemovalWorker
-import com.nextcloud.talk.jobs.CapabilitiesWorker
+import com.nextcloud.talk.jobs.ConversationsSyncWorker
+import com.nextcloud.talk.jobs.CapabilitiesSyncWorker
 import com.nextcloud.talk.jobs.SignalingSettingsWorker
 import com.nextcloud.talk.jobs.WebsocketConnectionsWorker
 import com.nextcloud.talk.ui.theme.ThemeModule
+import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.ClosedInterfaceImpl
 import com.nextcloud.talk.utils.DeviceUtils
+import com.nextcloud.talk.utils.LiveActivities
 import com.nextcloud.talk.utils.NotificationUtils
+import com.nextcloud.talk.utils.SharedFileCopies
+import com.nextcloud.talk.utils.UploadSourceGrants
 import com.nextcloud.talk.utils.database.arbitrarystorage.ArbitraryStorageModule
 import com.nextcloud.talk.utils.database.user.UserModule
 import com.nextcloud.talk.utils.preferences.AppPreferences
-import com.vanniktech.emoji.EmojiManager
-import com.vanniktech.emoji.google.GoogleEmojiProvider
 import de.cotech.hw.SecurityKeyManager
 import de.cotech.hw.SecurityKeyManagerConfig
-import net.sqlcipher.database.SQLiteDatabase
-import net.sqlcipher.database.SQLiteDatabaseHook
+import io.reactivex.exceptions.UndeliverableException
+import io.reactivex.plugins.RxJavaPlugins
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import org.conscrypt.Conscrypt
 import org.webrtc.PeerConnectionFactory
+import java.io.IOException
+import java.net.SocketException
 import java.security.Security
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -77,12 +93,16 @@ import javax.inject.Singleton
         ViewModelModule::class,
         RepositoryModule::class,
         UtilsModule::class,
-        ThemeModule::class
+        ThemeModule::class,
+        ManagerModule::class,
+        DaosModule::class
     ]
 )
 @Singleton
 @AutoInjector(NextcloudTalkApplication::class)
-class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
+class NextcloudTalkApplication :
+    Application(),
+    LifecycleObserver {
     //region Fields (components)
     lateinit var componentApplication: NextcloudTalkApplicationComponent
         private set
@@ -95,21 +115,48 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
 
     @Inject
     lateinit var okHttpClient: OkHttpClient
+
+    @Inject
+    lateinit var userManager: UserManager
+
+    @Inject
+    @field:ApplicationScope
+    lateinit var appScope: CoroutineScope
+
+    // the activities of the app, e.g. to finish only those in a task of another app, see LockedActivity
+    val liveActivities = LiveActivities().also { registerActivityLifecycleCallbacks(it) }
+
+    @Inject
+    lateinit var logger: LoggerImpl
     //endregion
 
-    val hook: SQLiteDatabaseHook = object : SQLiteDatabaseHook {
-        override fun preKey(database: SQLiteDatabase) {
-            // unused atm
-        }
-
-        override fun postKey(database: SQLiteDatabase) {
-            Log.i("TalkApplication", "DB cipher_migrate START")
-            database.rawExecSQL("PRAGMA cipher_migrate;")
-            Log.i("TalkApplication", "DB cipher_migrate END")
+    //region private methods
+    private fun installExceptionHandler() {
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Log.d(TAG, "installExceptionHandler: defaultHandler=$defaultHandler")
+        if (defaultHandler != null) {
+            Thread.setDefaultUncaughtExceptionHandler(
+                ExceptionHandler(
+                    context = this,
+                    defaultExceptionHandler = defaultHandler,
+                    diagnosisSupplier = {
+                        buildDiagnosisElements(
+                            context = this,
+                            userManager = userManager,
+                            appPreferences = appPreferences,
+                            logsRepository = logger
+                        ).toMarkdown()
+                    },
+                    logCrash = { msg, t -> logger.e(TAG, msg, t) },
+                    logFlusher = logger::flush
+                )
+            )
+            Log.d(TAG, "ExceptionHandler installed successfully")
+        } else {
+            Log.w(TAG, "No default UncaughtExceptionHandler found — ExceptionHandler NOT installed")
         }
     }
 
-    //region private methods
     private fun initializeWebRtc() {
         try {
             PeerConnectionFactory.initialize(
@@ -128,23 +175,65 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
         Log.d(TAG, "onCreate")
         sharedApplication = this
 
-        val securityKeyManager = SecurityKeyManager.getInstance()
-        val securityKeyConfig = SecurityKeyManagerConfig.Builder()
-            .setEnableDebugLogging(BuildConfig.DEBUG)
-            .build()
-        securityKeyManager.init(this, securityKeyConfig)
+        // The crash-reporter process only needs to show ShowErrorActivity — skip all heavy
+        // initialization (WebRTC, Room, Dagger) so the error screen can actually render.
+        val currentProcessName = if (SDK_INT >= P) getProcessName() else null
+        Log.d(TAG, "onCreate: processName=$currentProcessName")
+        if (SDK_INT >= P && currentProcessName?.endsWith(":crash") == true) {
+            Log.d(TAG, "Crash process detected — skipping full Application init")
+            return
+        }
 
+        RxJavaPlugins.setErrorHandler { e ->
+            var throwable: Throwable = if (e is UndeliverableException) e.cause ?: e else e
+            if (throwable is IOException || throwable is SocketException) {
+                Log.w(TAG, "Undeliverable network exception ignored", throwable)
+                return@setErrorHandler
+            }
+            Thread.currentThread().uncaughtExceptionHandler
+                ?.uncaughtException(Thread.currentThread(), throwable)
+        }
+
+        val securityKeyManager = SecurityKeyManager.getInstance()
+        val securityKeyConfigBuilder = SecurityKeyManagerConfig.Builder()
+            .setEnableDebugLogging(BuildConfig.DEBUG)
+
+        try {
+            val packageManager = packageManager
+            val activities = packageManager.getPackageInfo(packageName, PackageManager.GET_ACTIVITIES).activities
+            activities?.forEach { activityInfo ->
+                try {
+                    // an activity-alias is listed by its own name, which is not a class
+                    val activityClass = Class.forName(activityInfo.targetActivity ?: activityInfo.name)
+                    if (activityClass != AccountVerificationActivity::class.java &&
+                        activityClass != BrowserLoginActivity::class.java
+                    ) {
+                        @Suppress("UNCHECKED_CAST")
+                        securityKeyConfigBuilder.addExcludedActivityClass(activityClass as Class<out Activity>)
+                    }
+                } catch (exception: ClassNotFoundException) {
+                    Log.e(TAG, "Couldn't disable activity for security key listener", exception)
+                }
+            }
+        } catch (exception: PackageManager.NameNotFoundException) {
+            Log.e(TAG, "Couldn't disable activities for security key listener", exception)
+        }
+
+        securityKeyManager.init(this, securityKeyConfigBuilder.build())
         initializeWebRtc()
         buildComponent()
         DavUtils.registerCustomFactories()
 
+        Security.insertProviderAt(Conscrypt.newProvider(), 1)
+
         componentApplication.inject(this)
+        installExceptionHandler()
+
+        observeAppInBackground()
 
         Coil.setImageLoader(buildDefaultImageLoader())
         setAppTheme(appPreferences.theme)
         super.onCreate()
-
-        Security.insertProviderAt(Conscrypt.newProvider(), 1)
 
         ClosedInterfaceImpl().providerInstallerInstallIfNeededAsync()
         DeviceUtils.ignoreSpecialBatteryFeatures()
@@ -155,14 +244,18 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
         config.setReplaceAll(true)
         val emojiCompat = EmojiCompat.init(config)
 
-        EmojiManager.install(GoogleEmojiProvider())
-
         NotificationUtils.registerNotificationChannels(applicationContext, appPreferences)
     }
 
     private fun initWorkers() {
+        appScope.launch { userManager.repairMultipleActiveUsers() }
+        // the copies of shares that are done, also when no new share starts
+        appScope.launch { SharedFileCopies.removeDoneShares(this@NextcloudTalkApplication) }
+        // the read access to picked files whose uploads are done, also one that was cancelled before it started
+        appScope.launch { UploadSourceGrants.releaseUnused(this@NextcloudTalkApplication) }
+
         val accountRemovalWork = OneTimeWorkRequest.Builder(AccountRemovalWorker::class.java).build()
-        val capabilitiesUpdateWork = OneTimeWorkRequest.Builder(CapabilitiesWorker::class.java).build()
+        val capabilitiesUpdateWork = OneTimeWorkRequest.Builder(CapabilitiesSyncWorker::class.java).build()
         val signalingSettingsWork = OneTimeWorkRequest.Builder(SignalingSettingsWorker::class.java).build()
         val websocketConnectionsWorker = OneTimeWorkRequest.Builder(WebsocketConnectionsWorker::class.java).build()
 
@@ -174,7 +267,7 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
             .enqueue()
 
         val periodicCapabilitiesUpdateWork = PeriodicWorkRequest.Builder(
-            CapabilitiesWorker::class.java,
+            CapabilitiesSyncWorker::class.java,
             HALF_DAY,
             TimeUnit.HOURS
         ).build()
@@ -183,6 +276,8 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
             ExistingPeriodicWorkPolicy.REPLACE,
             periodicCapabilitiesUpdateWork
         )
+
+        ConversationsSyncWorker.schedule(applicationContext)
     }
 
     override fun onTerminate() {
@@ -200,11 +295,6 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
             .restModule(RestModule(applicationContext))
             .arbitraryStorageModule(ArbitraryStorageModule())
             .build()
-    }
-
-    override fun attachBaseContext(base: Context) {
-        super.attachBaseContext(base)
-        MultiDex.install(this)
     }
 
     private fun buildDefaultImageLoader(): ImageLoader {
@@ -232,6 +322,22 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
         return imageLoaderBuilder.build()
     }
 
+    /** Checks the app lock when the app is used again after it went to the background. */
+    private fun observeAppInBackground() {
+        ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                // While locked, the time of the last use stays, so the app is still locked after its process was
+                // killed, which resets isLocked.
+                if (!isLocked) {
+                    val ts = System.currentTimeMillis()
+                    Log.d(TAG, "ProcessLifecycle onStop: saving lockTimestamp=$ts")
+                    appPreferences.setLockTimestamp(ts)
+                }
+                pendingLockCheck = true
+            }
+        })
+    }
+
     companion object {
         private val TAG = NextcloudTalkApplication::class.java.simpleName
         const val FIFTY_PERCENT = 0.5
@@ -242,6 +348,18 @@ class NextcloudTalkApplication : MultiDexApplication(), LifecycleObserver {
 
         var sharedApplication: NextcloudTalkApplication? = null
             protected set
+
+        @Volatile
+        var pendingLockCheck = true
+
+        /**
+         * Whether the app lock is showing or due: set when the lock screen is started, and cleared only by
+         * authenticating in it (or when the app lock can't be used anymore). While it is set, every screen that is
+         * resumed shows the lock screen, even after the lock screen was closed without authenticating, e.g. by a
+         * deep link or a notification that clears the task.
+         */
+        @Volatile
+        var isLocked = false
         //endregion
 
         //region Setters

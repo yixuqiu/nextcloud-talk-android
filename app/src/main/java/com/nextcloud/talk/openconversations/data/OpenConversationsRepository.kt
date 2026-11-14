@@ -6,9 +6,13 @@
  */
 package com.nextcloud.talk.openconversations.data
 
-import io.reactivex.Observable
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.conversations.ConversationDto
+import kotlinx.coroutines.flow.Flow
 
 interface OpenConversationsRepository {
 
-    fun fetchConversations(): Observable<OpenConversationsModel>
+    suspend fun fetchConversations(user: User, url: String, searchTerm: String): Result<List<ConversationDto>>
+
+    fun fetchOpenConversationsFlow(user: User, searchTerm: String): Flow<List<ConversationDto>>
 }

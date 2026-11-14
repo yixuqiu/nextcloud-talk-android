@@ -6,7 +6,7 @@
  */
 package com.nextcloud.talk.signaling;
 
-import com.nextcloud.talk.models.json.participants.Participant;
+import com.nextcloud.talk.models.json.participants.ParticipantDto;
 
 import org.junit.Assert;
 import org.junit.Before;
@@ -58,10 +58,12 @@ public class SignalingMessageReceiverParticipantListTest {
         user1.put("roomId", 108);
         user1.put("sessionId", "theSessionId1");
         user1.put("userId", "theUserId");
-        // If "participantPermissions" is set in any of the participants all the other participants in the message
-        // would have it too. But for test simplicity, and as it is not relevant for the processing, in this test it
-        // is included only in one of the participants.
+        // If any of the following properties is set in any of the participants all the other participants in the
+        // message would have it too. But for test simplicity, and as it is not relevant for the processing, in this
+        // test they are included only in one of the participants.
         user1.put("participantPermissions", 42);
+        user1.put("actorType", "federated_users");
+        user1.put("actorId", "theActorId");
         users.add(user1);
         Map<String, Object> user2 = new HashMap<>();
         user2.put("inCall", 0);
@@ -72,16 +74,19 @@ public class SignalingMessageReceiverParticipantListTest {
         users.add(user2);
         signalingMessageReceiver.processUsersInRoom(users);
 
-        List<Participant> expectedParticipantList = new ArrayList<>();
-        Participant expectedParticipant1 = new Participant();
-        expectedParticipant1.setInCall(Participant.InCallFlags.IN_CALL | Participant.InCallFlags.WITH_AUDIO | Participant.InCallFlags.WITH_VIDEO);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>();
+        ParticipantDto expectedParticipant1 = new ParticipantDto();
+        expectedParticipant1.setInCall(ParticipantDto.InCallFlags.IN_CALL | ParticipantDto.InCallFlags.WITH_AUDIO | ParticipantDto.InCallFlags.WITH_VIDEO);
         expectedParticipant1.setLastPing(4815);
         expectedParticipant1.setSessionId("theSessionId1");
         expectedParticipant1.setUserId("theUserId");
+        expectedParticipant1.setActorType(ParticipantDto.ActorType.FEDERATED);
+        expectedParticipant1.setActorId("theActorId");
+        expectedParticipant1.setParticipantPermissions(42);
         expectedParticipantList.add(expectedParticipant1);
 
-        Participant expectedParticipant2 = new Participant();
-        expectedParticipant2.setInCall(Participant.InCallFlags.DISCONNECTED);
+        ParticipantDto expectedParticipant2 = new ParticipantDto();
+        expectedParticipant2.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant2.setLastPing(162342);
         expectedParticipant2.setSessionId("theSessionId2");
         expectedParticipantList.add(expectedParticipant2);
@@ -134,9 +139,9 @@ public class SignalingMessageReceiverParticipantListTest {
         users.add(user);
         signalingMessageReceiver.processUsersInRoom(users);
 
-        List<Participant> expectedParticipantList = new ArrayList<>();
-        Participant expectedParticipant = new Participant();
-        expectedParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>();
+        ParticipantDto expectedParticipant = new ParticipantDto();
+        expectedParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant.setLastPing(4815);
         expectedParticipant.setSessionId("theSessionId");
         expectedParticipantList.add(expectedParticipant);
@@ -164,9 +169,9 @@ public class SignalingMessageReceiverParticipantListTest {
         users.add(user);
         signalingMessageReceiver.processUsersInRoom(users);
 
-        List<Participant> expectedParticipantList = new ArrayList<>();
-        Participant expectedParticipant = new Participant();
-        expectedParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>();
+        ParticipantDto expectedParticipant = new ParticipantDto();
+        expectedParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant.setLastPing(4815);
         expectedParticipant.setSessionId("theSessionId");
         expectedParticipantList.add(expectedParticipant);
@@ -181,9 +186,9 @@ public class SignalingMessageReceiverParticipantListTest {
         SignalingMessageReceiver.ParticipantListMessageListener mockedParticipantListMessageListener2 =
             mock(SignalingMessageReceiver.ParticipantListMessageListener.class);
 
-        List<Participant> expectedParticipantList = new ArrayList<>();
-        Participant expectedParticipant = new Participant();
-        expectedParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>();
+        ParticipantDto expectedParticipant = new ParticipantDto();
+        expectedParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant.setLastPing(4815);
         expectedParticipant.setSessionId("theSessionId");
         expectedParticipantList.add(expectedParticipant);
@@ -216,9 +221,9 @@ public class SignalingMessageReceiverParticipantListTest {
         SignalingMessageReceiver.ParticipantListMessageListener mockedParticipantListMessageListener2 =
             mock(SignalingMessageReceiver.ParticipantListMessageListener.class);
 
-        List<Participant> expectedParticipantList = new ArrayList<>();
-        Participant expectedParticipant = new Participant();
-        expectedParticipant.setInCall(Participant.InCallFlags.DISCONNECTED);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>();
+        ParticipantDto expectedParticipant = new ParticipantDto();
+        expectedParticipant.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant.setLastPing(4815);
         expectedParticipant.setSessionId("theSessionId");
         expectedParticipantList.add(expectedParticipant);
@@ -266,11 +271,13 @@ public class SignalingMessageReceiverParticipantListTest {
         user1.put("sessionId", "theSessionId1");
         user1.put("participantType", 3);
         user1.put("userId", "theUserId");
-        // If "nextcloudSessionId" or "participantPermissions" is set in any of the participants all the other
-        // participants in the message would have them too. But for test simplicity, and as it is not relevant for
-        // the processing, in this test they are included only in one of the participants.
+        // If any of the following properties is set in any of the participants all the other participants in the
+        // message would have it too. But for test simplicity, and as it is not relevant for the processing, in this
+        // test they are included only in one of the participants.
         user1.put("nextcloudSessionId", "theNextcloudSessionId");
         user1.put("participantPermissions", 42);
+        user1.put("actorType", "federated_users");
+        user1.put("actorId", "theActorId");
         users.add(user1);
         Map<String, Object> user2 = new HashMap<>();
         user2.put("inCall", 0);
@@ -282,20 +289,23 @@ public class SignalingMessageReceiverParticipantListTest {
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
-        List<Participant> expectedParticipantList = new ArrayList<>(2);
-        Participant expectedParticipant1 = new Participant();
-        expectedParticipant1.setInCall(Participant.InCallFlags.IN_CALL | Participant.InCallFlags.WITH_AUDIO | Participant.InCallFlags.WITH_VIDEO);
+        List<ParticipantDto> expectedParticipantList = new ArrayList<>(2);
+        ParticipantDto expectedParticipant1 = new ParticipantDto();
+        expectedParticipant1.setInCall(ParticipantDto.InCallFlags.IN_CALL | ParticipantDto.InCallFlags.WITH_AUDIO | ParticipantDto.InCallFlags.WITH_VIDEO);
         expectedParticipant1.setLastPing(4815);
         expectedParticipant1.setSessionId("theSessionId1");
-        expectedParticipant1.setType(Participant.ParticipantType.USER);
+        expectedParticipant1.setType(ParticipantDto.ParticipantType.USER);
         expectedParticipant1.setUserId("theUserId");
+        expectedParticipant1.setActorType(ParticipantDto.ActorType.FEDERATED);
+        expectedParticipant1.setActorId("theActorId");
+        expectedParticipant1.setParticipantPermissions(42);
         expectedParticipantList.add(expectedParticipant1);
 
-        Participant expectedParticipant2 = new Participant();
-        expectedParticipant2.setInCall(Participant.InCallFlags.DISCONNECTED);
+        ParticipantDto expectedParticipant2 = new ParticipantDto();
+        expectedParticipant2.setInCall(ParticipantDto.InCallFlags.DISCONNECTED);
         expectedParticipant2.setLastPing(162342);
         expectedParticipant2.setSessionId("theSessionId2");
-        expectedParticipant2.setType(Participant.ParticipantType.GUEST);
+        expectedParticipant2.setType(ParticipantDto.ParticipantType.GUEST);
         expectedParticipantList.add(expectedParticipant2);
 
         verify(mockedParticipantListMessageListener, only()).onParticipantsUpdate(expectedParticipantList);
@@ -314,11 +324,11 @@ public class SignalingMessageReceiverParticipantListTest {
         Map<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
-        verify(mockedParticipantListMessageListener, only()).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        verify(mockedParticipantListMessageListener, only()).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
     }
 
     @Test
@@ -335,7 +345,7 @@ public class SignalingMessageReceiverParticipantListTest {
         HashMap<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
@@ -362,12 +372,12 @@ public class SignalingMessageReceiverParticipantListTest {
         HashMap<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
-        verify(mockedParticipantListMessageListener1, only()).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
-        verify(mockedParticipantListMessageListener3, only()).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        verify(mockedParticipantListMessageListener1, only()).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
+        verify(mockedParticipantListMessageListener3, only()).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
         verifyNoInteractions(mockedParticipantListMessageListener2);
     }
 
@@ -385,11 +395,11 @@ public class SignalingMessageReceiverParticipantListTest {
         HashMap<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
-        verify(mockedParticipantListMessageListener, only()).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        verify(mockedParticipantListMessageListener, only()).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
     }
 
     @Test
@@ -402,7 +412,7 @@ public class SignalingMessageReceiverParticipantListTest {
         doAnswer((invocation) -> {
             signalingMessageReceiver.addListener(mockedParticipantListMessageListener2);
             return null;
-        }).when(mockedParticipantListMessageListener1).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        }).when(mockedParticipantListMessageListener1).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
 
         signalingMessageReceiver.addListener(mockedParticipantListMessageListener1);
 
@@ -412,11 +422,11 @@ public class SignalingMessageReceiverParticipantListTest {
         HashMap<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
-        verify(mockedParticipantListMessageListener1, only()).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        verify(mockedParticipantListMessageListener1, only()).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
         verifyNoInteractions(mockedParticipantListMessageListener2);
     }
 
@@ -430,7 +440,7 @@ public class SignalingMessageReceiverParticipantListTest {
         doAnswer((invocation) -> {
             signalingMessageReceiver.removeListener(mockedParticipantListMessageListener2);
             return null;
-        }).when(mockedParticipantListMessageListener1).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        }).when(mockedParticipantListMessageListener1).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
 
         signalingMessageReceiver.addListener(mockedParticipantListMessageListener1);
         signalingMessageReceiver.addListener(mockedParticipantListMessageListener2);
@@ -441,13 +451,13 @@ public class SignalingMessageReceiverParticipantListTest {
         HashMap<String, Object> updateMap = new HashMap<>();
         updateMap.put("roomId", 108);
         updateMap.put("all", true);
-        updateMap.put("inCall", 0);
+        updateMap.put("incall", 0);
         eventMap.put("update", updateMap);
         signalingMessageReceiver.processEvent(eventMap);
 
         InOrder inOrder = inOrder(mockedParticipantListMessageListener1, mockedParticipantListMessageListener2);
 
-        inOrder.verify(mockedParticipantListMessageListener1).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
-        inOrder.verify(mockedParticipantListMessageListener2).onAllParticipantsUpdate(Participant.InCallFlags.DISCONNECTED);
+        inOrder.verify(mockedParticipantListMessageListener1).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
+        inOrder.verify(mockedParticipantListMessageListener2).onAllParticipantsUpdate(ParticipantDto.InCallFlags.DISCONNECTED);
     }
 }

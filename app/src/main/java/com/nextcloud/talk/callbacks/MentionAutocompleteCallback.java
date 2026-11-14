@@ -12,23 +12,27 @@ import android.text.Editable;
 import android.text.Spanned;
 import android.widget.EditText;
 
+import androidx.emoji2.text.EmojiCompat;
+import androidx.emoji2.text.EmojiSpan;
+
 import com.nextcloud.talk.R;
 import com.nextcloud.talk.data.user.model.User;
-import com.nextcloud.talk.models.json.mention.Mention;
+import com.nextcloud.talk.models.json.mention.MentionDto;
 import com.nextcloud.talk.ui.theme.ViewThemeUtils;
 import com.nextcloud.talk.utils.DisplayUtils;
 import com.nextcloud.talk.utils.CharPolicy;
 import com.nextcloud.talk.utils.text.Spans;
 import com.otaliastudios.autocomplete.AutocompleteCallback;
-import com.vanniktech.emoji.EmojiRange;
-import com.vanniktech.emoji.Emojis;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 import kotlin.OptIn;
 import third.parties.fresco.BetterImageSpan;
 
-public class MentionAutocompleteCallback implements AutocompleteCallback<Mention> {
+public class MentionAutocompleteCallback implements AutocompleteCallback<MentionDto> {
     private final ViewThemeUtils viewThemeUtils;
     private Context context;
     private User conversationUser;
@@ -46,7 +50,7 @@ public class MentionAutocompleteCallback implements AutocompleteCallback<Mention
 
     @OptIn(markerClass = kotlin.ExperimentalStdlibApi.class)
     @Override
-    public boolean onPopupItemClicked(Editable editable, Mention item) {
+    public boolean onPopupItemClicked(Editable editable, MentionDto item) {
         CharPolicy.TextSpan range = CharPolicy.getQueryRange(editable);
         if (range == null) {
             return false;
@@ -54,8 +58,21 @@ public class MentionAutocompleteCallback implements AutocompleteCallback<Mention
         String replacement = item.getLabel();
 
         StringBuilder replacementStringBuilder = new StringBuilder(Objects.requireNonNull(item.getLabel()));
-        for (EmojiRange emojiRange : Emojis.emojis(replacement)) {
-            replacementStringBuilder.delete(emojiRange.range.getStart(), emojiRange.range.getEndInclusive());
+        final EmojiCompat emojiCompat = EmojiCompat.get();
+        if (emojiCompat.getLoadState() == EmojiCompat.LOAD_STATE_SUCCEEDED) {
+            final CharSequence processed = emojiCompat.process(replacement);
+            if (processed instanceof Spanned) {
+                final Spanned spannedReplacement = (Spanned) processed;
+                final EmojiSpan[] emojiSpans =
+                    spannedReplacement.getSpans(0, spannedReplacement.length(), EmojiSpan.class);
+                final List<EmojiSpan> sortedSpans = new ArrayList<>(Arrays.asList(emojiSpans));
+                sortedSpans.sort((a, b) -> spannedReplacement.getSpanStart(b) - spannedReplacement.getSpanStart(a));
+                for (EmojiSpan emojiSpan : sortedSpans) {
+                    replacementStringBuilder.delete(
+                        spannedReplacement.getSpanStart(emojiSpan),
+                        spannedReplacement.getSpanEnd(emojiSpan));
+                }
+            }
         }
 
         String charSequence = " ";
@@ -78,7 +95,7 @@ public class MentionAutocompleteCallback implements AutocompleteCallback<Mention
         editable.setSpan(mentionChipSpan,
                          range.getStart() + charSequence.length(),
                          range.getStart() + replacementStringBuilder.length() + charSequence.length(),
-                         Spanned.SPAN_INCLUSIVE_INCLUSIVE);
+                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
 
 
         return true;

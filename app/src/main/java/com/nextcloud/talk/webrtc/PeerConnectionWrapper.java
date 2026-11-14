@@ -7,15 +7,14 @@
  */
 package com.nextcloud.talk.webrtc;
 
-import android.content.Context;
 import android.util.Log;
 
 import com.bluelinelabs.logansquare.LoganSquare;
-import com.nextcloud.talk.application.NextcloudTalkApplication;
-import com.nextcloud.talk.models.json.signaling.DataChannelMessage;
-import com.nextcloud.talk.models.json.signaling.NCIceCandidate;
-import com.nextcloud.talk.models.json.signaling.NCMessagePayload;
-import com.nextcloud.talk.models.json.signaling.NCSignalingMessage;
+import com.nextcloud.talk.call.e2ee.FrameKeyRing;
+import com.nextcloud.talk.models.json.signaling.DataChannelMessageDto;
+import com.nextcloud.talk.models.json.signaling.NCIceCandidateDto;
+import com.nextcloud.talk.models.json.signaling.NCMessagePayloadDto;
+import com.nextcloud.talk.models.json.signaling.NCSignalingMessageDto;
 import com.nextcloud.talk.signaling.SignalingMessageReceiver;
 import com.nextcloud.talk.signaling.SignalingMessageSender;
 
@@ -28,6 +27,7 @@ import org.webrtc.MediaStreamTrack;
 import org.webrtc.PeerConnection;
 import org.webrtc.PeerConnectionFactory;
 import org.webrtc.RtpReceiver;
+import org.webrtc.RtpSender;
 import org.webrtc.RtpTransceiver;
 import org.webrtc.SessionDescription;
 import org.webrtc.VideoTrack;
@@ -36,20 +36,15 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-import javax.inject.Inject;
-
 import androidx.annotation.Nullable;
-import autodagger.AutoInjector;
 
-@AutoInjector(NextcloudTalkApplication.class)
-public class PeerConnectionWrapper {
-
-    @Inject
-    Context context;
+public final class PeerConnectionWrapper {
 
     private static final String TAG = PeerConnectionWrapper.class.getCanonicalName();
 
@@ -66,20 +61,31 @@ public class PeerConnectionWrapper {
     private PeerConnection peerConnection;
     private String sessionId;
     private final MediaConstraints mediaConstraints;
-    private DataChannel dataChannel;
+    private final Map<String, DataChannel> dataChannels = new HashMap<>();
+    private final List<DataChannelMessageDto> pendingDataChannelMessages = new ArrayList<>();
     private final SdpObserver sdpObserver;
 
-    private final boolean hasInitiated;
-
-    private final MediaStream localStream;
     private final boolean isMCUPublisher;
+    private final boolean isScreenSharer;
+    private final String localSession;
     private final String videoStreamType;
+
+    // Keys of the remote participant when the call is end-to-end encrypted, attached to every receiver
+    @Nullable
+    private final FrameKeyRing receiverKeyRing;
+    // The frame encryption only handles VP8
+    private final String preferredVideoCodec;
 
     // It is assumed that there will be at most one remote stream at each time.
     private MediaStream stream;
+    private volatile boolean remoteAudioPlayoutEnabled = false;
+    private final Map<String, AudioTrack> remoteAudioTracks = new HashMap<>();
 
     /**
      * Listener for data channel messages.
+     * <p>
+     * Messages might have been received on any data channel, independently of its label or whether it was open by the
+     * local or the remote peer.
      * <p>
      * The messages are bound to a specific peer connection, so each listener is expected to handle messages only for
      * a single peer connection.
@@ -92,6 +98,8 @@ public class PeerConnectionWrapper {
         void onAudioOff();
         void onVideoOn();
         void onVideoOff();
+        void onSpeaking();
+        void onStoppedSpeaking();
         void onNickChanged(String nick);
     }
 
@@ -110,24 +118,63 @@ public class PeerConnectionWrapper {
         void onIceConnectionStateChanged(PeerConnection.IceConnectionState iceConnectionState);
     }
 
+    /**
+     * @param encryptionRequired whether the call has to be end-to-end encrypted; the wrapper is then not created
+     *                           without the keys it needs, so no media is ever exchanged unencrypted
+     * @param senderKeyRing own keys to encrypt the local tracks with, null when the call is not end-to-end encrypted
+     * @param receiverKeyRing keys of the remote participant to decrypt its tracks with, null when the call is not
+     *                        end-to-end encrypted
+     * @throws IllegalStateException when encryption is required but the keys for this connection are missing
+     */
     public PeerConnectionWrapper(PeerConnectionFactory peerConnectionFactory,
                                  List<PeerConnection.IceServer> iceServerList,
                                  MediaConstraints mediaConstraints,
                                  String sessionId, String localSession, @Nullable MediaStream localStream,
                                  boolean isMCUPublisher, boolean hasMCU, String videoStreamType,
                                  SignalingMessageReceiver signalingMessageReceiver,
-                                 SignalingMessageSender signalingMessageSender) {
+                                 SignalingMessageSender signalingMessageSender,
+                                 boolean encryptionRequired,
+                                 @Nullable FrameKeyRing senderKeyRing,
+                                 @Nullable FrameKeyRing receiverKeyRing) {
+        this(peerConnectionFactory, iceServerList, mediaConstraints, sessionId, localSession, localStream,
+             isMCUPublisher, hasMCU, videoStreamType, signalingMessageReceiver, signalingMessageSender,
+             encryptionRequired, senderKeyRing, receiverKeyRing, false);
+    }
 
-        Objects.requireNonNull(NextcloudTalkApplication.Companion.getSharedApplication()).getComponentApplication().inject(this);
+    /**
+     * @param isScreenSharer true if the connection sends the local screen, either directly to the remote participant
+     *                       or, with MCU, to the own publisher. The connection then always sends the offer and does
+     *                       not open data channels.
+     */
+    public PeerConnectionWrapper(PeerConnectionFactory peerConnectionFactory,
+                                 List<PeerConnection.IceServer> iceServerList,
+                                 MediaConstraints mediaConstraints,
+                                 String sessionId, String localSession, @Nullable MediaStream localStream,
+                                 boolean isMCUPublisher, boolean hasMCU, String videoStreamType,
+                                 SignalingMessageReceiver signalingMessageReceiver,
+                                 SignalingMessageSender signalingMessageSender,
+                                 boolean encryptionRequired,
+                                 @Nullable FrameKeyRing senderKeyRing,
+                                 @Nullable FrameKeyRing receiverKeyRing,
+                                 boolean isScreenSharer) {
+        boolean missingSenderKeys = (isMCUPublisher || localStream != null) && senderKeyRing == null;
+        boolean missingReceiverKeys = !isMCUPublisher && receiverKeyRing == null;
+        if (encryptionRequired && (missingSenderKeys || missingReceiverKeys)) {
+            throw new IllegalStateException("The call has to be end-to-end encrypted but there are no keys for "
+                                                + sessionId);
+        }
 
-        this.localStream = localStream;
         this.videoStreamType = videoStreamType;
+        this.isScreenSharer = isScreenSharer;
+        this.localSession = localSession;
+        this.receiverKeyRing = receiverKeyRing;
+        this.preferredVideoCodec = senderKeyRing != null || receiverKeyRing != null ? "VP8" : "H264";
 
         this.sessionId = sessionId;
         this.mediaConstraints = mediaConstraints;
 
         sdpObserver = new SdpObserver();
-        hasInitiated = sessionId.compareTo(localSession) < 0;
+        boolean hasInitiated = isOfferer(localSession, sessionId);
         this.isMCUPublisher = isMCUPublisher;
 
         PeerConnection.RTCConfiguration configuration = new PeerConnection.RTCConfiguration(iceServerList);
@@ -135,26 +182,45 @@ public class PeerConnectionWrapper {
         peerConnection = peerConnectionFactory.createPeerConnection(configuration, new InitialPeerConnectionObserver());
 
         this.signalingMessageReceiver = signalingMessageReceiver;
-        this.signalingMessageReceiver.addListener(webRtcMessageListener, sessionId, videoStreamType);
+        this.signalingMessageReceiver.addListener(
+            webRtcMessageListener,
+            sessionId,
+            isScreenSharer ? SignalingMessageReceiver.ROOM_TYPE_SCREEN_SHARING : videoStreamType);
 
         this.signalingMessageSender = signalingMessageSender;
 
         if (peerConnection != null) {
-            if (this.localStream != null) {
-                List<String> localStreamIds = Collections.singletonList(this.localStream.getId());
-                for(AudioTrack track : this.localStream.audioTracks) {
+            if (localStream != null) {
+                List<String> localStreamIds = Collections.singletonList(localStream.getId());
+                for(AudioTrack track : localStream.audioTracks) {
                     peerConnection.addTrack(track, localStreamIds);
                 }
-                for(VideoTrack track : this.localStream.videoTracks) {
+                for(VideoTrack track : localStream.videoTracks) {
                     peerConnection.addTrack(track, localStreamIds);
                 }
             }
 
-            if (hasMCU || hasInitiated) {
+            if (senderKeyRing != null) {
+                // Attached before any offer is created, so no frame is ever sent unencrypted
+                for (RtpSender sender : peerConnection.getSenders()) {
+                    if (!senderKeyRing.attachEncryptor(sender)) {
+                        // The own keys are disposed when the call ends, so nothing may be sent anymore
+                        Log.w(TAG, "Own keys are gone, not sending with sender " + sender.id());
+                        peerConnection.removeTrack(sender);
+                    }
+                }
+            }
+
+            if (isScreenSharer) {
+                peerConnection.createOffer(sdpObserver, mediaConstraints);
+            } else if (hasMCU || hasInitiated) {
                 DataChannel.Init init = new DataChannel.Init();
                 init.negotiated = false;
-                dataChannel = peerConnection.createDataChannel("status", init);
-                dataChannel.registerObserver(new DataChannelObserver());
+
+                DataChannel statusDataChannel = peerConnection.createDataChannel("status", init);
+                statusDataChannel.registerObserver(new DataChannelObserver(statusDataChannel));
+                dataChannels.put("status", statusDataChannel);
+
                 if (isMCUPublisher) {
                     peerConnection.createOffer(sdpObserver, mediaConstraints);
                 } else if (hasMCU && "video".equals(this.videoStreamType)) {
@@ -162,7 +228,7 @@ public class PeerConnectionWrapper {
                     // offer; offers should be requested only for videos.
                     // "to" property is not actually needed in the "requestoffer" signaling message, but it is used to
                     // set the recipient session ID in the assembled call message.
-                    NCSignalingMessage ncSignalingMessage = createBaseSignalingMessage("requestoffer");
+                    NCSignalingMessageDto ncSignalingMessage = createBaseSignalingMessage("requestoffer");
                     signalingMessageSender.send(ncSignalingMessage);
                 } else if (!hasMCU && hasInitiated && "video".equals(this.videoStreamType)) {
                     // If the connection type is "screen" the client sharing the screen will send an
@@ -173,12 +239,36 @@ public class PeerConnectionWrapper {
         }
     }
 
+    /**
+     * Decides whether this client takes the offerer role for a peer connection.
+     *
+     * <p>The role is resolved purely by lexicographic comparison of the two session IDs:
+     * the client whose remote session ID sorts before its own local session ID becomes the
+     * offerer. This yields exactly one offerer per pair <em>only if both peers compare the
+     * same ordered pair of strings</em>.
+     *
+     * <p>Bug #6169: with the High-Performance Backend the remote {@code sessionId} is a
+     * signaling-layer session ID. Callers must therefore pass a {@code localSession} from the
+     * <em>same</em> namespace (the local signaling session, not the Nextcloud session); otherwise
+     * the two peers compare unrelated strings and can both compute {@code false} (neither offers —
+     * deadlock) or both {@code true} (offer collision). The {@code requestoffer} fallback only
+     * applies in MCU mode, so a direct (no-MCU) 2-party call deadlocks outright. The deadlock is
+     * exercised by {@code PeerConnectionWrapperOffererRoleTest}.
+     *
+     * @param localSession  this client's own session ID (same namespace as {@code remoteSession})
+     * @param remoteSession the remote peer's session ID
+     * @return true if this client should create the initial offer
+     */
+    static boolean isOfferer(String localSession, String remoteSession) {
+        return remoteSession.compareTo(localSession) < 0;
+    }
+
     public void raiseHand(Boolean raise) {
-        NCMessagePayload ncMessagePayload = new NCMessagePayload();
+        NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
         ncMessagePayload.setState(raise);
         ncMessagePayload.setTimestamp(System.currentTimeMillis());
 
-        NCSignalingMessage ncSignalingMessage = new NCSignalingMessage();
+        NCSignalingMessageDto ncSignalingMessage = new NCSignalingMessageDto();
         ncSignalingMessage.setTo(sessionId);
         ncSignalingMessage.setType("raiseHand");
         ncSignalingMessage.setPayload(ncMessagePayload);
@@ -188,11 +278,11 @@ public class PeerConnectionWrapper {
     }
 
     public void sendReaction(String emoji) {
-        NCMessagePayload ncMessagePayload = new NCMessagePayload();
+        NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
         ncMessagePayload.setReaction(emoji);
         ncMessagePayload.setTimestamp(System.currentTimeMillis());
 
-        NCSignalingMessage ncSignalingMessage = new NCSignalingMessage();
+        NCSignalingMessageDto ncSignalingMessage = new NCSignalingMessageDto();
         ncSignalingMessage.setTo(sessionId);
         ncSignalingMessage.setType("reaction");
         ncSignalingMessage.setPayload(ncMessagePayload);
@@ -239,23 +329,87 @@ public class PeerConnectionWrapper {
         return stream;
     }
 
+    public synchronized void setRemoteAudioPlayoutEnabled(boolean enabled) {
+        remoteAudioPlayoutEnabled = enabled;
+        double volume = enabled ? 1.0 : 0.0;
+        Iterator<Map.Entry<String, AudioTrack>> iterator = remoteAudioTracks.entrySet().iterator();
+        while (iterator.hasNext()) {
+            try {
+                iterator.next().getValue().setVolume(volume);
+            } catch (IllegalStateException exception) {
+                iterator.remove();
+                Log.w(TAG, "Remote audio track was already disposed", exception);
+            }
+        }
+    }
+
+    private void applyRemoteAudioVolume(@Nullable MediaStream mediaStream) {
+        if (mediaStream == null) {
+            return;
+        }
+        double volume = remoteAudioPlayoutEnabled ? 1.0 : 0.0;
+        for (AudioTrack audioTrack : mediaStream.audioTracks) {
+            applyRemoteAudioVolume(audioTrack, volume);
+        }
+    }
+
+    private void applyRemoteAudioVolume(AudioTrack audioTrack, double volume) {
+        try {
+            String trackId = audioTrack.id();
+            audioTrack.setVolume(volume);
+            remoteAudioTracks.put(trackId, audioTrack);
+        } catch (IllegalStateException exception) {
+            Log.w(TAG, "Remote audio track was already disposed", exception);
+        }
+    }
+
+    private void removeRemoteAudioTrack(MediaStreamTrack mediaStreamTrack) {
+        try {
+            String trackId = mediaStreamTrack.id();
+            if (remoteAudioTracks.get(trackId) == mediaStreamTrack) {
+                remoteAudioTracks.remove(trackId);
+            }
+        } catch (IllegalStateException exception) {
+            Log.w(TAG, "Remote audio track was already disposed", exception);
+        }
+    }
+
     public void removePeerConnection() {
         signalingMessageReceiver.removeListener(webRtcMessageListener);
 
-        if (dataChannel != null) {
-            dataChannel.dispose();
-            dataChannel = null;
-            Log.d(TAG, "Disposed DataChannel");
-        } else {
-            Log.d(TAG, "DataChannel is null.");
+        final PeerConnection connectionToClose;
+        synchronized (this) {
+            connectionToClose = peerConnection;
+            peerConnection = null;
         }
 
-        if (peerConnection != null) {
-            peerConnection.close();
-            peerConnection = null;
+        if (connectionToClose != null) {
+            // close() blocks until the signaling thread finishes, and signaling thread callbacks
+            // (onStateChange, onDataChannel) acquire this object's lock — so close() must be
+            // called outside the lock. Nulling peerConnection above causes those callbacks to
+            // return early once they acquire the lock.
+            connectionToClose.close();
             Log.d(TAG, "Disposed PeerConnection");
         } else {
             Log.d(TAG, "PeerConnection is null.");
+        }
+
+        synchronized (this) {
+            stream = null;
+            remoteAudioTracks.clear();
+            for (DataChannel dataChannel : dataChannels.values()) {
+                String label;
+                try {
+                    label = dataChannel.label();
+                } catch (IllegalStateException e) {
+                    label = "<disposed>";
+                }
+                Log.d(TAG, "Disposed DataChannel " + label);
+
+                dataChannel.unregisterObserver();
+                dataChannel.dispose();
+            }
+            dataChannels.clear();
         }
     }
 
@@ -278,15 +432,51 @@ public class PeerConnectionWrapper {
         }
     }
 
-    public void sendChannelData(DataChannelMessage dataChannelMessage) {
-        ByteBuffer buffer;
-        if (dataChannel != null && dataChannelMessage != null) {
-            try {
-                buffer = ByteBuffer.wrap(LoganSquare.serialize(dataChannelMessage).getBytes());
-                dataChannel.send(new DataChannel.Buffer(buffer, false));
-            } catch (Exception e) {
-                Log.d(TAG, "Failed to send channel data, attempting regular " + dataChannelMessage);
-            }
+    /**
+     * Sends a data channel message.
+     * <p>
+     * Data channel messages are always sent on the "status" data channel locally opened. However, if Janus is used,
+     * messages can be sent only on publisher connections, even if subscriber connections have a "status" data channel;
+     * messages sent on subscriber connections will be simply ignored. Moreover, even if the message is sent on the
+     * "status" data channel subscriber connections will receive it on a data channel with a different label, as
+     * Janus opens its own data channel on subscriber connections and "multiplexes" all the received data channel
+     * messages on it, independently of on which data channel they were originally sent.
+     * <p>
+     * Data channel messages can be sent at any time; if the "status" data channel is not open yet the messages will be
+     * queued and sent once it is opened. Nevertheless, if Janus is used, it is not guaranteed that the messages will
+     * be received by other participants, as it is only known when the data channel of the publisher was opened, but
+     * not if the data channel of the subscribers was. However, in general this should be a concern only during the
+     * first seconds after a participant joins; after some time the subscriber connections should be established and
+     * their data channels open.
+     *
+     * @param dataChannelMessage the message to send
+     */
+    public synchronized void send(DataChannelMessageDto dataChannelMessage) {
+        if (dataChannelMessage == null) {
+            return;
+        }
+
+        DataChannel statusDataChannel = dataChannels.get("status");
+        if (statusDataChannel == null || statusDataChannel.state() != DataChannel.State.OPEN ||
+            !pendingDataChannelMessages.isEmpty()) {
+            Log.d(TAG, "Queuing data channel message (" + dataChannelMessage + ") " + sessionId);
+
+            pendingDataChannelMessages.add(dataChannelMessage);
+
+            return;
+        }
+
+        sendWithoutQueuing(statusDataChannel, dataChannelMessage);
+    }
+
+    private void sendWithoutQueuing(DataChannel statusDataChannel, DataChannelMessageDto dataChannelMessage) {
+        try {
+            Log.d(TAG, "Sending data channel message (" + dataChannelMessage + ") " + sessionId);
+
+            ByteBuffer buffer = ByteBuffer.wrap(LoganSquare.serialize(dataChannelMessage).getBytes());
+            statusDataChannel.send(new DataChannel.Buffer(buffer, false));
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to send data channel message");
         }
     }
 
@@ -296,22 +486,6 @@ public class PeerConnectionWrapper {
 
     public String getSessionId() {
         return sessionId;
-    }
-
-    private void sendInitialMediaStatus() {
-        if (localStream != null) {
-            if (localStream.videoTracks.size() == 1 && localStream.videoTracks.get(0).enabled()) {
-                sendChannelData(new DataChannelMessage("videoOn"));
-            } else {
-                sendChannelData(new DataChannelMessage("videoOff"));
-            }
-
-            if (localStream.audioTracks.size() == 1 && localStream.audioTracks.get(0).enabled()) {
-                sendChannelData(new DataChannelMessage("audioOn"));
-            } else {
-                sendChannelData(new DataChannelMessage("audioOff"));
-            }
-        }
     }
 
     public boolean isMCUPublisher() {
@@ -327,11 +501,14 @@ public class PeerConnectionWrapper {
         return false;
     }
 
-    private NCSignalingMessage createBaseSignalingMessage(String type) {
-        NCSignalingMessage ncSignalingMessage = new NCSignalingMessage();
+    private NCSignalingMessageDto createBaseSignalingMessage(String type) {
+        NCSignalingMessageDto ncSignalingMessage = new NCSignalingMessageDto();
         ncSignalingMessage.setTo(sessionId);
         ncSignalingMessage.setRoomType(videoStreamType);
         ncSignalingMessage.setType(type);
+        if (isScreenSharer) {
+            ncSignalingMessage.setBroadcaster(localSession);
+        }
 
         return ncSignalingMessage;
     }
@@ -350,7 +527,7 @@ public class PeerConnectionWrapper {
             SessionDescription sessionDescriptionWithPreferredCodec;
 
             boolean isAudio = false;
-            String sessionDescriptionStringWithPreferredCodec = WebRTCUtils.preferCodec(sdp, "H264", isAudio);
+            String sessionDescriptionStringWithPreferredCodec = WebRTCUtils.preferCodec(sdp, preferredVideoCodec, isAudio);
 
             sessionDescriptionWithPreferredCodec = new SessionDescription(
                 SessionDescription.Type.fromCanonicalForm(type),
@@ -373,6 +550,14 @@ public class PeerConnectionWrapper {
 
     private class DataChannelObserver implements DataChannel.Observer {
 
+        private final DataChannel dataChannel;
+        private final String dataChannelLabel;
+
+        public DataChannelObserver(DataChannel dataChannel) {
+            this.dataChannel = Objects.requireNonNull(dataChannel);
+            this.dataChannelLabel = dataChannel.label();
+        }
+
         @Override
         public void onBufferedAmountChange(long l) {
 
@@ -380,16 +565,36 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onStateChange() {
-            if (dataChannel != null &&
-                dataChannel.state() == DataChannel.State.OPEN) {
-                sendInitialMediaStatus();
+            synchronized (PeerConnectionWrapper.this) {
+                // The PeerConnection could have been removed in parallel even with the synchronization (as just after
+                // "onStateChange" was called "removePeerConnection" could have acquired the lock).
+                if (peerConnection == null) {
+                    return;
+                }
+
+                if (dataChannel.state() == DataChannel.State.OPEN && "status".equals(dataChannelLabel)) {
+                    for (DataChannelMessageDto dataChannelMessage : pendingDataChannelMessages) {
+                        sendWithoutQueuing(dataChannel, dataChannelMessage);
+                    }
+                    pendingDataChannelMessages.clear();
+                }
             }
         }
 
         @Override
         public void onMessage(DataChannel.Buffer buffer) {
+            synchronized (PeerConnectionWrapper.this) {
+                // It is assumed that, even if its data channel was disposed, its buffers can be used while there is
+                // a reference to them, so it would not be necessary to check this from a thread-safety point of view.
+                // Nevertheless, if the remote peer connection was removed it would not make sense to notify the
+                // listeners anyway.
+                if (peerConnection == null) {
+                    return;
+                }
+            }
+
             if (buffer.binary) {
-                Log.d(TAG, "Received binary msg over " + TAG + " " + sessionId);
+                Log.d(TAG, "Received binary data channel message over " + dataChannelLabel + " " + sessionId);
                 return;
             }
 
@@ -397,11 +602,11 @@ public class PeerConnectionWrapper {
             final byte[] bytes = new byte[data.capacity()];
             data.get(bytes);
             String strData = new String(bytes);
-            Log.d(TAG, "Got msg: " + strData + " over " + TAG + " " + sessionId);
+            Log.d(TAG, "Received data channel message (" + strData + ") over " + dataChannelLabel + " " + sessionId);
 
-            DataChannelMessage dataChannelMessage;
+            DataChannelMessageDto dataChannelMessage;
             try {
-                dataChannelMessage = LoganSquare.parse(strData, DataChannelMessage.class);
+                dataChannelMessage = LoganSquare.parse(strData, DataChannelMessageDto.class);
             } catch (IOException e) {
                 Log.d(TAG, "Failed to parse data channel message");
 
@@ -447,6 +652,18 @@ public class PeerConnectionWrapper {
 
                 return;
             }
+
+            if ("speaking".equals(dataChannelMessage.getType())) {
+                dataChannelMessageNotifier.notifySpeaking();
+
+                return;
+            }
+
+            if ("stoppedSpeaking".equals(dataChannelMessage.getType())) {
+                dataChannelMessageNotifier.notifyStoppedSpeaking();
+
+                return;
+            }
         }
     }
 
@@ -458,13 +675,11 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onIceConnectionChange(PeerConnection.IceConnectionState iceConnectionState) {
+            if (peerConnection == null) {
+                return;
+            }
 
             Log.d("iceConnectionChangeTo: ", iceConnectionState.name() + " over " + peerConnection.hashCode() + " " + sessionId);
-            if (iceConnectionState == PeerConnection.IceConnectionState.CONNECTED) {
-                if (hasInitiated) {
-                    sendInitialMediaStatus();
-                }
-            }
 
             peerConnectionNotifier.notifyIceConnectionStateChanged(iceConnectionState);
         }
@@ -481,11 +696,11 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onIceCandidate(IceCandidate iceCandidate) {
-            NCSignalingMessage ncSignalingMessage = createBaseSignalingMessage("candidate");
-            NCMessagePayload ncMessagePayload = new NCMessagePayload();
+            NCSignalingMessageDto ncSignalingMessage = createBaseSignalingMessage("candidate");
+            NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
             ncMessagePayload.setType("candidate");
 
-            NCIceCandidate ncIceCandidate = new NCIceCandidate();
+            NCIceCandidateDto ncIceCandidate = new NCIceCandidateDto();
             ncIceCandidate.setSdpMid(iceCandidate.sdpMid);
             ncIceCandidate.setSdpMLineIndex(iceCandidate.sdpMLineIndex);
             ncIceCandidate.setCandidate(iceCandidate.sdp);
@@ -503,26 +718,71 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onAddStream(MediaStream mediaStream) {
-            stream = mediaStream;
+            synchronized (PeerConnectionWrapper.this) {
+                stream = mediaStream;
+                applyRemoteAudioVolume(mediaStream);
+            }
 
             peerConnectionNotifier.notifyStreamAdded(mediaStream);
         }
 
         @Override
         public void onRemoveStream(MediaStream mediaStream) {
-            stream = null;
+            synchronized (PeerConnectionWrapper.this) {
+                stream = null;
+                for (AudioTrack audioTrack : mediaStream.audioTracks) {
+                    removeRemoteAudioTrack(audioTrack);
+                }
+            }
 
             peerConnectionNotifier.notifyStreamRemoved(mediaStream);
         }
 
         @Override
         public void onDataChannel(DataChannel dataChannel) {
-            if (PeerConnectionWrapper.this.dataChannel != null) {
-                Log.w(TAG, "Data channel with label " + PeerConnectionWrapper.this.dataChannel.label()
-                    + " exists, but received onDataChannel event for DataChannel with label " + dataChannel.label());
+            synchronized (PeerConnectionWrapper.this) {
+                // Another data channel with the same label, no matter if the same instance or a different one, should
+                // not be added, but this is handled just in case.
+                // Moreover, if it were possible that an already added data channel was added again there would be a
+                // potential race condition with "removePeerConnection", even with the synchronization, as it would
+                // be possible that "onDataChannel" was called, then "removePeerConnection" disposed the data
+                // channel, and then "onDataChannel" continued in the synchronized statements and tried to get the
+                // label, which would throw an exception due to the data channel having been disposed already.
+                String dataChannelLabel;
+                try {
+                    dataChannelLabel = dataChannel.label();
+                } catch (IllegalStateException e) {
+                    // The data channel was disposed already, nothing to do.
+                    return;
+                }
+
+                DataChannel oldDataChannel = dataChannels.get(dataChannelLabel);
+                if (oldDataChannel == dataChannel) {
+                    Log.w(TAG, "Data channel with label " + dataChannelLabel + " added again");
+
+                    return;
+                }
+
+                if (oldDataChannel != null) {
+                    Log.w(TAG, "Data channel with label " + dataChannelLabel + " exists");
+
+                    // Remove the old entry first so that removePeerConnection() cannot iterate over
+                    // a channel that we are about to dispose (it would throw when calling label() on it).
+                    dataChannels.remove(dataChannelLabel);
+                    oldDataChannel.unregisterObserver();
+                    oldDataChannel.dispose();
+                }
+
+                // If the peer connection was removed in parallel dispose the data channel instead of adding it.
+                if (peerConnection == null) {
+                    dataChannel.dispose();
+
+                    return;
+                }
+
+                dataChannel.registerObserver(new DataChannelObserver(dataChannel));
+                dataChannels.put(dataChannelLabel, dataChannel);
             }
-            PeerConnectionWrapper.this.dataChannel = dataChannel;
-            PeerConnectionWrapper.this.dataChannel.registerObserver(new DataChannelObserver());
         }
 
         @Override
@@ -532,6 +792,35 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onAddTrack(RtpReceiver rtpReceiver, MediaStream[] mediaStreams) {
+            // Called on the signaling thread before the track is wired to a decoder, so no encrypted frame reaches
+            // it without a decryptor
+            if (receiverKeyRing != null && !receiverKeyRing.attachDecryptor(rtpReceiver)) {
+                // The participant left and its keys are disposed, so this connection is about to be closed too
+                Log.w(TAG, "Not adding a track of " + sessionId + " that can not be decrypted anymore");
+                return;
+            }
+
+            MediaStreamTrack track = rtpReceiver.track();
+            synchronized (PeerConnectionWrapper.this) {
+                if (track instanceof AudioTrack) {
+                    AudioTrack audioTrack = (AudioTrack) track;
+                    applyRemoteAudioVolume(audioTrack, remoteAudioPlayoutEnabled ? 1.0 : 0.0);
+                }
+                for (MediaStream mediaStream : mediaStreams) {
+                    stream = mediaStream;
+                    applyRemoteAudioVolume(mediaStream);
+                }
+            }
+        }
+
+        @Override
+        public void onRemoveTrack(RtpReceiver rtpReceiver) {
+            MediaStreamTrack track = rtpReceiver.track();
+            if (track instanceof AudioTrack) {
+                synchronized (PeerConnectionWrapper.this) {
+                    removeRemoteAudioTrack(track);
+                }
+            }
         }
     }
 
@@ -540,27 +829,27 @@ public class PeerConnectionWrapper {
 
         @Override
         public void onCreateFailure(String s) {
-            Log.d(TAG, "SDPObserver createFailure: " + s + " over " + peerConnection.hashCode() + " " + sessionId);
+            Log.d(TAG, "SDPObserver createFailure: " + s + " over " + sessionId);
 
         }
 
         @Override
         public void onSetFailure(String s) {
-            Log.d(TAG,"SDPObserver setFailure: " + s + " over " + peerConnection.hashCode() + " " + sessionId);
+            Log.d(TAG,"SDPObserver setFailure: " + s + " over " + sessionId);
         }
 
         @Override
         public void onCreateSuccess(SessionDescription sessionDescription) {
             String type = sessionDescription.type.canonicalForm();
 
-            NCSignalingMessage ncSignalingMessage = createBaseSignalingMessage(type);
-            NCMessagePayload ncMessagePayload = new NCMessagePayload();
+            NCSignalingMessageDto ncSignalingMessage = createBaseSignalingMessage(type);
+            NCMessagePayloadDto ncMessagePayload = new NCMessagePayloadDto();
             ncMessagePayload.setType(type);
 
             SessionDescription sessionDescriptionWithPreferredCodec;
             String sessionDescriptionStringWithPreferredCodec = WebRTCUtils.preferCodec
                     (sessionDescription.description,
-                            "H264", false);
+                            preferredVideoCodec, false);
             sessionDescriptionWithPreferredCodec = new SessionDescription(
                     sessionDescription.type,
                     sessionDescriptionStringWithPreferredCodec);

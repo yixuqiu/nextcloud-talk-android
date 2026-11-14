@@ -8,31 +8,34 @@ package com.nextcloud.talk.conversation
 
 import android.annotation.SuppressLint
 import android.app.Dialog
-import android.content.res.ColorStateList
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextUtils
 import android.text.TextWatcher
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.appcompat.app.AlertDialog
-import androidx.core.content.res.ResourcesCompat
+import androidx.core.os.BundleCompat
 import androidx.fragment.app.DialogFragment
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import autodagger.AutoInjector
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
-import com.nextcloud.android.common.ui.theme.utils.ColorRole
 import com.nextcloud.talk.R
 import com.nextcloud.talk.application.NextcloudTalkApplication
-import com.nextcloud.talk.conversation.viewmodel.RenameConversationViewModel
+import com.nextcloud.talk.conversationinfoedit.viewmodel.ConversationInfoEditViewModel
 import com.nextcloud.talk.conversationlist.ConversationsListActivity
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.DialogRenameConversationBinding
 import com.nextcloud.talk.events.ConversationsListFetchDataEvent
+import com.nextcloud.talk.logger.Logger
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
-import com.vanniktech.emoji.EmojiPopup
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
+import kotlinx.coroutines.launch
 import org.greenrobot.eventbus.EventBus
 import javax.inject.Inject
 
@@ -48,11 +51,13 @@ class RenameConversationDialogFragment : DialogFragment() {
     @Inject
     lateinit var eventBus: EventBus
 
+    @Inject
+    lateinit var logger: Logger
+
     private lateinit var binding: DialogRenameConversationBinding
-    private lateinit var viewModel: RenameConversationViewModel
+    private lateinit var viewModel: ConversationInfoEditViewModel
 
-    private var emojiPopup: EmojiPopup? = null
-
+    private lateinit var user: User
     private var roomToken = ""
     private var initialName = ""
 
@@ -60,15 +65,17 @@ class RenameConversationDialogFragment : DialogFragment() {
         super.onCreate(savedInstanceState)
 
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
 
-        viewModel = ViewModelProvider(this, viewModelFactory)[RenameConversationViewModel::class.java]
+        viewModel = ViewModelProvider(this, viewModelFactory)[ConversationInfoEditViewModel::class.java]
+        user = BundleCompat.getParcelable(requireArguments(), KEY_USER, User::class.java)!!
         roomToken = arguments?.getString(KEY_ROOM_TOKEN)!!
         initialName = arguments?.getString(INITIAL_NAME)!!
     }
 
     @SuppressLint("InflateParams")
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
-        binding = DialogRenameConversationBinding.inflate(LayoutInflater.from(context))
+        binding = DialogRenameConversationBinding.inflate(layoutInflater)
 
         val dialogBuilder = MaterialAlertDialogBuilder(binding.root.context)
             .setTitle(resources.getString(R.string.nc_rename))
@@ -82,17 +89,14 @@ class RenameConversationDialogFragment : DialogFragment() {
         return dialogBuilder.create()
     }
 
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
-        return binding.root
-    }
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+        binding.root
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
         setupListeners()
         setupStateObserver()
-
-        setupEmojiPopup()
     }
 
     override fun onStart() {
@@ -102,7 +106,7 @@ class RenameConversationDialogFragment : DialogFragment() {
         val positiveButton = (dialog as AlertDialog).getButton(AlertDialog.BUTTON_POSITIVE)
         positiveButton.isEnabled = false
         positiveButton.setOnClickListener {
-            viewModel.renameConversation(roomToken, binding.textEdit.text.toString())
+            viewModel.renameRoom(user, roomToken, binding.textEdit.text.toString())
         }
 
         themeDialog()
@@ -115,32 +119,7 @@ class RenameConversationDialogFragment : DialogFragment() {
         viewThemeUtils.material.colorTextInputLayout(binding.textInputLayout)
     }
 
-    private fun setupEmojiPopup() {
-        emojiPopup = binding.let {
-            EmojiPopup(
-                rootView = requireView(),
-                editText = it.textEdit,
-                onEmojiPopupShownListener = {
-                    viewThemeUtils.platform.colorImageView(it.smileyButton, ColorRole.PRIMARY)
-                },
-                onEmojiPopupDismissListener = {
-                    it.smileyButton.imageTintList = ColorStateList.valueOf(
-                        ResourcesCompat.getColor(
-                            resources,
-                            R.color.medium_emphasis_text,
-                            context?.theme
-                        )
-                    )
-                },
-                onEmojiClickListener = {
-                    binding.textEdit.editableText?.append(" ")
-                }
-            )
-        }
-    }
-
     private fun setupListeners() {
-        binding.smileyButton.setOnClickListener { emojiPopup?.toggle() }
         binding.textEdit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence, start: Int, count: Int, after: Int) {
                 // unused atm
@@ -169,17 +148,21 @@ class RenameConversationDialogFragment : DialogFragment() {
     }
 
     private fun setupStateObserver() {
-        viewModel.viewState.observe(viewLifecycleOwner) { state ->
-            when (state) {
-                is RenameConversationViewModel.InitialState -> {}
-                is RenameConversationViewModel.RenamingState -> {}
-                is RenameConversationViewModel.RenamingSuccessState -> handleSuccess()
-                is RenameConversationViewModel.RenamingFailedState -> showError()
-                else -> {}
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect { state ->
+                    if (state.navigateBack) {
+                        handleSuccess()
+                    } else if (state.userMessage != null) {
+                        showError()
+                        viewModel.messageShown()
+                    }
+                }
             }
         }
     }
 
+    @SuppressLint("StringFormatInvalid")
     private fun handleSuccess() {
         eventBus.post(ConversationsListFetchDataEvent())
 
@@ -199,7 +182,7 @@ class RenameConversationDialogFragment : DialogFragment() {
 
     private fun showError() {
         dismiss()
-        Log.e(TAG, "Failed to rename conversation")
+        logger.e(TAG, "Failed to rename conversation")
         Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
     }
 
@@ -208,12 +191,14 @@ class RenameConversationDialogFragment : DialogFragment() {
      */
     companion object {
         private val TAG = RenameConversationDialogFragment::class.java.simpleName
+        private const val KEY_USER = "keyUser"
         private const val KEY_ROOM_TOKEN = "keyRoomToken"
         private const val INITIAL_NAME = "initialName"
 
         @JvmStatic
-        fun newInstance(roomTokenParam: String, initialName: String): RenameConversationDialogFragment {
+        fun newInstance(user: User, roomTokenParam: String, initialName: String): RenameConversationDialogFragment {
             val args = Bundle()
+            args.putParcelable(KEY_USER, user)
             args.putString(KEY_ROOM_TOKEN, roomTokenParam)
             args.putString(INITIAL_NAME, initialName)
             val fragment = RenameConversationDialogFragment()

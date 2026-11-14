@@ -14,22 +14,23 @@ import at.bitfire.dav4jvm.DavResource
 import at.bitfire.dav4jvm.Property
 import at.bitfire.dav4jvm.exception.DavException
 import at.bitfire.dav4jvm.exception.HttpException
+import at.bitfire.dav4jvm.exception.NotFoundException
 import at.bitfire.dav4jvm.property.DisplayName
 import at.bitfire.dav4jvm.property.GetContentType
 import at.bitfire.dav4jvm.property.GetLastModified
 import at.bitfire.dav4jvm.property.ResourceType
 import autodagger.AutoInjector
+import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.application.NextcloudTalkApplication
-import com.nextcloud.talk.components.filebrowser.models.DavResponse
-import com.nextcloud.talk.components.filebrowser.models.properties.NCEncrypted
-import com.nextcloud.talk.components.filebrowser.models.properties.NCPermission
-import com.nextcloud.talk.components.filebrowser.models.properties.NCPreview
-import com.nextcloud.talk.components.filebrowser.models.properties.OCFavorite
-import com.nextcloud.talk.components.filebrowser.models.properties.OCId
-import com.nextcloud.talk.components.filebrowser.models.properties.OCSize
 import com.nextcloud.talk.dagger.modules.RestModule
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.jobs.ShareOperationWorker
+import com.nextcloud.talk.filebrowser.models.DavResponse
+import com.nextcloud.talk.filebrowser.models.properties.NCEncrypted
+import com.nextcloud.talk.filebrowser.models.properties.NCPermission
+import com.nextcloud.talk.filebrowser.models.properties.NCPreview
+import com.nextcloud.talk.filebrowser.models.properties.OCFavorite
+import com.nextcloud.talk.filebrowser.models.properties.OCId
+import com.nextcloud.talk.filebrowser.models.properties.OCSize
 import com.nextcloud.talk.remotefilebrowser.model.RemoteFileBrowserItem
 import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.FileUtils
@@ -49,9 +50,8 @@ import java.util.Locale
 class ChunkedFileUploader(
     okHttpClient: OkHttpClient,
     val currentUser: User,
-    val roomToken: String,
-    val metaData: String?,
-    val listener: OnDataTransferProgressListener
+    val listener: OnDataTransferProgressListener,
+    val ncApiCoroutines: NcApiCoroutines
 ) {
 
     private var okHttpClientNoRedirects: OkHttpClient? = null
@@ -64,9 +64,19 @@ class ChunkedFileUploader(
         remoteChunkUrl = ApiUtils.getUrlForChunkedUpload(currentUser.baseUrl!!, currentUser.userId!!)
     }
 
+    /**
+     * Uploads [localFile] in chunks, skipping chunks that are already on the server, and assembles them at
+     * [targetPath].
+     *
+     * @return false if the upload was aborted or the server answered with an HTTP error
+     * @throws IOException on I/O failures (e.g. connection loss or timeout) and chunk folder creation failures,
+     * so the caller can retry; chunks already on the server are skipped as long as [localFile] is unchanged
+     */
     @Suppress("Detekt.TooGenericExceptionCaught")
+    @Throws(IOException::class)
     fun upload(localFile: File, mimeType: MediaType?, targetPath: String): Boolean {
         try {
+            var isUploadSuccessful = true
             uploadFolderUri = remoteChunkUrl + "/" + FileUtils.md5Sum(localFile)
             val davResource = DavResource(
                 okHttpClientNoRedirects!!,
@@ -82,12 +92,19 @@ class ChunkedFileUploader(
             Log.d(TAG, "missingChunks: " + missingChunks.size)
 
             for (missingChunk in missingChunks) {
-                if (isUploadAborted) return false
+                if (isUploadAborted) {
+                    isUploadSuccessful = false
+                    break
+                }
                 uploadChunk(localFile, uploadFolderUri, mimeType, missingChunk, missingChunk.length())
             }
 
-            assembleChunks(uploadFolderUri, targetPath)
-            return true
+            if (isUploadSuccessful) {
+                assembleChunks(uploadFolderUri, targetPath)
+            }
+            return isUploadSuccessful
+        } catch (e: IOException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Something went wrong in ChunkedFileUploader", e)
             return false
@@ -105,6 +122,7 @@ class ChunkedFileUploader(
                 }
             }
         } catch (e: IOException) {
+            NextcloudTalkApplication.sharedApplication?.logger?.e(TAG, "Failed to create folder for chunked upload", e)
             throw IOException("failed to create folder", e)
         } catch (e: HttpException) {
             if (e.code == METHOD_NOT_ALLOWED_CODE) {
@@ -115,7 +133,7 @@ class ChunkedFileUploader(
         }
     }
 
-    @Suppress("Detekt.ComplexMethod")
+    @Suppress("Detekt.ComplexMethod", "Detekt.ReturnCount")
     private fun getUploadedChunks(davResource: DavResource, uploadFolderUri: String): MutableList<Chunk> {
         val davResponse = DavResponse()
         val memberElements: MutableList<at.bitfire.dav4jvm.Response> = ArrayList()
@@ -135,9 +153,14 @@ class ChunkedFileUploader(
                 Unit
             }
         } catch (e: IOException) {
-            throw IOException("Error reading remote path", e)
+            // PROPFIND on Nextcloud chunked-upload folders can return unexpected responses
+            // (e.g. 200 instead of 207). Treat any failure as "no chunks uploaded yet" so
+            // we fall back to a full upload rather than aborting entirely.
+            Log.w(TAG, "PROPFIND failed — assuming no chunks on server, will upload from scratch: ${e.message}")
+            return ArrayList()
         } catch (e: DavException) {
-            throw IOException("Error reading remote path", e)
+            Log.w(TAG, "PROPFIND failed — assuming no chunks on server, will upload from scratch: ${e.message}")
+            return ArrayList()
         }
         for (memberElement in memberElements) {
             remoteFiles.add(
@@ -263,31 +286,34 @@ class ChunkedFileUploader(
         }
     }
 
-    // @RequiresApi(Build.VERSION_CODES.O)
     private fun initHttpClient(okHttpClient: OkHttpClient, currentUser: User) {
-        val okHttpClientBuilder: OkHttpClient.Builder = okHttpClient.newBuilder()
-        okHttpClientBuilder.followRedirects(false)
-        okHttpClientBuilder.followSslRedirects(false)
-        // okHttpClientBuilder.readTimeout(Duration.ofMinutes(30)) // TODO set timeout
-        okHttpClientBuilder.protocols(listOf(Protocol.HTTP_1_1))
-        okHttpClientBuilder.authenticator(
-            RestModule.HttpAuthenticator(
-                ApiUtils.getCredentials(
-                    currentUser.username,
-                    currentUser.token
-                )!!,
-                "Authorization"
+        val builder = okHttpClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .sslSocketFactory(okHttpClient.sslSocketFactory, okHttpClient.x509TrustManager!!)
+            .hostnameVerifier(okHttpClient.hostnameVerifier)
+            .authenticator(
+                RestModule.HttpAuthenticator(
+                    ApiUtils.getCredentials(
+                        currentUser.username,
+                        currentUser.token
+                    )!!,
+                    "Authorization"
+                )
             )
-        )
-        this.okHttpClientNoRedirects = okHttpClientBuilder.build()
+        okHttpClient.proxy?.let { builder.proxy(it) }
+        this.okHttpClientNoRedirects = builder.build()
     }
 
     private fun assembleChunks(uploadFolderUri: String, targetPath: String) {
-        val destinationUri: String = ApiUtils.getUrlForFileUpload(
+        val destinationUri = ApiUtils.getUrlForFileUpload(
             currentUser.baseUrl!!,
             currentUser.userId!!,
             targetPath
         )
+
+        createRemoteFolder(targetPath)
         val originUri = "$uploadFolderUri/.file"
 
         DavResource(
@@ -297,29 +323,58 @@ class ChunkedFileUploader(
             destinationUri.toHttpUrlOrNull()!!,
             true
         ) { response: Response ->
-            if (response.isSuccessful) {
-                ShareOperationWorker.shareFile(
-                    roomToken,
-                    currentUser,
-                    targetPath,
-                    metaData
-                )
-            } else {
+            if (!response.isSuccessful) {
                 throw IOException("Failed to assemble chunks. response code: " + response.code)
             }
         }
     }
 
+    private fun createRemoteFolder(targetPath: String) {
+        val folderPath = targetPath.substringBeforeLast('/')
+        if (folderPath.isEmpty() || folderPath == "/") return
+        val folderUri = ApiUtils.getUrlForFileUpload(currentUser.baseUrl!!, currentUser.userId!!, folderPath)
+        try {
+            DavResource(okHttpClientNoRedirects!!, folderUri.toHttpUrlOrNull()!!).mkCol(
+                xmlBody = null
+            ) { _ -> }
+        } catch (e: HttpException) {
+            if (e.code != METHOD_NOT_ALLOWED_CODE) {
+                Log.w(TAG, "Unexpected error creating remote folder $folderPath: ${e.code}")
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "Failed to create remote folder $folderPath", e)
+        }
+    }
+
+    /**
+     * Called from the worker's onStopped, which WorkManager runs inside a coroutine cancellation handler:
+     * anything thrown here crashes the process, so this function must never throw.
+     */
+    @Suppress("Detekt.TooGenericExceptionCaught")
     fun abortUpload(onSuccess: () -> Unit) {
         isUploadAborted = true
-        DavResource(
-            okHttpClientNoRedirects!!,
-            uploadFolderUri.toHttpUrlOrNull()!!
-        ).delete { response: Response ->
-            when {
-                response.isSuccessful -> onSuccess()
-                else -> isUploadAborted = false
+        val client = okHttpClientNoRedirects
+        val folderUrl = uploadFolderUri.toHttpUrlOrNull()
+        if (client == null || folderUrl == null) {
+            Log.i(TAG, "Nothing to abort, chunk upload was not started")
+            return
+        }
+        try {
+            DavResource(client, folderUrl).delete { response: Response ->
+                when {
+                    response.isSuccessful -> onSuccess()
+                    else -> isUploadAborted = false
+                }
             }
+        } catch (e: NotFoundException) {
+            Log.i(TAG, "Chunk upload folder could not be found", e)
+            try {
+                onSuccess()
+            } catch (callbackError: Exception) {
+                Log.w(TAG, "Abort callback failed", callbackError)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to remove chunk upload folder", e)
         }
     }
 
@@ -389,7 +444,7 @@ class ChunkedFileUploader(
     }
 
     companion object {
-        private val TAG = ChunkedFileUploader::class.simpleName
+        private val TAG = ChunkedFileUploader::class.java.simpleName
         private const val READ_PERMISSION = "R"
         private const val CHUNK_SIZE: Long = 1024000
         private const val METHOD_NOT_ALLOWED_CODE: Int = 405

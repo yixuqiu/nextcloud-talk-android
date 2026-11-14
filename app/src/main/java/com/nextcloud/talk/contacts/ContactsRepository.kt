@@ -1,0 +1,30 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024 Sowjanya Kota <sowjanya.kch@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.contacts
+
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.autocomplete.AutocompleteOverall
+import com.nextcloud.talk.models.json.autocomplete.AutocompleteUserDto
+import com.nextcloud.talk.models.json.conversations.RoomOverall
+import kotlinx.coroutines.flow.Flow
+
+interface ContactsRepository {
+    suspend fun getContacts(user: User, searchQuery: String?, shareTypes: List<String>): AutocompleteOverall
+
+    suspend fun createRoom(
+        user: User,
+        roomType: String,
+        sourceType: String?,
+        userId: String,
+        conversationName: String?
+    ): RoomOverall
+
+    fun getImageUri(user: User, avatarId: String, requestBigSize: Boolean, isDarkMode: Boolean): String
+
+    fun getContactsFlow(user: User, searchQuery: String?): Flow<List<AutocompleteUserDto>>
+}

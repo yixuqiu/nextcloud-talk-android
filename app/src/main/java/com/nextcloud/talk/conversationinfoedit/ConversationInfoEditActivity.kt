@@ -7,79 +7,47 @@
  */
 package com.nextcloud.talk.conversationinfoedit
 
-import android.app.Activity
-import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.text.TextUtils
 import android.util.Log
-import android.view.Menu
-import android.view.MenuItem
-import android.view.View
+import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.res.stringResource
 import androidx.core.net.toFile
-import androidx.core.view.ViewCompat
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import autodagger.AutoInjector
 import com.github.dhaval2404.imagepicker.ImagePicker
-import com.google.android.material.snackbar.Snackbar
-import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
-import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.components.ColoredStatusBar
+import com.nextcloud.talk.conversationinfoedit.ui.ConversationInfoEditCallbacks
+import com.nextcloud.talk.conversationinfoedit.ui.ConversationInfoEditScreen
 import com.nextcloud.talk.conversationinfoedit.viewmodel.ConversationInfoEditViewModel
-import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.databinding.ActivityConversationInfoEditBinding
-import com.nextcloud.talk.extensions.loadConversationAvatar
-import com.nextcloud.talk.extensions.loadSystemAvatar
-import com.nextcloud.talk.extensions.loadUserAvatar
-import com.nextcloud.talk.models.domain.ConversationModel
-import com.nextcloud.talk.models.domain.ConversationType
-import com.nextcloud.talk.models.json.capabilities.SpreedCapability
-import com.nextcloud.talk.models.json.generic.GenericOverall
-import com.nextcloud.talk.utils.ApiUtils
-import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.PickImage
 import com.nextcloud.talk.utils.bundle.BundleKeys
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
-import io.reactivex.Observer
-import io.reactivex.android.schedulers.AndroidSchedulers
-import io.reactivex.disposables.Disposable
-import io.reactivex.schedulers.Schedulers
-import java.io.File
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
 class ConversationInfoEditActivity : BaseActivity() {
-
-    private lateinit var binding: ActivityConversationInfoEditBinding
-
-    @Inject
-    lateinit var ncApi: NcApi
-
-    @Inject
-    lateinit var currentUserProvider: CurrentUserProviderNew
 
     @Inject
     lateinit var viewModelFactory: ViewModelProvider.Factory
 
     lateinit var conversationInfoEditViewModel: ConversationInfoEditViewModel
 
-    private lateinit var roomToken: String
-    private lateinit var conversationUser: User
-    private lateinit var credentials: String
-
-    private var conversation: ConversationModel? = null
-
-    private lateinit var pickImage: PickImage
-
-    private lateinit var spreedCapabilities: SpreedCapability
+    private var pickImage: PickImage? = null
 
     private val startImagePickerForResult =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             handleResult(it) { result ->
-                pickImage.onImagePickerResult(result.data) { uri ->
-                    uploadAvatar(uri.toFile())
+                pickImage?.onImagePickerResult(result.data) { uri ->
+                    conversationInfoEditViewModel.uploadAvatar(uri.toFile())
                 }
             }
         }
@@ -88,286 +56,95 @@ class ConversationInfoEditActivity : BaseActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) {
         handleResult(it) { result ->
-            pickImage.onSelectRemoteFilesResult(startImagePickerForResult, result.data)
+            pickImage?.onSelectRemoteFilesResult(startImagePickerForResult, result.data)
         }
     }
 
     private val startTakePictureIntentForResult = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        handleResult(it) { result ->
-            pickImage.onTakePictureResult(startImagePickerForResult, result.data)
+        handleResult(it) {
+            pickImage?.onTakePictureResult(startImagePickerForResult)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        val user = setUpBoundUserOrFinish() ?: return
+        // Created right away, so results of the camera or an image picker are handled even when the activity was
+        // recreated after process death and the conversation is still loading.
+        pickImage = PickImage(this, user)
 
-        binding = ActivityConversationInfoEditBinding.inflate(layoutInflater)
-        setupActionBar()
-        setContentView(binding.root)
-        setupSystemColors()
-
-        val extras: Bundle? = intent.extras
-
-        conversationUser = currentUserProvider.currentUser.blockingGet()
-
-        roomToken = extras?.getString(BundleKeys.KEY_ROOM_TOKEN)!!
+        val roomToken = intent.extras?.getString(BundleKeys.KEY_ROOM_TOKEN)!!
 
         conversationInfoEditViewModel =
             ViewModelProvider(this, viewModelFactory)[ConversationInfoEditViewModel::class.java]
 
-        conversationInfoEditViewModel.getRoom(conversationUser, roomToken)
+        conversationInfoEditViewModel.initialize(user, roomToken)
 
-        viewThemeUtils.material.colorTextInputLayout(binding.conversationNameInputLayout)
-        viewThemeUtils.material.colorTextInputLayout(binding.conversationDescriptionInputLayout)
-
-        credentials = ApiUtils.getCredentials(conversationUser.username, conversationUser.token)!!
-
-        pickImage = PickImage(this, conversationUser)
-
-        initObservers()
+        setupCompose()
     }
 
-    override fun onResume() {
-        super.onResume()
-    }
+    private fun setupCompose() {
+        val colorScheme = viewThemeUtils.getColorScheme(this)
+        setContent {
+            val uiState by conversationInfoEditViewModel.uiState.collectAsStateWithLifecycle()
+            val snackbarHostState = remember { SnackbarHostState() }
+            val userMessage = uiState.userMessage
+            val userMessageText = userMessage?.let { stringResource(it) }
 
-    private fun initObservers() {
-        conversationInfoEditViewModel.viewState.observe(this) { state ->
-            when (state) {
-                is ConversationInfoEditViewModel.GetRoomSuccessState -> {
-                    conversation = state.conversationModel
-
-                    spreedCapabilities = conversationUser.capabilities!!.spreedCapability!!
-
-                    binding.conversationName.setText(conversation!!.displayName)
-
-                    if (conversation!!.description != null && conversation!!.description!!.isNotEmpty()) {
-                        binding.conversationDescription.setText(conversation!!.description)
-                    }
-
-                    if (!CapabilitiesUtil.isConversationDescriptionEndpointAvailable(spreedCapabilities)) {
-                        binding.conversationDescription.isEnabled = false
-                    }
-
-                    loadConversationAvatar()
+            LaunchedEffect(userMessage) {
+                if (userMessageText != null) {
+                    snackbarHostState.showSnackbar(userMessageText)
+                    conversationInfoEditViewModel.messageShown()
                 }
+            }
 
-                is ConversationInfoEditViewModel.GetRoomErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
+            LaunchedEffect(uiState.navigateBack) {
+                if (uiState.navigateBack) {
+                    conversationInfoEditViewModel.resetNavigateBack()
+                    setResult(RESULT_OK)
+                    onBackPressedDispatcher.onBackPressed()
                 }
+            }
 
-                is ConversationInfoEditViewModel.UploadAvatarSuccessState -> {
-                    conversation = state.conversationModel
-                    loadConversationAvatar()
-                }
-
-                is ConversationInfoEditViewModel.UploadAvatarErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                }
-
-                is ConversationInfoEditViewModel.DeleteAvatarSuccessState -> {
-                    conversation = state.conversationModel
-                    loadConversationAvatar()
-                }
-
-                is ConversationInfoEditViewModel.DeleteAvatarErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-                }
-
-                else -> {}
+            MaterialTheme(colorScheme = colorScheme) {
+                ColoredStatusBar()
+                ConversationInfoEditScreen(
+                    uiState = uiState,
+                    callbacks = ConversationInfoEditCallbacks(
+                        onNavigateBack = { onBackPressedDispatcher.onBackPressed() },
+                        onSaveClick = { conversationInfoEditViewModel.saveNameAndDescription() },
+                        onAvatarUploadClick = {
+                            pickImage?.selectLocal(startImagePickerForResult = startImagePickerForResult)
+                        },
+                        onAvatarChooseClick = {
+                            pickImage?.selectRemote(
+                                startSelectRemoteFilesIntentForResult = startSelectRemoteFilesIntentForResult
+                            )
+                        },
+                        onAvatarCameraClick = {
+                            pickImage?.takePicture(startTakePictureIntentForResult = startTakePictureIntentForResult)
+                        },
+                        onAvatarDeleteClick = { conversationInfoEditViewModel.deleteAvatar() },
+                        onAvatarEmojiAvatarConfirmed = { emoji, color ->
+                            conversationInfoEditViewModel.onEmojiAvatarConfirmed(emoji, color)
+                        },
+                        onNameChange = { conversationInfoEditViewModel.updateConversationName(it) },
+                        onDescriptionChange = { conversationInfoEditViewModel.updateConversationDescription(it) }
+                    ),
+                    snackbarHostState = snackbarHostState
+                )
             }
         }
-    }
-
-    private fun setupAvatarOptions() {
-        binding.avatarUpload.setOnClickListener {
-            pickImage.selectLocal(startImagePickerForResult = startImagePickerForResult)
-        }
-
-        binding.avatarChoose.setOnClickListener {
-            pickImage.selectRemote(startSelectRemoteFilesIntentForResult = startSelectRemoteFilesIntentForResult)
-        }
-
-        binding.avatarCamera.setOnClickListener {
-            pickImage.takePicture(startTakePictureIntentForResult = startTakePictureIntentForResult)
-        }
-
-        if (conversation?.hasCustomAvatar == true) {
-            binding.avatarDelete.visibility = View.VISIBLE
-            binding.avatarDelete.setOnClickListener { deleteAvatar() }
-        } else {
-            binding.avatarDelete.visibility = View.GONE
-        }
-
-        binding.avatarImage.let { ViewCompat.setTransitionName(it, "userAvatar.transitionTag") }
-
-        binding.let {
-            viewThemeUtils.material.themeFAB(it.avatarUpload)
-            viewThemeUtils.material.themeFAB(it.avatarChoose)
-            viewThemeUtils.material.themeFAB(it.avatarCamera)
-            viewThemeUtils.material.themeFAB(it.avatarDelete)
-        }
-    }
-
-    private fun setupActionBar() {
-        setSupportActionBar(binding.conversationInfoEditToolbar)
-        binding.conversationInfoEditToolbar.setNavigationOnClickListener {
-            onBackPressedDispatcher.onBackPressed()
-        }
-        supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(android.R.color.transparent, null)))
-        supportActionBar?.title = resources!!.getString(R.string.nc_conversation_menu_conversation_info)
-
-        viewThemeUtils.material.themeToolbar(binding.conversationInfoEditToolbar)
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        super.onCreateOptionsMenu(menu)
-        menuInflater.inflate(R.menu.menu_conversation_info_edit, menu)
-        return true
-    }
-
-    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
-        super.onPrepareOptionsMenu(menu)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == R.id.save) {
-            saveConversationNameAndDescription()
-        }
-        return true
-    }
-
-    private fun saveConversationNameAndDescription() {
-        val apiVersion =
-            ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, ApiUtils.API_V1))
-
-        ncApi.renameRoom(
-            credentials,
-            ApiUtils.getUrlForRoom(
-                apiVersion,
-                conversationUser.baseUrl!!,
-                conversation!!.token
-            ),
-            binding.conversationName.text.toString()
-        )
-            .subscribeOn(Schedulers.io())
-            .observeOn(AndroidSchedulers.mainThread())
-            .retry(1)
-            .subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onNext(genericOverall: GenericOverall) {
-                    if (CapabilitiesUtil.isConversationDescriptionEndpointAvailable(spreedCapabilities)) {
-                        saveConversationDescription()
-                    } else {
-                        finish()
-                    }
-                }
-
-                override fun onError(e: Throwable) {
-                    Snackbar.make(
-                        binding.root,
-                        context.getString(R.string.default_error_msg),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                    Log.e(TAG, "Error while saving conversation name", e)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
-    }
-
-    fun saveConversationDescription() {
-        val apiVersion =
-            ApiUtils.getConversationApiVersion(conversationUser, intArrayOf(ApiUtils.API_V4, ApiUtils.API_V1))
-
-        ncApi.setConversationDescription(
-            credentials,
-            ApiUtils.getUrlForConversationDescription(
-                apiVersion,
-                conversationUser.baseUrl!!,
-                conversation!!.token
-            ),
-            binding.conversationDescription.text.toString()
-        )
-            .subscribeOn(Schedulers.io())
-            .observeOn(AndroidSchedulers.mainThread())
-            .retry(1)
-            .subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
-
-                override fun onNext(genericOverall: GenericOverall) {
-                    finish()
-                }
-
-                override fun onError(e: Throwable) {
-                    Snackbar.make(
-                        binding.root,
-                        context.getString(R.string.default_error_msg),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                    Log.e(TAG, "Error while saving conversation description", e)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
     }
 
     private fun handleResult(result: ActivityResult, onResult: (result: ActivityResult) -> Unit) {
         when (result.resultCode) {
-            Activity.RESULT_OK -> onResult(result)
-
-            ImagePicker.RESULT_ERROR -> {
-                Snackbar.make(binding.root, ImagePicker.getError(result.data), Snackbar.LENGTH_SHORT).show()
-            }
-
-            else -> {
-                Log.i(TAG, "Task Cancelled")
-            }
-        }
-    }
-
-    private fun uploadAvatar(file: File) {
-        conversationInfoEditViewModel.uploadConversationAvatar(conversationUser, file, roomToken)
-    }
-
-    private fun deleteAvatar() {
-        conversationInfoEditViewModel.deleteConversationAvatar(conversationUser, roomToken)
-    }
-
-    private fun loadConversationAvatar() {
-        setupAvatarOptions()
-
-        when (conversation!!.type) {
-            ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL -> if (!TextUtils.isEmpty(conversation!!.name)) {
-                conversation!!.name?.let { binding.avatarImage.loadUserAvatar(conversationUser, it, true, false) }
-            }
-
-            ConversationType.ROOM_GROUP_CALL, ConversationType.ROOM_PUBLIC_CALL -> {
-                binding.avatarImage.loadConversationAvatar(conversationUser, conversation!!, false, viewThemeUtils)
-            }
-
-            ConversationType.ROOM_SYSTEM -> {
-                binding.avatarImage.loadSystemAvatar()
-            }
-
-            else -> {
-                // unused atm
-            }
+            RESULT_OK -> onResult(result)
+            ImagePicker.RESULT_ERROR -> Log.e(TAG, "Image picker error: ${ImagePicker.getError(result.data)}")
+            else -> Log.i(TAG, "Task Cancelled")
         }
     }
 

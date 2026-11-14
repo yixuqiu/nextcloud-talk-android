@@ -1,7 +1,7 @@
 <!--
   ~ Nextcloud Talk - Android Client
   ~
-  ~ SPDX-FileCopyrightText: 2021-2024 Google LLC
+  ~ SPDX-FileCopyrightText: 2021-2026 Google LLC
   ~ SPDX-License-Identifier: Apache-2.0
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -10,6 +10,12 @@
     android:viewportWidth="24"
     android:viewportHeight="24">
     <path
-        android:fillColor="#FF0000"
-        android:pathData="M12,2C8.13,2 5,5.13 5,9c0,5.25 7,13 7,13s7,-7.75 7,-13c0,-3.87 -3.13,-7 -7,-7zM12,11.5c-1.38,0 -2.5,-1.12 -2.5,-2.5s1.12,-2.5 2.5,-2.5 2.5,1.12 2.5,2.5 -1.12,2.5 -2.5,2.5z" />
+        android:fillColor="#FFDF3F2F"
+        android:fillType="nonZero"
+        android:pathData="M12,22C9.317,19.717 7.313,17.596 5.988,15.637C4.662,13.679 4,11.867 4,10.2C4,7.7 4.804,5.708 6.412,4.225C8.021,2.742 9.883,2 12,2C14.117,2 15.979,2.742 17.587,4.225C19.196,5.708 20,7.7 20,10.2C20,11.867 19.337,13.679 18.013,15.637C16.688,17.596 14.683,19.717 12,22Z"
+        android:strokeWidth="0.5"
+        android:strokeColor="#000000" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M13.413,11.413C13.021,11.804 12.55,12 12,12C11.45,12 10.979,11.804 10.588,11.413C10.196,11.021 10,10.55 10,10C10,9.45 10.196,8.979 10.588,8.587C10.979,8.196 11.45,8 12,8C12.55,8 13.021,8.196 13.413,8.587C13.804,8.979 14,9.45 14,10C14,10.55 13.804,11.021 13.413,11.413Z" />
 </vector>

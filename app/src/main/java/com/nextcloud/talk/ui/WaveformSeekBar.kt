@@ -14,16 +14,18 @@ import android.graphics.Paint
 import android.util.AttributeSet
 import androidx.annotation.ColorInt
 import androidx.appcompat.widget.AppCompatSeekBar
-import com.nextcloud.talk.utils.AudioUtils
+import androidx.core.graphics.toColorInt
+import com.nextcloud.talk.chat.audio.Waveforms
 import kotlin.math.roundToInt
+import androidx.core.graphics.withSave
 
 class WaveformSeekBar : AppCompatSeekBar {
 
     @ColorInt
-    private var primary: Int = Color.parseColor("#679ff5")
+    private var primary: Int = "#679ff5".toColorInt()
 
     @ColorInt
-    private var secondary: Int = Color.parseColor("#a6c6f7")
+    private var secondary: Int = "#a6c6f7".toColorInt()
     private var rawData: FloatArray = floatArrayOf()
     private var waveData: FloatArray = floatArrayOf()
     private var savedMeasure: Int = 0
@@ -72,7 +74,7 @@ class WaveformSeekBar : AppCompatSeekBar {
         if (usableWidth > MINIMUM_WIDTH && rawData.isNotEmpty() && usableWidth != savedMeasure) {
             savedMeasure = usableWidth
             val numBars = if (usableWidth > VALUE_100) (usableWidth / WIDTH_DIVISOR) else usableWidth / 2f
-            waveData = AudioUtils.shrinkFloatArray(rawData, numBars.roundToInt())
+            waveData = Waveforms.reduce(rawData, numBars.roundToInt())
             invalidate()
         }
     }
@@ -95,27 +97,26 @@ class WaveformSeekBar : AppCompatSeekBar {
         val usableWidth = width - paddingLeft - paddingRight
         val midpoint = usableHeight / 2f
         val maxHeight: Float = usableHeight / MAX_HEIGHT_DIVISOR
-        val barGap: Float = (usableWidth - waveData.size * DEFAULT_BAR_WIDTH) / (waveData.size - 1).toFloat()
+        val barGap: Float = (usableWidth - waveData.size * DEFAULT_BAR_WIDTH) / (waveData.size - 1).toFloat() + 1
 
         canvas?.apply {
-            save()
-            translate(paddingLeft.toFloat(), paddingTop.toFloat())
-            for (i in waveData.indices) {
-                val x: Float = i * (DEFAULT_BAR_WIDTH + barGap) + DEFAULT_BAR_WIDTH / 2f
-                val y: Float = waveData[i] * maxHeight
-                val progress = (x / usableWidth)
-                paint.color = if (progress * max < getProgress()) primary else secondary
-                canvas.drawLine(x, midpoint - y, x, midpoint + y, paint)
+            withSave {
+                translate(paddingLeft.toFloat(), paddingTop.toFloat())
+                for (i in waveData.indices) {
+                    val x: Float = i * (DEFAULT_BAR_WIDTH + barGap) + DEFAULT_BAR_WIDTH / 2f
+                    val y: Float = waveData[i] * maxHeight
+                    val progress = (x / usableWidth)
+                    paint.color = if (progress * max < getProgress()) primary else secondary
+                    canvas.drawLine(x, midpoint - y, x, midpoint + y, paint)
+                }
             }
-
-            restore()
         }
     }
 
     companion object {
-        private const val DEFAULT_BAR_WIDTH: Int = 2
-        private const val MAX_HEIGHT_DIVISOR: Float = 4.0f
-        private const val WIDTH_DIVISOR = 20f
+        private const val DEFAULT_BAR_WIDTH: Int = 3
+        private const val MAX_HEIGHT_DIVISOR: Float = 2.4f
+        private const val WIDTH_DIVISOR = 16f
         private const val VALUE_100 = 100
         private const val MINIMUM_WIDTH = 50
         private val Int.dp: Int

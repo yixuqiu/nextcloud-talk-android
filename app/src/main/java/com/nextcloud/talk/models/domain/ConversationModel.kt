@@ -7,40 +7,47 @@
  */
 package com.nextcloud.talk.models.domain
 
-import com.nextcloud.talk.models.json.conversations.Conversation
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.MessageDraft
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
+import com.nextcloud.talk.models.json.conversations.ConversationDto
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
+import com.nextcloud.talk.models.json.participants.ParticipantDto
 
-class ConversationModel(
-    var roomId: String? = null,
-    var token: String? = null,
-    var name: String? = null,
-    var displayName: String? = null,
-    var description: String? = null,
-    var type: ConversationType? = null,
+data class ConversationModel(
+    var internalId: String,
+    var accountId: Long,
+    var token: String,
+    var name: String,
+    var displayName: String,
+    var description: String,
+    var type: ConversationEnums.ConversationType,
     var lastPing: Long = 0,
-    var participantType: ParticipantType? = null,
+    var participantType: ParticipantDto.ParticipantType,
     var hasPassword: Boolean = false,
-    var sessionId: String? = null,
-    var actorId: String? = null,
-    var actorType: String? = null,
-    var password: String? = null,
+    var sessionId: String,
+    var actorId: String,
+    var actorType: String,
     var favorite: Boolean = false,
     var lastActivity: Long = 0,
     var unreadMessages: Int = 0,
     var unreadMention: Boolean = false,
-    // var lastMessage: .....? = null,
-    var objectType: ObjectType? = null,
-    var notificationLevel: NotificationLevel? = null,
-    var conversationReadOnlyState: ConversationReadOnlyState? = null,
-    var lobbyState: LobbyState? = null,
-    var lobbyTimer: Long? = null,
+    var lastMessage: ChatMessageDto? = null,
+    var objectType: ConversationEnums.ObjectType,
+    var objectId: String = "",
+    var notificationLevel: ConversationEnums.NotificationLevel,
+    var conversationReadOnlyState: ConversationEnums.ConversationReadOnlyState,
+    var lobbyState: ConversationEnums.LobbyState,
+    var lobbyTimer: Long,
     var lastReadMessage: Int = 0,
+    var lastCommonReadMessage: Int = 0,
     var hasCall: Boolean = false,
     var callFlag: Int = 0,
     var canStartCall: Boolean = false,
-    var canLeaveConversation: Boolean? = null,
-    var canDeleteConversation: Boolean? = null,
-    var unreadMentionDirect: Boolean? = null,
-    var notificationCalls: Int? = null,
+    var canLeaveConversation: Boolean,
+    var canDeleteConversation: Boolean,
+    var unreadMentionDirect: Boolean,
+    var notificationCalls: Int,
     var permissions: Int = 0,
     var messageExpiration: Int = 0,
     var status: String? = null,
@@ -48,25 +55,39 @@ class ConversationModel(
     var statusMessage: String? = null,
     var statusClearAt: Long? = 0,
     var callRecording: Int = 0,
-    var avatarVersion: String? = null,
-    var hasCustomAvatar: Boolean? = null,
-    var callStartTime: Long? = null,
+    var avatarVersion: String,
+    var hasCustomAvatar: Boolean,
+    var callStartTime: Long,
     var recordingConsentRequired: Int = 0,
     var remoteServer: String? = null,
-    var remoteToken: String? = null
+    var remoteToken: String? = null,
+    var hasArchived: Boolean = false,
+    var hasSensitive: Boolean = false,
+    var hasImportant: Boolean = false,
+    var tagIds: List<String> = emptyList(),
+    var lastPinnedId: Long? = null,
+    var hiddenPinnedId: Long? = null,
+    var attributes: Int? = null,
+
+    // attributes that don't come from API. This should be changed?!
+    var password: String? = null,
+    var messageDraft: MessageDraft? = MessageDraft(),
+    var hiddenUpcomingEvent: String? = null
 ) {
 
     companion object {
-        fun mapToConversationModel(conversation: Conversation): ConversationModel {
-            return ConversationModel(
-                roomId = conversation.roomId,
+        @Suppress("LongMethod")
+        fun mapToConversationModel(conversation: ConversationDto, user: User): ConversationModel =
+            ConversationModel(
+                internalId = user.id!!.toString() + "@" + conversation.token,
+                accountId = user.id!!,
                 token = conversation.token,
                 name = conversation.name,
                 displayName = conversation.displayName,
                 description = conversation.description,
-                type = conversation.type?.let { ConversationType.valueOf(it.name) },
+                type = conversation.type.let { ConversationEnums.ConversationType.valueOf(it.name) },
                 lastPing = conversation.lastPing,
-                participantType = conversation.participantType?.let { ParticipantType.valueOf(it.name) },
+                participantType = conversation.participantType.let { ParticipantDto.ParticipantType.valueOf(it.name) },
                 hasPassword = conversation.hasPassword,
                 sessionId = conversation.sessionId,
                 actorId = conversation.actorId,
@@ -76,21 +97,23 @@ class ConversationModel(
                 lastActivity = conversation.lastActivity,
                 unreadMessages = conversation.unreadMessages,
                 unreadMention = conversation.unreadMention,
-                // lastMessage = conversation.lastMessage,     to do...
-                objectType = conversation.objectType?.let { ObjectType.valueOf(it.name) },
-                notificationLevel = conversation.notificationLevel?.let {
-                    NotificationLevel.valueOf(
+                lastMessage = conversation.lastMessage,
+                objectType = conversation.objectType.let { ConversationEnums.ObjectType.valueOf(it.name) },
+                objectId = conversation.objectId,
+                notificationLevel = conversation.notificationLevel.let {
+                    ConversationEnums.NotificationLevel.valueOf(
                         it.name
                     )
                 },
-                conversationReadOnlyState = conversation.conversationReadOnlyState?.let {
-                    ConversationReadOnlyState.valueOf(
+                conversationReadOnlyState = conversation.conversationReadOnlyState.let {
+                    ConversationEnums.ConversationReadOnlyState.valueOf(
                         it.name
                     )
                 },
-                lobbyState = conversation.lobbyState?.let { LobbyState.valueOf(it.name) },
+                lobbyState = conversation.lobbyState.let { ConversationEnums.LobbyState.valueOf(it.name) },
                 lobbyTimer = conversation.lobbyTimer,
                 lastReadMessage = conversation.lastReadMessage,
+                lastCommonReadMessage = conversation.lastCommonReadMessage,
                 hasCall = conversation.hasCall,
                 callFlag = conversation.callFlag,
                 canStartCall = conversation.canStartCall,
@@ -110,52 +133,14 @@ class ConversationModel(
                 callStartTime = conversation.callStartTime,
                 recordingConsentRequired = conversation.recordingConsentRequired,
                 remoteServer = conversation.remoteServer,
-                remoteToken = conversation.remoteToken
+                remoteToken = conversation.remoteToken,
+                hasArchived = conversation.hasArchived,
+                hasSensitive = conversation.hasSensitive,
+                hasImportant = conversation.hasImportant,
+                tagIds = conversation.tagIds ?: emptyList(),
+                lastPinnedId = conversation.lastPinnedId,
+                hiddenPinnedId = conversation.hiddenPinnedId,
+                attributes = conversation.attributes
             )
-        }
     }
-}
-
-enum class ConversationType {
-    DUMMY,
-    ROOM_TYPE_ONE_TO_ONE_CALL,
-    ROOM_GROUP_CALL,
-    ROOM_PUBLIC_CALL,
-    ROOM_SYSTEM,
-    FORMER_ONE_TO_ONE,
-    NOTE_TO_SELF
-}
-
-enum class ParticipantType {
-    DUMMY,
-    OWNER,
-    MODERATOR,
-    USER,
-    GUEST,
-    USER_FOLLOWING_LINK,
-    GUEST_MODERATOR
-}
-
-enum class ObjectType {
-    DEFAULT,
-    SHARE_PASSWORD,
-    FILE,
-    ROOM
-}
-
-enum class NotificationLevel {
-    DEFAULT,
-    ALWAYS,
-    MENTION,
-    NEVER
-}
-
-enum class ConversationReadOnlyState {
-    CONVERSATION_READ_WRITE,
-    CONVERSATION_READ_ONLY
-}
-
-enum class LobbyState {
-    LOBBY_STATE_ALL_PARTICIPANTS,
-    LOBBY_STATE_MODERATORS_ONLY
 }

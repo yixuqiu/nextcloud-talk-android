@@ -1,0 +1,96 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2025 Marcel Hibbe <dev@mhibbe.de>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.contextchat
+
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import autodagger.AutoInjector
+import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.chat.data.network.ChatNetworkDataSource
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AutoInjector(NextcloudTalkApplication::class)
+class ContextChatViewModel @Inject constructor(private val chatNetworkDataSource: ChatNetworkDataSource) :
+    ViewModel() {
+
+    var threadId: String? = null
+
+    private val _getContextChatMessagesState =
+        MutableStateFlow<ContextChatRetrieveUiState>(ContextChatRetrieveUiState.None)
+    val getContextChatMessagesState: StateFlow<ContextChatRetrieveUiState> = _getContextChatMessagesState
+
+    @Suppress("LongParameterList")
+    fun getContextForChatMessages(user: User, token: String, threadId: String?, messageId: String, title: String) {
+        viewModelScope.launch {
+            if (!user.hasSpreedFeatureCapability("chat-get-context") ||
+                !user.hasSpreedFeatureCapability("federation-v1")
+            ) {
+                _getContextChatMessagesState.value = ContextChatRetrieveUiState.Error
+            }
+
+            try {
+                var messages = chatNetworkDataSource.getContextForChatMessage(
+                    credentials = user.getCredentials(),
+                    baseUrl = user.baseUrl!!,
+                    token = token,
+                    messageId = messageId,
+                    limit = LIMIT,
+                    threadId = threadId?.toIntOrNull()
+                )
+
+                if (threadId.isNullOrEmpty()) {
+                    messages = messages.filter { !isThreadChildMessage(it) }
+                }
+
+                val subTitle = if (threadId?.isNotEmpty() == true) {
+                    messages.firstOrNull()?.threadTitle
+                } else {
+                    ""
+                }
+
+                _getContextChatMessagesState.value = ContextChatRetrieveUiState.Success(
+                    messageId = messageId,
+                    threadId = threadId,
+                    messages = messages,
+                    title = title,
+                    subTitle = subTitle
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load chat message context", e)
+                _getContextChatMessagesState.value = ContextChatRetrieveUiState.Error
+            }
+        }
+    }
+
+    fun isThreadChildMessage(currentMessage: ChatMessageDto): Boolean =
+        currentMessage.hasThread &&
+            currentMessage.threadId != currentMessage.id
+
+    sealed class ContextChatRetrieveUiState {
+        data object None : ContextChatRetrieveUiState()
+        data class Success(
+            val messageId: String,
+            val threadId: String?,
+            val messages: List<ChatMessageDto>,
+            val title: String?,
+            val subTitle: String?
+        ) : ContextChatRetrieveUiState()
+        data object Error : ContextChatRetrieveUiState()
+    }
+
+    companion object {
+        private val TAG = ContextChatViewModel::class.java.simpleName
+        private const val LIMIT = 50
+    }
+}

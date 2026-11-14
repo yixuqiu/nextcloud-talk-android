@@ -8,45 +8,58 @@
  */
 package com.nextcloud.talk.account
 
+import android.Manifest
 import android.accounts.Account
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.net.Uri
 import android.os.Bundle
 import android.security.KeyChain
 import android.text.TextUtils
-import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.core.net.toUri
+import androidx.core.os.bundleOf
 import autodagger.AutoInjector
+import com.blikoon.qrcodescanner.QrCodeActivity
+import com.github.dhaval2404.imagepicker.util.PermissionUtil
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.snackbar.Snackbar
 import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
+import com.nextcloud.talk.data.network.NetworkMonitor
 import com.nextcloud.talk.databinding.ActivityServerSelectionBinding
 import com.nextcloud.talk.models.json.capabilities.CapabilitiesOverall
-import com.nextcloud.talk.models.json.generic.Status
-import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.models.json.generic.StatusDto
 import com.nextcloud.talk.utils.AccountUtils
 import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.UriUtils
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.bundle.BundleKeys.ADD_ADDITIONAL_ACCOUNT
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_IS_ACCOUNT_IMPORT
-import com.nextcloud.talk.utils.CapabilitiesUtil
+import com.nextcloud.talk.utils.permissions.LocalNetworkPermission
 import com.nextcloud.talk.utils.singletons.ApplicationWideMessageHolder
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.runBlocking
+import java.net.URLDecoder
 import java.security.cert.CertificateException
 import javax.inject.Inject
-import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
+import javax.net.ssl.SSLPeerUnverifiedException
 
+@Suppress("TooManyFunctions")
 @AutoInjector(NextcloudTalkApplication::class)
 class ServerSelectionActivity : BaseActivity() {
 
@@ -56,9 +69,14 @@ class ServerSelectionActivity : BaseActivity() {
     lateinit var ncApi: NcApi
 
     @Inject
-    lateinit var userManager: UserManager
+    lateinit var networkMonitor: NetworkMonitor
 
     private var statusQueryDisposable: Disposable? = null
+
+    // the QR code whose login waits for the local network permission, kept when the activity is recreated
+    private var pendingQrData: String? = null
+
+    private val localNetworkPermission = LocalNetworkPermission(this, { viewThemeUtils }, ::onLocalNetworkResult)
 
     private val onBackPressedCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
@@ -74,17 +92,31 @@ class ServerSelectionActivity : BaseActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sharedApplication!!.componentApplication.inject(this)
+        pendingQrData = savedInstanceState?.getString(KEY_PENDING_QR_DATA)
         binding = ActivityServerSelectionBinding.inflate(layoutInflater)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         setContentView(binding.root)
         actionBar?.hide()
-        setupPrimaryColors()
+        initSystemBars()
 
         onBackPressedDispatcher.addCallback(this, onBackPressedCallback)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_PENDING_QR_DATA, pendingQrData)
+    }
+
     override fun onResume() {
         super.onResume()
+
+        networkMonitor.isOnlineLiveData.observe(this) { connected ->
+            binding.networkErrorWrapper.visibility = if (connected) {
+                View.GONE
+            } else {
+                View.VISIBLE
+            }
+        }
 
         binding.hostUrlInputHelperText.text = String.format(
             resources!!.getString(R.string.nc_server_helper_text),
@@ -96,7 +128,7 @@ class ServerSelectionActivity : BaseActivity() {
             binding.certTextView.visibility = View.GONE
         }
 
-        val loggedInUsers = userManager.users.blockingGet()
+        val loggedInUsers = runBlocking { userManager.getUsers() }
         val availableAccounts = AccountUtils.findAvailableAccountsOnDevice(loggedInUsers)
 
         if (isImportAccountNameSet() && availableAccounts.isNotEmpty()) {
@@ -119,6 +151,8 @@ class ServerSelectionActivity : BaseActivity() {
             false
         }
         binding.certTextView.setOnClickListener { onCertClick() }
+
+        binding.scanQr.setOnClickListener { onScan() }
 
         if (ApplicationWideMessageHolder.getInstance().messageType != null) {
             if (ApplicationWideMessageHolder.getInstance().messageType
@@ -154,10 +188,9 @@ class ServerSelectionActivity : BaseActivity() {
         )
     }
 
-    private fun isAbleToShowProviderLink(): Boolean {
-        return !resources!!.getBoolean(R.bool.hide_provider) &&
+    private fun isAbleToShowProviderLink(): Boolean =
+        !resources!!.getBoolean(R.bool.hide_provider) &&
             !TextUtils.isEmpty(resources!!.getString(R.string.nc_providers_url))
-    }
 
     private fun showImportAccountsInfo(availableAccounts: List<Account>) {
         if (!TextUtils.isEmpty(
@@ -198,37 +231,50 @@ class ServerSelectionActivity : BaseActivity() {
         binding.importOrChooseProviderText.setOnClickListener {
             val browserIntent = Intent(
                 Intent.ACTION_VIEW,
-                Uri.parse(
-                    resources!!
-                        .getString(R.string.nc_providers_url)
-                )
+                resources!!.getString(R.string.nc_providers_url).toUri()
             )
             startActivity(browserIntent)
         }
     }
 
-    private fun isImportAccountNameSet(): Boolean {
-        return !TextUtils.isEmpty(resources!!.getString(R.string.nc_import_account_type))
-    }
+    private fun isImportAccountNameSet(): Boolean =
+        !TextUtils.isEmpty(resources!!.getString(R.string.nc_import_account_type))
 
     @SuppressLint("LongLogTag")
     @Suppress("Detekt.TooGenericExceptionCaught")
     private fun checkServerAndProceed() {
         dispose()
-        var url: String = binding.serverEntryTextInputEditText.text.toString().trim { it <= ' ' }
         showserverEntryProgressBar()
         if (binding.importOrChooseProviderText.visibility != View.INVISIBLE) {
             binding.importOrChooseProviderText.visibility = View.INVISIBLE
             binding.certTextView.visibility = View.INVISIBLE
         }
-        if (url.endsWith("/")) {
-            url = url.substring(0, url.length - 1)
-        }
+        localNetworkPermission.ensure(listOf(enteredServer().first))
+    }
 
-        if (UriUtils.hasHttpProtocolPrefixed(url)) {
-            checkServer(url, false)
-        } else {
-            checkServer("https://$url", true)
+    // The entered server with https:// added when it has no protocol, and whether it had one
+    private fun enteredServer(): Pair<String, Boolean> {
+        val url = binding.serverEntryTextInputEditText.text.toString().trim().removeSuffix("/")
+        val hasProtocol = UriUtils.hasHttpProtocolPrefixed(url)
+        return Pair(if (hasProtocol) url else "https://$url", hasProtocol)
+    }
+
+    private fun onLocalNetworkResult(granted: Boolean) {
+        val qrData = pendingQrData
+        pendingQrData = null
+        when {
+            !granted -> setErrorText(getString(R.string.nc_local_network_permission_denied))
+            qrData != null -> {
+                val intent = Intent(this, BrowserLoginActivity::class.java)
+                intent.putExtras(bundleOf(BundleKeys.KEY_FROM_QR to qrData))
+                startActivity(intent)
+            }
+            else -> {
+                // the result can come to an activity recreated meanwhile, which doesn't show the progress yet
+                val (serverUrl, hasProtocol) = enteredServer()
+                showserverEntryProgressBar()
+                checkServer(serverUrl, !hasProtocol)
+            }
         }
     }
 
@@ -238,60 +284,20 @@ class ServerSelectionActivity : BaseActivity() {
         statusQueryDisposable = ncApi.getServerStatus(queryStatusUrl)
             .subscribeOn(Schedulers.io())
             .observeOn(AndroidSchedulers.mainThread())
-            .subscribe({ status: Status ->
-                val productName = resources!!.getString(R.string.nc_server_product_name)
+            .subscribe({ status: StatusDto ->
                 val versionString: String = status.version!!.substring(0, status.version!!.indexOf("."))
                 val version: Int = versionString.toInt()
 
                 if (isServerStatusQueryable(status) && version >= MIN_SERVER_MAJOR_VERSION) {
                     findServerTalkApp(url)
-                } else if (!status.installed) {
-                    setErrorText(
-                        String.format(
-                            resources!!.getString(R.string.nc_server_not_installed),
-                            productName
-                        )
-                    )
-                } else if (status.needsUpgrade) {
-                    setErrorText(
-                        String.format(
-                            resources!!.getString(R.string.nc_server_db_upgrade_needed),
-                            productName
-                        )
-                    )
-                } else if (status.maintenance) {
-                    setErrorText(
-                        String.format(
-                            resources!!.getString(R.string.nc_server_maintenance),
-                            productName
-                        )
-                    )
-                } else if (!status.version!!.startsWith("13.")) {
-                    setErrorText(
-                        String.format(
-                            resources!!.getString(R.string.nc_server_version),
-                            resources!!.getString(R.string.nc_app_product_name),
-                            productName
-                        )
-                    )
+                } else {
+                    showErrorTextForStatus(status)
                 }
             }, { throwable: Throwable ->
-                if (checkForcedHttps) {
-                    checkServer(queryStatusUrl.replace("https://", "http://"), false)
+                if (checkForcedHttps && !isTlsTrustFailure(throwable)) {
+                    askToFallBackToHttp(url, throwable)
                 } else {
-                    if (throwable.localizedMessage != null) {
-                        setErrorText(throwable.localizedMessage)
-                    } else if (throwable.cause is CertificateException) {
-                        setErrorText(resources!!.getString(R.string.nc_certificate_error))
-                    } else {
-                        hideserverEntryProgressBar()
-                    }
-
-                    if (binding.importOrChooseProviderText.visibility != View.INVISIBLE) {
-                        binding.importOrChooseProviderText.visibility = View.VISIBLE
-                        binding.certTextView.visibility = View.VISIBLE
-                    }
-                    dispose()
+                    showServerCheckError(throwable)
                 }
             }) {
                 hideserverEntryProgressBar()
@@ -301,6 +307,96 @@ class ServerSelectionActivity : BaseActivity() {
                 }
                 dispose()
             }
+    }
+
+    // A certificate or host name failure must never lead to an offer to downgrade to HTTP.
+    private fun isTlsTrustFailure(throwable: Throwable): Boolean {
+        val seen = mutableSetOf<Throwable>()
+        var current: Throwable? = throwable
+        while (current != null && seen.add(current)) {
+            if (current is CertificateException || current is SSLPeerUnverifiedException) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun showServerCheckError(throwable: Throwable) {
+        if (throwable.localizedMessage != null) {
+            setErrorText(throwable.localizedMessage)
+        } else if (throwable.cause is CertificateException) {
+            setErrorText(resources!!.getString(R.string.nc_certificate_error))
+        } else {
+            hideserverEntryProgressBar()
+        }
+
+        if (binding.importOrChooseProviderText.visibility != View.INVISIBLE) {
+            binding.importOrChooseProviderText.visibility = View.VISIBLE
+            binding.certTextView.visibility = View.VISIBLE
+        }
+        dispose()
+    }
+
+    private fun askToFallBackToHttp(httpsUrl: String, httpsError: Throwable) {
+        if (isFinishing || isDestroyed) {
+            dispose()
+            return
+        }
+
+        var confirmed = false
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.nc_server_http_fallback_title)
+            .setMessage(R.string.nc_server_http_fallback_message)
+            .setPositiveButton(R.string.nc_server_http_fallback_confirm) { _, _ ->
+                confirmed = true
+                checkServer(httpsUrl.replaceFirst("https://", "http://"), false)
+            }
+            .setNegativeButton(R.string.nc_cancel, null)
+            .setOnDismissListener {
+                if (!confirmed) {
+                    showServerCheckError(httpsError)
+                }
+            }
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        )
+    }
+
+    private fun showErrorTextForStatus(status: StatusDto) {
+        if (!status.installed) {
+            setErrorText(
+                String.format(
+                    resources!!.getString(R.string.nc_server_not_installed),
+                    resources!!.getString(R.string.nc_server_product_name)
+                )
+            )
+        } else if (status.needsUpgrade) {
+            setErrorText(
+                String.format(
+                    resources!!.getString(R.string.nc_server_db_upgrade_needed),
+                    resources!!.getString(R.string.nc_server_product_name)
+                )
+            )
+        } else if (status.maintenance) {
+            setErrorText(
+                String.format(
+                    resources!!.getString(R.string.nc_server_maintenance),
+                    resources!!.getString(R.string.nc_server_product_name)
+                )
+            )
+        } else if (!status.version!!.startsWith("13.")) {
+            setErrorText(
+                String.format(
+                    resources!!.getString(R.string.nc_server_version),
+                    resources!!.getString(R.string.nc_app_product_name),
+                    resources!!.getString(R.string.nc_server_product_name)
+                )
+            )
+        }
     }
 
     private fun findServerTalkApp(queryUrl: String) {
@@ -331,7 +427,7 @@ class ServerSelectionActivity : BaseActivity() {
                                 val bundle = Bundle()
                                 bundle.putString(BundleKeys.KEY_BASE_URL, queryUrl.replace("/status.php", ""))
 
-                                val intent = Intent(context, WebViewLoginActivity::class.java)
+                                val intent = Intent(context, BrowserLoginActivity::class.java)
                                 intent.putExtras(bundle)
                                 startActivity(intent)
                             }
@@ -346,7 +442,7 @@ class ServerSelectionActivity : BaseActivity() {
                 }
 
                 override fun onError(e: Throwable) {
-                    Log.e(TAG, "Error while checking capabilities", e)
+                    logger.e(TAG, "Error while checking capabilities", e)
                     if (resources != null) {
                         runOnUiThread {
                             setErrorText(resources!!.getString(R.string.nc_common_error_sorry))
@@ -360,23 +456,22 @@ class ServerSelectionActivity : BaseActivity() {
             })
     }
 
-    private fun isServerStatusQueryable(status: Status): Boolean {
-        return status.installed && !status.maintenance && !status.needsUpgrade
-    }
+    private fun isServerStatusQueryable(status: StatusDto): Boolean =
+        status.installed && !status.maintenance && !status.needsUpgrade
 
-    private fun setErrorText(text: String) {
+    private fun setErrorText(text: String?) {
         binding.errorWrapper.visibility = View.VISIBLE
         binding.errorText.text = text
         hideserverEntryProgressBar()
     }
 
     private fun showserverEntryProgressBar() {
-        binding.errorWrapper.visibility = View.INVISIBLE
+        binding.errorWrapper.visibility = View.GONE
         binding.serverEntryProgressBar.visibility = View.VISIBLE
     }
 
     private fun hideserverEntryProgressBar() {
-        binding.serverEntryProgressBar.visibility = View.INVISIBLE
+        binding.serverEntryProgressBar.visibility = View.GONE
     }
 
     @SuppressLint("LongLogTag")
@@ -390,6 +485,48 @@ class ServerSelectionActivity : BaseActivity() {
             hideserverEntryProgressBar()
         }
     }
+
+    private val requestCameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
+            if (isGranted) {
+                // Permission was granted
+                startQRScanner()
+            }
+        }
+
+    fun onScan() {
+        if (PermissionUtil.isPermissionGranted(this, Manifest.permission.CAMERA)) {
+            startQRScanner()
+        } else {
+            requestCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun startQRScanner() {
+        val intent = Intent(this, QrCodeActivity::class.java)
+        qrScanResultLauncher.launch(intent)
+    }
+
+    private val qrScanResultLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                val data = result.data
+
+                if (data == null) {
+                    return@registerForActivityResult
+                }
+
+                val resultData = data.getStringExtra(QR_URI)
+
+                if (resultData == null || !resultData.startsWith("nc")) {
+                    Snackbar.make(binding.root, getString(R.string.qr_code_error), Snackbar.LENGTH_SHORT).show()
+                    return@registerForActivityResult
+                }
+
+                pendingQrData = resultData
+                localNetworkPermission.ensure(listOf(serverFromQr(resultData)))
+            }
+        }
 
     public override fun onDestroy() {
         super.onDestroy()
@@ -409,5 +546,29 @@ class ServerSelectionActivity : BaseActivity() {
     companion object {
         private val TAG = ServerSelectionActivity::class.java.simpleName
         const val MIN_SERVER_MAJOR_VERSION = 13
+        private const val QR_URI = "com.blikoon.qrcodescanner.got_qr_scan_relult"
+        private const val QR_SERVER_KEY = "server:"
+        private const val KEY_PENDING_QR_DATA = "pendingQrData"
+
+        /**
+         * Creates the intent that starts the login: the web login on the server of a branded client, or else the
+         * selection of the server.
+         */
+        fun createLoginIntent(context: Context): Intent {
+            val brandedServerUrl = context.getString(R.string.weblogin_url)
+            return if (brandedServerUrl.isNotEmpty()) {
+                Intent(context, BrowserLoginActivity::class.java).putExtra(BundleKeys.KEY_BASE_URL, brandedServerUrl)
+            } else {
+                Intent(context, ServerSelectionActivity::class.java)
+            }
+        }
+
+        /**
+         * The server of a login QR code, in the format LoginRepository parses: `nc://login/` or `nc://onetime-login/`
+         * followed by `&`-separated elements, one of them the URL-encoded `server:`.
+         */
+        fun serverFromQr(qrData: String): String? =
+            qrData.substringAfter("login/").split('&').firstOrNull { it.startsWith(QR_SERVER_KEY) }
+                ?.let { URLDecoder.decode(it.removePrefix(QR_SERVER_KEY), "UTF-8") }
     }
 }

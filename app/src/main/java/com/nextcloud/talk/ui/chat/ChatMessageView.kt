@@ -1,0 +1,397 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2017-2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.ui.chat
+
+import android.util.Log
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ripple
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.nextcloud.talk.R
+import com.nextcloud.talk.chat.audio.ChatAudioKey
+import com.nextcloud.talk.chat.audio.ChatAudioMetadata
+import com.nextcloud.talk.chat.audio.ChatAudioPlaybackState
+import com.nextcloud.talk.chat.ui.model.ChatMessageUi
+import com.nextcloud.talk.chat.ui.model.MessageTypeContent
+import com.nextcloud.talk.ui.PlaybackSpeed
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+
+private const val QUOTE_HIGHLIGHT_INITIAL_ALPHA = 0.15f
+private const val PREVIEW_WAVEFORM_POINT_ONE = 0.1f
+private const val PREVIEW_WAVEFORM_POINT_TWO = 0.2f
+private const val PREVIEW_WAVEFORM_POINT_THREE = 0.4f
+private const val PREVIEW_WAVEFORM_POINT_FOUR = 0.15f
+private const val PREVIEW_WAVEFORM_POINT_FIVE = 0.3f
+private const val PREVIEW_WAVEFORM_POINT_SIX = 0.5f
+private const val PREVIEW_USER_ID = 1L
+private const val PREVIEW_ROOM_TOKEN = "preview"
+private const val PREVIEW_VOICE_DURATION_MS = 16_000L
+private const val PREVIEW_VOICE_POSITION_MS = 4_000L
+
+private val previewWaveform = listOf(
+    PREVIEW_WAVEFORM_POINT_ONE,
+    PREVIEW_WAVEFORM_POINT_TWO,
+    PREVIEW_WAVEFORM_POINT_THREE,
+    PREVIEW_WAVEFORM_POINT_FOUR,
+    PREVIEW_WAVEFORM_POINT_FIVE,
+    PREVIEW_WAVEFORM_POINT_SIX
+)
+
+private const val QUOTE_HIGHLIGHT_HOLD_MILLIS = 700L
+private const val QUOTE_HIGHLIGHT_FADE_OUT_MILLIS = 1500
+
+data class ChatMessageContext(
+    val isOneToOneConversation: Boolean = false,
+    val conversationThreadId: Long? = null,
+    val hasChatPermission: Boolean = true,
+    val downloadingFileState: List<String> = listOf()
+)
+
+@Suppress("Detekt.LongParameterList")
+data class ChatMessageCallbacks(
+    val onLongClick: ((Int) -> Unit?)? = null,
+    val onSwipeReply: ((Int) -> Unit)? = null,
+    val onFileClick: (Int) -> Unit = {},
+    val onPollClick: (String, String) -> Unit = { _, _ -> },
+    val onVoicePlayPauseClick: (Int) -> Unit = {},
+    val onVoiceSeek: (Int, Float) -> Unit = { _, _ -> },
+    val onVoiceSpeedClick: (Int) -> Unit = {},
+    val onReactionClick: (Int, String) -> Unit = { _, _ -> },
+    val onReactionLongClick: (Int) -> Unit = {},
+    val onOpenThreadClick: (Int) -> Unit = {},
+    val onQuotedMessageClick: (Int) -> Unit = {},
+    val onSystemMessageExpandClick: (Int) -> Unit = {},
+    val onAvatarClick: (Int) -> Unit = {},
+    val onCancelUpload: (String) -> Unit = {}
+)
+
+@Suppress("Detekt.LongParameterList", "Detekt.LongMethod", "Detekt.CyclomaticComplexMethod")
+@Composable
+fun ChatMessageView(
+    message: ChatMessageUi,
+    highlightTriggerKey: Long? = null,
+    isSelected: Boolean = false,
+    highlightSearchTerm: String? = null,
+    context: ChatMessageContext = ChatMessageContext(),
+    callbacks: ChatMessageCallbacks = ChatMessageCallbacks()
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val lastHandledHighlightKey = rememberSaveable(message.id) { mutableStateOf<Long?>(null) }
+    val highlightAlpha = remember { Animatable(0f) }
+
+    LaunchedEffect(highlightTriggerKey) {
+        if (highlightTriggerKey == null || highlightTriggerKey == lastHandledHighlightKey.value) {
+            return@LaunchedEffect
+        }
+
+        lastHandledHighlightKey.value = highlightTriggerKey
+
+        highlightAlpha.snapTo(QUOTE_HIGHLIGHT_INITIAL_ALPHA)
+        delay(QUOTE_HIGHLIGHT_HOLD_MILLIS)
+        highlightAlpha.animateTo(0f, animationSpec = tween(durationMillis = QUOTE_HIGHLIGHT_FADE_OUT_MILLIS))
+    }
+
+    CompositionLocalProvider(
+        LocalMessageLongClickHandler provides { id -> callbacks.onLongClick?.invoke(id) ?: Unit },
+        LocalReactionClickHandler provides callbacks.onReactionClick,
+        LocalReactionLongClickHandler provides callbacks.onReactionLongClick,
+        LocalOpenThreadHandler provides callbacks.onOpenThreadClick,
+        LocalQuotedMessageClickHandler provides callbacks.onQuotedMessageClick,
+        LocalHighlightSearchTerm provides highlightSearchTerm,
+        LocalAvatarClickHandler provides callbacks.onAvatarClick
+    ) {
+        SwipeToReplyContainer(
+            replyable = message.replyable && context.hasChatPermission,
+            onSwipeReply = { callbacks.onSwipeReply?.invoke(message.id) }
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .combinedClickable(
+                        interactionSource = interactionSource,
+                        indication = ripple(),
+                        onClick = {
+                            if (message.isExpandableParent) {
+                                callbacks.onSystemMessageExpandClick(message.id)
+                            } else {
+                                callbacks.onLongClick?.invoke(message.id)
+                            }
+                        },
+                        onDoubleClick = { callbacks.onLongClick?.invoke(message.id) },
+                        onLongClick = { callbacks.onLongClick?.invoke(message.id) }
+                    )
+            ) {
+                Box(modifier = Modifier.padding(horizontal = 12.dp)) {
+                    when (val content = message.content) {
+                        MessageTypeContent.RegularText -> {
+                            TextMessage(
+                                uiMessage = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                highlightSearchTerm = highlightSearchTerm
+                            )
+                        }
+
+                        MessageTypeContent.SystemMessage -> {
+                            SystemMessage(message)
+                        }
+
+                        is MessageTypeContent.Media -> {
+                            MediaMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                chatViewDownloadingFileState = context.downloadingFileState,
+                                onImageClick = callbacks.onFileClick
+                            )
+                        }
+
+                        is MessageTypeContent.LinkPreview -> {
+                            LinkMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId
+                            )
+                        }
+
+                        is MessageTypeContent.Geolocation -> {
+                            GeolocationMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId
+                            )
+                        }
+
+                        is MessageTypeContent.Voice -> {
+                            VoiceMessage(
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                callbacks = callbacks
+                            )
+                        }
+
+                        is MessageTypeContent.AudioFile -> {
+                            AudioFileMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                callbacks = callbacks
+                            )
+                        }
+
+                        is MessageTypeContent.Poll -> {
+                            PollMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                onPollClick = callbacks.onPollClick
+                            )
+                        }
+
+                        is MessageTypeContent.Deck -> {
+                            DeckMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId
+                            )
+                        }
+
+                        is MessageTypeContent.UploadingMedia -> {
+                            UploadingMediaMessage(
+                                typeContent = content,
+                                message = message,
+                                isOneToOneConversation = context.isOneToOneConversation,
+                                conversationThreadId = context.conversationThreadId,
+                                onCancelUpload = callbacks.onCancelUpload
+                            )
+                        }
+
+                        else -> {
+                            Log.d("ChatView", "Unknown message type: $content")
+                        }
+                    }
+                }
+                val useContainerHighlight = highlightSearchTerm.isNullOrBlank() || isSelected
+                if (isSelected && useContainerHighlight) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = QUOTE_HIGHLIGHT_INITIAL_ALPHA))
+                    )
+                } else if (highlightAlpha.value > 0f && useContainerHighlight) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = highlightAlpha.value))
+                    )
+                }
+            }
+        }
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewRegularTextPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(MessageTypeContent.RegularText)
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewRegularLongTextPreview() {
+    PreviewContainer {
+        val uiMessage = createLongBaseMessage(MessageTypeContent.RegularText)
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewSystemMessagePreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(MessageTypeContent.SystemMessage)
+            .copy(message = "You joined the conversation")
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewMediaPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(
+            MessageTypeContent.Media(
+                previewUrl = null,
+                drawableResourceId = R.drawable.ic_mimetype_image,
+                mimeType = ""
+            )
+        )
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewMediaPreviewWithoutCaption() {
+    PreviewContainer {
+        val uiMessage = createBaseMessageWithoutCaption(
+            MessageTypeContent.Media(
+                previewUrl = null,
+                drawableResourceId = R.drawable.ic_mimetype_image,
+                mimeType = ""
+            )
+        )
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewGeolocationPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(
+            MessageTypeContent.Geolocation(
+                id = "geo:52.5200,13.4050",
+                name = "Berlin, Germany",
+                lat = 52.5200,
+                lon = 13.4050
+            )
+        )
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewVoicePreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(MessageTypeContent.Voice).copy(roomToken = PREVIEW_ROOM_TOKEN)
+        val audioUi = ChatAudioUi(
+            playbackState = MutableStateFlow(ChatAudioPlaybackState()),
+            metadata = MutableStateFlow(
+                mapOf(
+                    ChatAudioKey(PREVIEW_USER_ID, PREVIEW_ROOM_TOKEN, uiMessage.id) to ChatAudioMetadata(
+                        durationMs = PREVIEW_VOICE_DURATION_MS,
+                        positionMs = PREVIEW_VOICE_POSITION_MS,
+                        waveform = previewWaveform
+                    )
+                )
+            ),
+            voiceSpeed = MutableStateFlow(PlaybackSpeed.NORMAL),
+            internalUserId = { PREVIEW_USER_ID },
+            loadMetadata = {}
+        )
+        CompositionLocalProvider(LocalChatAudioUi provides audioUi) {
+            ChatMessageView(message = uiMessage)
+        }
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewPollPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(
+            MessageTypeContent.Poll(
+                pollId = "1",
+                pollName = "What's your favorite color?"
+            )
+        )
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewDeckPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(
+            MessageTypeContent.Deck(
+                cardName = "Fix all bugs",
+                stackName = "Todo",
+                boardName = "Talk Android",
+                cardLink = ""
+            )
+        )
+        ChatMessageView(message = uiMessage)
+    }
+}
+
+@ChatMessagePreviews
+@Composable
+private fun ChatMessageViewLinkPreviewPreview() {
+    PreviewContainer {
+        val uiMessage = createBaseMessage(MessageTypeContent.LinkPreview(url = "https://nextcloud.com/"))
+        ChatMessageView(message = uiMessage)
+    }
+}

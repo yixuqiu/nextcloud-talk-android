@@ -21,6 +21,7 @@ target/
 # Local configuration files (sdk path, etc)
 local.properties
 tests/local.properties
+.vscode/
 
 # Mac .DS_Store files
 .DS_Store
@@ -42,6 +43,7 @@ build
 /gradle.properties
 .attach_pid*
 fastlane/Fastfile
+fastlane/ruby
 *.hprof
 captures/
 .navigation/
@@ -88,3 +90,6 @@ freeline_project_description.json
 **/__pycache__/
 
 /gradle/verification-keyring.gpg
+/.claude/settings.local.json
+/.claude/worktrees/
+/.artifacts/

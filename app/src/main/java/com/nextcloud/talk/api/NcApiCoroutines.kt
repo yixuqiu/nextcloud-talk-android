@@ -1,0 +1,655 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024 Sowjanya Kota <sowjanya.kch@gmail.com>
+ * SPDX-FileCopyrightText: 2025 Marcel Hibbe <dev@mhibbe.de>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.api
+
+import com.nextcloud.talk.conversationinfo.CreateRoomRequestDto
+import com.nextcloud.talk.models.json.autocomplete.AutocompleteOverall
+import com.nextcloud.talk.models.json.capabilities.CapabilitiesOverall
+import com.nextcloud.talk.models.json.chat.ChatOverall
+import com.nextcloud.talk.models.json.wipe.WipeCheckResponseDto
+import com.nextcloud.talk.models.json.chat.ChatOverallSingleMessage
+import com.nextcloud.talk.models.json.chatpostattachment.ChatPostAttachmentOverall
+import com.nextcloud.talk.models.json.chatpostattachment.PostConversationAttachmentRequestDto
+import com.nextcloud.talk.models.json.chatprobeattachmentfolder.ChatProbeAttachmentFolderOverall
+import com.nextcloud.talk.models.json.chatprobeattachmentfolder.ProbeConversationAttachmentRequestDto
+import com.nextcloud.talk.models.json.conversations.ConversationPresetsOverall
+import com.nextcloud.talk.models.json.conversations.RoomOverall
+import com.nextcloud.talk.models.json.conversations.RoomsOverall
+import com.nextcloud.talk.models.json.generic.GenericOverall
+import com.nextcloud.talk.models.json.hovercard.HoverCardOverall
+import com.nextcloud.talk.models.json.invitation.InvitationOverall
+import com.nextcloud.talk.models.json.participants.AddParticipantOverall
+import com.nextcloud.talk.models.json.participants.TalkBanDto
+import com.nextcloud.talk.models.json.participants.TalkBanOverall
+import com.nextcloud.talk.models.json.passwordResult.PasswordResultOverall
+import com.nextcloud.talk.models.json.profile.ProfileOverall
+import com.nextcloud.talk.models.json.reactions.ReactionsOverall
+import com.nextcloud.talk.models.json.reminder.ReminderOverall
+import com.nextcloud.talk.models.json.status.StatusOverall
+import com.nextcloud.talk.models.json.status.predefined.PredefinedStatusOverall
+import com.nextcloud.talk.models.json.tags.AssignConversationTagsRequestDto
+import com.nextcloud.talk.models.json.tags.ConversationTagOverall
+import com.nextcloud.talk.models.json.tags.ConversationTagsOverall
+import com.nextcloud.talk.models.json.tags.CreateConversationTagRequestDto
+import com.nextcloud.talk.models.json.tags.ReorderConversationTagsRequestDto
+import com.nextcloud.talk.models.json.tags.UpdateConversationTagRequestDto
+import com.nextcloud.talk.models.json.generic.StatusDto
+import com.nextcloud.talk.models.json.testNotification.TestNotificationOverall
+import com.nextcloud.talk.models.json.threads.ThreadOverall
+import com.nextcloud.talk.models.json.threads.ThreadsOverall
+import com.nextcloud.talk.models.json.unifiedsearch.UnifiedSearchOverall
+import com.nextcloud.talk.models.json.upcomingEvents.UpcomingEventsOverall
+import com.nextcloud.talk.models.json.userAbsence.UserAbsenceOverall
+import com.nextcloud.talk.models.json.userprofile.UserProfileOverall
+import okhttp3.MultipartBody
+import okhttp3.RequestBody
+import retrofit2.Response
+import retrofit2.http.Body
+import retrofit2.http.DELETE
+import retrofit2.http.Field
+import retrofit2.http.FieldMap
+import retrofit2.http.FormUrlEncoded
+import retrofit2.http.GET
+import retrofit2.http.Header
+import retrofit2.http.Multipart
+import retrofit2.http.POST
+import retrofit2.http.PUT
+import retrofit2.http.Part
+import retrofit2.http.Query
+import retrofit2.http.QueryMap
+import retrofit2.http.Url
+
+@Suppress("TooManyFunctions")
+interface NcApiCoroutines {
+    @GET
+    @JvmSuppressWildcards
+    suspend fun getContactsWithSearchParam(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @Query("shareTypes[]") listOfShareTypes: List<String>?,
+        @QueryMap options: Map<String, Any>?
+    ): AutocompleteOverall
+
+    /*
+        QueryMap items are as follows:
+            - "roomType" : ""
+            - "invite" : ""
+
+        Server URL is: baseUrl + ocsApiVersion + spreedApiVersion + /room
+     */
+    @POST
+    suspend fun createRoom(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @QueryMap options: Map<String, String>?
+    ): RoomOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun createRoomForm(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @FieldMap options: Map<String, String>?
+    ): RoomOverall
+
+    @GET
+    suspend fun getConversationPresets(
+        @Header("Authorization") authorization: String?,
+        @Url url: String
+    ): ConversationPresetsOverall
+
+    @POST
+    suspend fun createRoomWithBody(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @Body roomRequest: CreateRoomRequestDto
+    ): RoomOverall
+
+    /*
+        QueryMap items are as follows:
+            - "roomName" : "newName"
+
+        Server URL is: baseUrl + ocsApiVersion + spreedApiVersion + /room/roomToken
+     */
+    @FormUrlEncoded
+    @PUT
+    suspend fun renameRoom(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Field("roomName") roomName: String?
+    ): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun openConversation(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Field("scope") scope: Int
+    ): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setConversationDescription(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Field("description") description: String?
+    ): GenericOverall
+
+    @POST
+    suspend fun addParticipant(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @QueryMap options: Map<String, String>?
+    ): AddParticipantOverall
+
+    @POST
+    suspend fun makeRoomPublic(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun makeRoomPublicWithPassword(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("password") password: String
+    ): GenericOverall
+
+    @DELETE
+    suspend fun makeRoomPrivate(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setPassword(
+        @Header("Authorization") authorization: String?,
+        @Url url: String?,
+        @Field("password") password: String?
+    ): GenericOverall
+
+    @Multipart
+    @POST
+    suspend fun uploadConversationAvatar(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Part attachment: MultipartBody.Part
+    ): RoomOverall
+
+    @DELETE
+    suspend fun deleteConversationAvatar(@Header("Authorization") authorization: String, @Url url: String): RoomOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun setConversationEmojiAvatar(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("emoji") emoji: String,
+        @Field("color") color: String?
+    ): RoomOverall
+
+    @POST
+    suspend fun archiveConversation(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @DELETE
+    suspend fun unarchiveConversation(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @Suppress("LongParameterList")
+    @FormUrlEncoded
+    @POST
+    suspend fun sendChatMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("message") message: String,
+        @Field("actorDisplayName") actorDisplayName: String,
+        @Field("replyTo") replyTo: Int,
+        @Field("silent") sendWithoutNotification: Boolean,
+        @Field("referenceId") referenceId: String,
+        @Field("threadTitle") threadTitle: String?
+    ): ChatOverallSingleMessage
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun editChatMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("message") message: String
+    ): ChatOverallSingleMessage
+
+    @DELETE
+    suspend fun deleteChatMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): ChatOverallSingleMessage
+
+    @FormUrlEncoded
+    @POST
+    suspend fun banActor(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("actorType") actorType: String,
+        @Field("actorId") actorId: String,
+        @Field("internalNote") internalNote: String
+    ): TalkBanDto
+
+    @GET
+    suspend fun listBans(@Header("Authorization") authorization: String, @Url url: String): TalkBanOverall
+
+    @DELETE
+    suspend fun unbanActor(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @POST
+    suspend fun addConversationToFavorites(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @POST
+    suspend fun markConversationAsImportant(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @DELETE
+    suspend fun markConversationAsUnimportant(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @DELETE
+    suspend fun removeConversationFromFavorites(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @POST
+    suspend fun markConversationAsSensitive(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @DELETE
+    suspend fun markConversationAsInsensitive(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): GenericOverall
+
+    @GET
+    suspend fun getConversationTags(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): ConversationTagsOverall
+
+    @POST
+    suspend fun createConversationTag(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: CreateConversationTagRequestDto
+    ): ConversationTagOverall
+
+    @PUT
+    suspend fun updateConversationTag(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: UpdateConversationTagRequestDto
+    ): ConversationTagOverall
+
+    @DELETE
+    suspend fun deleteConversationTag(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @PUT
+    suspend fun reorderConversationTags(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: ReorderConversationTagsRequestDto
+    ): ConversationTagsOverall
+
+    @POST
+    suspend fun assignConversationTags(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: AssignConversationTagsRequestDto
+    ): RoomOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun notificationCalls(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("level") level: Int
+    ): GenericOverall
+
+    @POST
+    suspend fun setReadStatusPrivacy(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: RequestBody
+    ): GenericOverall
+
+    @POST
+    suspend fun setTypingStatusPrivacy(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: RequestBody
+    ): GenericOverall
+
+    @DELETE
+    suspend fun clearChatHistory(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setConversationReadOnly(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("state") state: Int
+    ): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun setNotificationLevel(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("level") level: Int
+    ): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun setMessageExpiration(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("seconds") seconds: Int
+    ): GenericOverall
+
+    @GET
+    suspend fun getOutOfOfficeStatusForUser(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): UserAbsenceOverall
+
+    @GET
+    suspend fun getUpcomingEvents(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): UpcomingEventsOverall
+
+    @POST
+    suspend fun testPushNotifications(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): TestNotificationOverall
+
+    @GET
+    suspend fun getContextOfChatMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Query("limit") limit: Int,
+        @Query("threadId") threadId: Int?
+    ): ChatOverall
+
+    @GET
+    suspend fun getRoom(@Header("Authorization") authorization: String, @Url url: String): RoomOverall
+
+    @GET
+    suspend fun getNoteToSelfRoom(@Header("Authorization") authorization: String, @Url url: String): RoomOverall
+
+    @GET
+    suspend fun getProfile(@Header("Authorization") authorization: String, @Url url: String): ProfileOverall
+
+    @DELETE
+    suspend fun unbindRoom(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @DELETE
+    suspend fun leaveRoom(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @GET
+    suspend fun getThreads(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Query("limit") limit: Int?
+    ): ThreadsOverall
+
+    @GET
+    suspend fun getThread(@Header("Authorization") authorization: String, @Url url: String): ThreadOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun setThreadNotificationLevel(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("level") level: Int
+    ): ThreadOverall
+
+    @GET
+    suspend fun getOpenConversations(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Query("searchTerm") searchTerm: String?
+    ): RoomsOverall
+
+    @GET
+    suspend fun getInvitations(@Header("Authorization") authorization: String, @Url url: String): InvitationOverall
+
+    @GET
+    suspend fun status(@Header("Authorization") authorization: String, @Url url: String): StatusOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setStatusType(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("statusType") statusType: String
+    ): GenericOverall
+
+    @GET
+    suspend fun getPredefinedStatuses(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): PredefinedStatusOverall
+
+    @GET
+    suspend fun backupStatus(@Header("Authorization") authorization: String, @Url url: String): StatusOverall
+
+    @DELETE
+    suspend fun statusDeleteMessage(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setPredefinedStatusMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("messageId") messageId: String,
+        @Field("clearAt") clearAt: Long?
+    ): GenericOverall
+
+    @FormUrlEncoded
+    @PUT
+    suspend fun setCustomStatusMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("statusIcon") statusIcon: String?,
+        @Field("message") message: String,
+        @Field("clearAt") clearAt: Long?
+    ): GenericOverall
+
+    @DELETE
+    suspend fun revertStatus(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun pinMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("pinUntil") pinUntil: Int
+    ): ChatOverallSingleMessage
+
+    @DELETE
+    suspend fun unPinMessage(@Header("Authorization") authorization: String, @Url url: String): ChatOverallSingleMessage
+
+    @DELETE
+    suspend fun hidePinnedMessage(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    @Suppress("LongParameterList")
+    suspend fun sendScheduleChatMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("message") message: String,
+        @Field("replyTo") replyTo: Int?,
+        @Field("silent") sendWithoutNotification: Boolean,
+        @Field("threadTitle") threadTitle: String?,
+        @Field("threadId") threadId: Long?,
+        @Field("sendAt") sendAt: Int?
+    ): ChatOverallSingleMessage
+
+    @FormUrlEncoded
+    @POST
+    suspend fun updateScheduledMessage(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("message") message: String,
+        @Field("sendAt") sendAt: Int?,
+        @Field("silent") sendWithoutNotification: Boolean
+    ): ChatOverallSingleMessage
+
+    @DELETE
+    suspend fun deleteScheduleMessage(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @GET
+    suspend fun getScheduledMessage(@Header("Authorization") authorization: String, @Url url: String): ChatOverall
+
+    @GET
+    suspend fun pullChatMessages(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @QueryMap fields: Map<String, Int>
+    ): Response<ChatOverall>
+
+    @POST
+    suspend fun sendReaction(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Query("reaction") reaction: String
+    ): GenericOverall
+
+    @DELETE
+    suspend fun deleteReaction(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Query("reaction") reaction: String
+    ): GenericOverall
+
+    @GET
+    suspend fun hoverCard(@Header("Authorization") authorization: String, @Url url: String): HoverCardOverall
+
+    @GET
+    suspend fun getReactions(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Query("reaction") reaction: String?
+    ): ReactionsOverall
+
+    @Suppress("LongParameterList")
+    @GET
+    suspend fun performUnifiedSearch(
+        @Header("Authorization") authorization: String?,
+        @Url url: String,
+        @Query("term") term: String,
+        @Query("from") fromUrl: String?,
+        @Query("limit") limit: Int,
+        @Query("cursor") cursor: Int
+    ): UnifiedSearchOverall
+
+    // Url is: /api/{apiVersion}/chat/{token}/read
+    @FormUrlEncoded
+    @POST
+    suspend fun setChatReadMarker(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("lastReadMessage") lastReadMessage: Int?
+    ): GenericOverall
+
+    // Url is: /api/{apiVersion}/chat/{token}/read
+    @DELETE
+    suspend fun markRoomAsUnread(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @POST
+    suspend fun probeConversationAttachmentFolder(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body request: ProbeConversationAttachmentRequestDto
+    ): ChatProbeAttachmentFolderOverall
+
+    @POST
+    suspend fun postConversationAttachment(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: PostConversationAttachmentRequestDto
+    ): ChatPostAttachmentOverall
+
+    @PUT
+    suspend fun uploadFile(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Body body: RequestBody
+    ): Response<GenericOverall>
+
+    @FormUrlEncoded
+    @POST
+    suspend fun checkRemoteWipe(@Url url: String, @Field("token") token: String): Response<WipeCheckResponseDto>
+
+    @FormUrlEncoded
+    @POST
+    suspend fun reportRemoteWipeSuccess(@Url url: String, @Field("token") token: String): Response<Unit>
+
+    @FormUrlEncoded
+    @POST
+    suspend fun validatePassword(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("password") password: String
+    ): PasswordResultOverall
+
+    @GET
+    suspend fun generatePassword(
+        @Header("Authorization") authorization: String,
+        @Url url: String
+    ): PasswordResultOverall
+
+    @GET
+    suspend fun getCapabilities(@Header("Authorization") authorization: String?, @Url url: String): CapabilitiesOverall
+
+    @GET
+    suspend fun getServerStatus(@Url url: String): StatusDto
+
+    @GET
+    suspend fun getUserProfile(@Header("Authorization") authorization: String, @Url url: String): UserProfileOverall
+
+    @GET
+    suspend fun getReminder(@Header("Authorization") authorization: String, @Url url: String): ReminderOverall
+
+    @DELETE
+    suspend fun deleteReminder(@Header("Authorization") authorization: String, @Url url: String): GenericOverall
+
+    @FormUrlEncoded
+    @POST
+    suspend fun setReminder(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("timestamp") timestamp: Int
+    ): ReminderOverall
+
+    @Suppress("LongParameterList")
+    @FormUrlEncoded
+    @POST
+    suspend fun sendLocation(
+        @Header("Authorization") authorization: String,
+        @Url url: String,
+        @Field("objectType") objectType: String,
+        @Field("objectId") objectId: String,
+        @Field("metaData") metaData: String,
+        @Field("referenceId") referenceId: String
+    ): GenericOverall
+}

@@ -9,24 +9,23 @@ package com.nextcloud.talk.data.source.local.converters
 
 import androidx.room.TypeConverter
 import com.bluelinelabs.logansquare.LoganSquare
-import com.nextcloud.talk.models.json.capabilities.Capabilities
+import com.nextcloud.talk.models.json.capabilities.CapabilitiesDto
 
 class CapabilitiesConverter {
     @TypeConverter
-    fun fromCapabilitiesToString(capabilities: Capabilities?): String {
-        return if (capabilities == null) {
+    fun fromCapabilitiesToString(capabilities: CapabilitiesDto?): String =
+        if (capabilities == null) {
             ""
         } else {
             LoganSquare.serialize(capabilities)
         }
-    }
 
     @TypeConverter
-    fun fromStringToCapabilities(value: String): Capabilities? {
+    fun fromStringToCapabilities(value: String): CapabilitiesDto? {
         return if (value.isBlank()) {
             null
         } else {
-            return LoganSquare.parse(value, Capabilities::class.java)
+            return LoganSquare.parse(value, CapabilitiesDto::class.java)
         }
     }
 }

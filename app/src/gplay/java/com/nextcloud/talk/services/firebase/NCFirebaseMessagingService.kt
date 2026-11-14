@@ -21,6 +21,7 @@ import com.nextcloud.talk.jobs.NotificationWorker
 import com.nextcloud.talk.jobs.PushRegistrationWorker
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.preferences.AppPreferences
+import com.nextcloud.talk.utils.setExpeditedIfSupported
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
@@ -53,6 +54,7 @@ class NCFirebaseMessagingService : FirebaseMessagingService() {
                 .build()
             val notificationWork =
                 OneTimeWorkRequest.Builder(NotificationWorker::class.java).setInputData(messageData)
+                    .setExpeditedIfSupported()
                     .build()
             WorkManager.getInstance().enqueue(notificationWork)
         }

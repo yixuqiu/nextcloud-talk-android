@@ -14,18 +14,19 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.translate.repositories.TranslateRepository
-import com.nextcloud.talk.translate.repositories.model.Language
-import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.translate.repositories.model.LanguageDto
 import com.nextcloud.talk.utils.ApiUtils
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
-import javax.inject.Inject
 
-class TranslateViewModel @Inject constructor(
+class TranslateViewModel @AssistedInject constructor(
     private val repository: TranslateRepository,
-    private val userManager: UserManager
+    @Assisted private val currentUser: User
 ) : ViewModel() {
 
     sealed interface ViewState
@@ -33,7 +34,7 @@ class TranslateViewModel @Inject constructor(
     data object StartState : ViewState
     class TranslatedState(val msg: String) : ViewState
 
-    class LanguagesRetrievedState(val list: List<Language>) : ViewState
+    class LanguagesRetrievedState(val list: List<LanguageDto>) : ViewState
 
     data object LanguagesErrorState : ViewState
 
@@ -44,7 +45,6 @@ class TranslateViewModel @Inject constructor(
         get() = _viewState
 
     fun translateMessage(toLanguage: String, fromLanguage: String?, text: String) {
-        val currentUser: User = userManager.currentUser.blockingGet()
         val authorization: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
         val url: String = ApiUtils.getUrlForTranslation(currentUser.baseUrl!!)
         val calculatedFromLanguage =
@@ -67,14 +67,13 @@ class TranslateViewModel @Inject constructor(
     }
 
     fun getLanguages() {
-        val currentUser: User = userManager.currentUser.blockingGet()
         val authorization: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
         val url: String = ApiUtils.getUrlForLanguages(currentUser.baseUrl!!)
         Log.d(TAG, "URL is: $url")
         repository.getLanguages(authorization, url)
             .subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<List<Language>> {
+            ?.subscribe(object : Observer<List<LanguageDto>> {
                 override fun onSubscribe(d: Disposable) {
                     // unused atm
                 }
@@ -88,7 +87,7 @@ class TranslateViewModel @Inject constructor(
                     // unused atm
                 }
 
-                override fun onNext(list: List<Language>) {
+                override fun onNext(list: List<LanguageDto>) {
                     _viewState.value = LanguagesRetrievedState(list)
                     Log.d(TAG, "Languages retrieved: $list")
                 }
@@ -113,6 +112,12 @@ class TranslateViewModel @Inject constructor(
             // nothing?
         }
     }
+
+    @AssistedFactory
+    interface Factory {
+        fun build(user: User): TranslateViewModel
+    }
+
     companion object {
         private val TAG = TranslateViewModel::class.simpleName
     }

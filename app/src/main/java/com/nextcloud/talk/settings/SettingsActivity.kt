@@ -15,12 +15,12 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.annotation.SuppressLint
 import android.app.KeyguardManager
+import android.app.NotificationManager
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.PorterDuff
-import android.graphics.drawable.ColorDrawable
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
@@ -32,11 +32,20 @@ import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.core.content.res.ResourcesCompat
+import androidx.core.graphics.drawable.toDrawable
+import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.work.OneTimeWorkRequest
+import com.nextcloud.talk.utils.AppTasks
+import com.nextcloud.talk.utils.bundle.BundleKeys
+import com.nextcloud.talk.utils.setExpeditedIfSupported
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import autodagger.AutoInjector
@@ -47,16 +56,24 @@ import com.nextcloud.android.common.ui.theme.utils.ColorRole
 import com.nextcloud.talk.BuildConfig
 import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
-import com.nextcloud.talk.activities.MainActivity
 import com.nextcloud.talk.api.NcApi
+import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.setAppTheme
 import com.nextcloud.talk.conversationlist.ConversationsListActivity
+import com.nextcloud.talk.conversationlist.ConversationsListActivity.Companion.NOTIFICATION_WARNING_DATE_NOT_SET
+import com.nextcloud.talk.data.network.NetworkMonitor
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.ActivitySettingsBinding
-import com.nextcloud.talk.diagnose.DiagnoseActivity
+import com.nextcloud.talk.diagnosis.DiagnosisActivity
+import com.nextcloud.talk.diagnosis.buildDiagnosisReportText
+import com.nextcloud.talk.diagnosis.showShareReportDialog
+import com.nextcloud.talk.errorhandling.saveLogsAsZip
+import com.nextcloud.talk.logger.Level
+import com.nextcloud.talk.logger.LogsRepository
+import com.nextcloud.talk.logger.ui.LogsActivity
 import com.nextcloud.talk.jobs.AccountRemovalWorker
-import com.nextcloud.talk.jobs.CapabilitiesWorker
+import com.nextcloud.talk.jobs.CapabilitiesSyncWorker
 import com.nextcloud.talk.jobs.ContactAddressBookWorker
 import com.nextcloud.talk.jobs.ContactAddressBookWorker.Companion.checkPermission
 import com.nextcloud.talk.jobs.ContactAddressBookWorker.Companion.deleteAll
@@ -64,18 +81,19 @@ import com.nextcloud.talk.models.json.generic.GenericOverall
 import com.nextcloud.talk.models.json.userprofile.UserProfileOverall
 import com.nextcloud.talk.profile.ProfileActivity
 import com.nextcloud.talk.ui.dialog.SetPhoneNumberDialogFragment
-import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.ClosedInterfaceImpl
 import com.nextcloud.talk.utils.DisplayUtils
+import com.nextcloud.talk.utils.DrawableUtils
 import com.nextcloud.talk.utils.LoggingUtils.sendMailWithAttachment
 import com.nextcloud.talk.utils.NotificationUtils
 import com.nextcloud.talk.utils.NotificationUtils.getCallRingtoneUri
 import com.nextcloud.talk.utils.NotificationUtils.getMessageRingtoneUri
 import com.nextcloud.talk.utils.SecurityUtils
 import com.nextcloud.talk.utils.SpreedFeatures
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.utils.UnifiedPushUtils
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SCROLL_TO_NOTIFICATION_CATEGORY
 import com.nextcloud.talk.utils.permissions.PlatformPermissionUtil
 import com.nextcloud.talk.utils.power.PowerManagerUtils
 import com.nextcloud.talk.utils.preferences.AppPreferencesImpl
@@ -89,8 +107,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.unifiedpush.android.connector.UnifiedPush
+import retrofit2.HttpException
 import java.net.URI
 import java.net.URISyntaxException
 import java.util.Locale
@@ -98,20 +120,37 @@ import javax.inject.Inject
 
 @Suppress("LargeClass", "TooManyFunctions")
 @AutoInjector(NextcloudTalkApplication::class)
-class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNumberDialogClickListener {
+class SettingsActivity :
+    BaseActivity(),
+    SetPhoneNumberDialogFragment.SetPhoneNumberDialogClickListener {
     private lateinit var binding: ActivitySettingsBinding
 
     @Inject
     lateinit var ncApi: NcApi
 
     @Inject
-    lateinit var userManager: UserManager
+    lateinit var networkMonitor: NetworkMonitor
 
     @Inject
-    lateinit var currentUserProvider: CurrentUserProviderNew
+    lateinit var ncApiCoroutines: NcApiCoroutines
 
     @Inject
     lateinit var platformPermissionUtil: PlatformPermissionUtil
+
+    @Inject
+    lateinit var logsRepository: LogsRepository
+
+    private val saveZipLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+            if (uri != null) {
+                val diagnosisText = buildDiagnosisReportText(this, userManager, appPreferences, logsRepository)
+                lifecycleScope.launch(Dispatchers.IO) {
+                    contentResolver.openOutputStream(uri)?.use { os ->
+                        saveLogsAsZip(this@SettingsActivity, os, diagnosisText)
+                    }
+                }
+            }
+        }
 
     private var currentUser: User? = null
     private var credentials: String? = null
@@ -126,25 +165,29 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
     private lateinit var phoneBookIntegrationFlow: Flow<Boolean>
     private var profileQueryDisposable: Disposable? = null
     private var dbQueryDisposable: Disposable? = null
+    private var openedByNotificationWarning: Boolean = false
+    private var isOnline: MutableState<Boolean> = mutableStateOf(false)
 
+    @SuppressLint("StringFormatInvalid")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        setCurrentUser(setUpBoundUserOrFinish() ?: return)
+        networkMonitor.isOnlineLiveData.observe(this) { online ->
+            isOnline.value = online
+            handleNetworkChange(isOnline.value)
+        }
 
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setupActionBar()
         setContentView(binding.root)
-        setupSystemColors()
+        initSystemBars()
 
         binding.avatarImage.let { ViewCompat.setTransitionName(it, "userAvatar.transitionTag") }
 
-        getCurrentUser()
+        handleIntent(intent)
 
-        setupLicenceSetting()
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            binding.settingsIncognitoKeyboard.visibility = View.GONE
-        }
+        setupLicenceSetting(isOnline.value)
 
         binding.settingsScreenLockSummary.text = String.format(
             Locale.getDefault(),
@@ -152,14 +195,31 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             resources!!.getString(R.string.nc_app_product_name)
         )
 
-        setupDiagnose()
-        setupPrivacyUrl()
-        setupSourceCodeUrl()
+        setupDiagnosis()
+
+        setupPrivacyUrl(isOnline.value)
+        setupSourceCodeUrl(isOnline.value)
+
         binding.settingsVersionSummary.text = String.format("v" + BuildConfig.VERSION_NAME)
 
-        setupPhoneBookIntegration()
+        setupPhoneBookIntegration(isOnline.value)
 
         setupClientCertView()
+        showSetupClientCertView(isOnline.value)
+    }
+
+    private fun handleNetworkChange(isOnline: Boolean) {
+        setupLicenceSetting(isOnline)
+        setupPrivacyUrl(isOnline)
+        setupSourceCodeUrl(isOnline)
+        setupPhoneBookIntegration(isOnline)
+        setupCheckables(isOnline)
+        showSetupClientCertView(isOnline)
+    }
+
+    private fun handleIntent(intent: Intent) {
+        val extras: Bundle? = intent.extras
+        openedByNotificationWarning = extras?.getBoolean(KEY_SCROLL_TO_NOTIFICATION_CATEGORY) ?: false
     }
 
     override fun onResume() {
@@ -167,7 +227,15 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         supportActionBar?.show()
         dispose(null)
 
-        loadCapabilitiesAndUpdateSettings()
+        binding.logsSubtitle.setText(
+            when {
+                logsRepository.minimumLevel == Level.NONE -> R.string.nc_logs_logging_disabled_note
+                logsRepository.minimumLevel <= Level.DEBUG -> R.string.nc_logs_advanced_logging_enabled_warning
+                else -> R.string.nc_logs_logging_enabled
+            }
+        )
+
+        loadCapabilitiesAndUpdateSettings(isOnline.value)
 
         binding.settingsVersion.setOnClickListener {
             sendLogs()
@@ -179,7 +247,8 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             binding.settingsClientCertTitle.setText(R.string.nc_client_cert_setup)
         }
 
-        setupCheckables()
+        setupCheckables(isOnline.value)
+        setupEcosystemSetting()
         setupScreenLockSetting()
         setupNotificationSettings()
         setupProxyTypeSettings()
@@ -187,7 +256,7 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         registerChangeListeners()
 
         if (currentUser != null) {
-            binding.domainText.text = Uri.parse(currentUser!!.baseUrl).host
+            binding.domainText.text = currentUser!!.baseUrl!!.toUri().host
             setupServerAgeWarning()
             if (currentUser!!.displayName != null) {
                 binding.nameText.text = currentUser!!.displayName
@@ -205,22 +274,48 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         binding.settingsName.visibility = View.VISIBLE
         binding.settingsName.setOnClickListener {
             val intent = Intent(this, ProfileActivity::class.java)
+            intent.putExtra(BundleKeys.KEY_INTERNAL_USER_ID, currentUser!!.id)
             startActivity(intent)
         }
 
         themeTitles()
         themeSwitchPreferences()
+
+        if (openedByNotificationWarning) {
+            scrollToNotificationCategory()
+        }
     }
 
-    private fun loadCapabilitiesAndUpdateSettings() {
-        val capabilitiesWork = OneTimeWorkRequest.Builder(CapabilitiesWorker::class.java).build()
+    private fun setupEcosystemSetting() {
+        if (getResources().getBoolean(R.bool.is_branded_client)) {
+            binding.settingsShowEcosystem.visibility = View.GONE
+        } else {
+            binding.settingsShowEcosystem.visibility = View.VISIBLE
+        }
+    }
+
+    @Suppress("MagicNumber")
+    private fun scrollToNotificationCategory() {
+        binding.scrollView.post {
+            val scrollViewLocation = IntArray(2)
+            val targetLocation = IntArray(2)
+            binding.scrollView.getLocationOnScreen(scrollViewLocation)
+            binding.settingsNotificationsCategory.getLocationOnScreen(targetLocation)
+            val offset = targetLocation[1] - scrollViewLocation[1]
+            binding.scrollView.scrollBy(0, offset)
+        }
+    }
+
+    private fun loadCapabilitiesAndUpdateSettings(isOnline: Boolean) {
+        val capabilitiesWork = OneTimeWorkRequest.Builder(CapabilitiesSyncWorker::class.java)
+            .setExpeditedIfSupported()
+            .build()
         WorkManager.getInstance(context).enqueue(capabilitiesWork)
 
         WorkManager.getInstance(context).getWorkInfoByIdLiveData(capabilitiesWork.id)
             .observe(this) { workInfo ->
-                if (workInfo?.state == WorkInfo.State.SUCCEEDED) {
-                    getCurrentUser()
-                    setupCheckables()
+                if (workInfo?.state == WorkInfo.State.SUCCEEDED && reloadCurrentUser()) {
+                    setupCheckables(isOnline)
                 }
             }
     }
@@ -232,21 +327,35 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(android.R.color.transparent, null)))
+        supportActionBar?.setIcon(resources!!.getColor(android.R.color.transparent, null).toDrawable())
         supportActionBar?.title = context.getString(R.string.nc_settings)
         viewThemeUtils.material.themeToolbar(binding.settingsToolbar)
     }
 
-    private fun getCurrentUser() {
-        currentUser = currentUserProvider.currentUser.blockingGet()
-        credentials = ApiUtils.getCredentials(currentUser!!.username, currentUser!!.token)
+    private fun setCurrentUser(user: User) {
+        currentUser = user
+        credentials = ApiUtils.getCredentials(user.username, user.token)
     }
 
-    private fun setupPhoneBookIntegration() {
+    /**
+     * Loads the account of this screen again, e.g. for updated capabilities. Finishes the activity and returns false
+     * if it was removed meanwhile.
+     */
+    private fun reloadCurrentUser(): Boolean {
+        val user = runBlocking { userManager.getUserWithInternalId(resolveUserIdFromIntent()) } ?: run {
+            finish()
+            return false
+        }
+        setCurrentUser(user)
+        return true
+    }
+
+    private fun setupPhoneBookIntegration(isOnline: Boolean) {
         if (CapabilitiesUtil.hasSpreedFeatureCapability(
-                currentUser?.capabilities?.spreedCapability!!,
+                currentUser?.capabilities?.spreedCapability,
                 SpreedFeatures.PHONEBOOK_SEARCH
-            )
+            ) &&
+            isOnline
         ) {
             binding.settingsPhoneBookIntegration.visibility = View.VISIBLE
         } else {
@@ -255,32 +364,98 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
     }
 
     private fun setupNotificationSettings() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            binding.settingsNotificationsTitle.text = resources!!.getString(
-                R.string.nc_settings_notification_sounds_post_oreo
-            )
-        }
+        setupUnifiedPushSettings()
         setupNotificationSoundsSettings()
         setupNotificationPermissionSettings()
+        setupFullScreenIntentPermissionSetting()
+        setupServerNotificationAppCheck()
     }
 
+    private fun showUnifiedPushToggle(): Boolean =
+        UnifiedPushUtils.getExternalDistributors(this).isNotEmpty() &&
+            runBlocking { userManager.getUsers() }.all { it.hasWebPushCapability }
+
+    private fun setupUnifiedPushSettings() {
+        // If any user doesn't support web push, or there is no UnifiedPush
+        // service (distributor) available: hide the feature.
+        //
+        // We could provide the feature as soon as one user supports web push,
+        // but for simplicity (UX & dev), and at least in a first step:
+        // we require that all the users support webpush
+        if (!showUnifiedPushToggle()) {
+            binding.settingsUnifiedpush.visibility = View.GONE
+            binding.settingsUnifiedpushService.visibility = View.GONE
+        } else {
+            val nDistrib = UnifiedPushUtils.getExternalDistributors(context).size
+            binding.settingsUnifiedpush.visibility = View.VISIBLE
+            binding.settingsUnifiedpushSwitch.isChecked = appPreferences.useUnifiedPush
+            binding.settingsUnifiedpush.setOnClickListener {
+                val checked = !appPreferences.useUnifiedPush
+                appPreferences.useUnifiedPush = checked
+                binding.settingsUnifiedpushSwitch.isChecked = checked
+                setupNotificationPermissionSettings()
+                setupUnifiedPushServiceSelectionVisibility(nDistrib)
+                if (checked) {
+                    UnifiedPushUtils.useDefaultDistributor(this) { distrib ->
+                        Log.d(TAG, "Registered to $distrib")
+                        binding.settingsUnifiedpushServiceSummary.text = distrib
+                    }
+                } else {
+                    UnifiedPushUtils.disableExternalUnifiedPush(this)
+                }
+            }
+            // To use non-default service
+            binding.settingsUnifiedpushService.setOnClickListener {
+                UnifiedPushUtils.pickDistributor(this) { distrib ->
+                    Log.d(TAG, "Registered to $distrib")
+                    binding.settingsUnifiedpushServiceSummary.text = distrib
+                }
+            }
+            // For the init only
+            if (binding.settingsUnifiedpushServiceSummary.text.isBlank()) {
+                binding.settingsUnifiedpushServiceSummary.text = UnifiedPush.getAckDistributor(context) ?: ""
+            }
+            setupUnifiedPushServiceSelectionVisibility(nDistrib)
+        }
+    }
+
+    private fun setupUnifiedPushServiceSelectionVisibility(nDistrib: Int) {
+        // We offer the option to use non-default service, only if UnifiedPush
+        // is enabled and there are more than one service
+        if (binding.settingsUnifiedpushSwitch.isChecked && nDistrib > 1) {
+            binding.settingsUnifiedpushService.visibility = View.VISIBLE
+        } else {
+            binding.settingsUnifiedpushService.visibility = View.GONE
+        }
+    }
+
+    @SuppressLint("StringFormatInvalid")
     @Suppress("LongMethod")
     private fun setupNotificationPermissionSettings() {
-        if (ClosedInterfaceImpl().isGooglePlayServicesAvailable) {
-            binding.settingsGplayOnlyWrapper.visibility = View.VISIBLE
+        if (ClosedInterfaceImpl().isGooglePlayServicesAvailable ||
+            appPreferences.useUnifiedPush ||
+            UnifiedPushUtils.hasEmbeddedDistributor(context)
+        ) {
+            binding.settingsPushOnlyWrapper.visibility = View.VISIBLE
+            binding.settingsGplayNotAvailable.visibility = View.GONE
+            binding.settingsPushNotAvailable.visibility = View.GONE
 
             setTroubleshootingClickListenersIfNecessary()
 
             if (PowerManagerUtils().isIgnoringBatteryOptimizations()) {
                 binding.batteryOptimizationIgnored.text =
-                    resources!!.getString(R.string.nc_diagnose_battery_optimization_ignored)
+                    resources!!.getString(R.string.battery_optimization_ignored)
                 binding.batteryOptimizationIgnored.setTextColor(
                     resources.getColor(R.color.high_emphasis_text, null)
                 )
             } else {
                 binding.batteryOptimizationIgnored.text =
-                    resources!!.getString(R.string.nc_diagnose_battery_optimization_not_ignored)
+                    resources!!.getString(R.string.battery_optimization_not_ignored)
                 binding.batteryOptimizationIgnored.setTextColor(resources.getColor(R.color.nc_darkRed, null))
+
+                if (openedByNotificationWarning) {
+                    DrawableUtils.blinkDrawable(binding.settingsBatteryOptimizationWrapper.background)
+                }
 
                 binding.settingsBatteryOptimizationWrapper.setOnClickListener {
                     val dialogText = String.format(
@@ -309,17 +484,31 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             // handle notification permission on API level >= 33
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 if (platformPermissionUtil.isPostNotificationsPermissionGranted()) {
-                    binding.ncDiagnoseNotificationPermissionSubtitle.text =
+                    binding.ncDiagnosisNotificationPermissionSubtitle.text =
                         resources.getString(R.string.nc_settings_notifications_granted)
-                    binding.ncDiagnoseNotificationPermissionSubtitle.setTextColor(
+                    binding.ncDiagnosisNotificationPermissionSubtitle.setTextColor(
                         resources.getColor(R.color.high_emphasis_text, null)
                     )
+                    binding.settingsCallSound.isEnabled = true
+                    binding.settingsCallSound.alpha = ENABLED_ALPHA
+                    binding.settingsMessageSound.isEnabled = true
+                    binding.settingsMessageSound.alpha = ENABLED_ALPHA
                 } else {
-                    binding.ncDiagnoseNotificationPermissionSubtitle.text =
+                    binding.ncDiagnosisNotificationPermissionSubtitle.text =
                         resources.getString(R.string.nc_settings_notifications_declined)
-                    binding.ncDiagnoseNotificationPermissionSubtitle.setTextColor(
+                    binding.ncDiagnosisNotificationPermissionSubtitle.setTextColor(
                         resources.getColor(R.color.nc_darkRed, null)
                     )
+
+                    if (openedByNotificationWarning) {
+                        DrawableUtils.blinkDrawable(binding.settingsNotificationsPermissionWrapper.background)
+                    }
+
+                    binding.settingsCallSound.isEnabled = false
+                    binding.settingsCallSound.alpha = DISABLED_ALPHA
+                    binding.settingsMessageSound.isEnabled = false
+                    binding.settingsMessageSound.alpha = DISABLED_ALPHA
+
                     binding.settingsNotificationsPermissionWrapper.setOnClickListener {
                         requestPermissions(
                             arrayOf(Manifest.permission.POST_NOTIFICATIONS),
@@ -331,8 +520,48 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                 binding.settingsNotificationsPermissionWrapper.visibility = View.GONE
             }
         } else {
-            binding.settingsGplayOnlyWrapper.visibility = View.GONE
-            binding.settingsGplayNotAvailable.visibility = View.VISIBLE
+            binding.settingsPushOnlyWrapper.visibility = View.GONE
+            // Shows "UnifiedPush is disabled and Google Play services are not available." if we offer UnifiedPush
+            // Else "Google Play services are not available" (if any account doesn't support webpush yet, or no
+            // distrib are installed)
+            if (showUnifiedPushToggle()) {
+                binding.settingsGplayNotAvailable.visibility = View.GONE
+                binding.settingsPushNotAvailable.visibility = View.VISIBLE
+            } else {
+                binding.settingsGplayNotAvailable.visibility = View.VISIBLE
+                binding.settingsPushNotAvailable.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun setupFullScreenIntentPermissionSetting() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            if (notificationManager.canUseFullScreenIntent()) {
+                binding.fullScreenIntentPermissionSubtitle.text =
+                    resources.getString(R.string.full_screen_intent_permission_granted)
+                binding.fullScreenIntentPermissionSubtitle.setTextColor(
+                    resources.getColor(R.color.high_emphasis_text, null)
+                )
+            } else {
+                binding.fullScreenIntentPermissionSubtitle.text =
+                    resources.getString(R.string.full_screen_intent_permission_not_granted)
+                binding.fullScreenIntentPermissionSubtitle.setTextColor(
+                    resources.getColor(R.color.nc_darkRed, null)
+                )
+
+                if (openedByNotificationWarning) {
+                    DrawableUtils.blinkDrawable(binding.settingsFullScreenIntentWrapper.background)
+                }
+            }
+            binding.settingsFullScreenIntentWrapper.setOnClickListener {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
+                    data = "package:$packageName".toUri()
+                }
+                startActivity(intent)
+            }
+        } else {
+            binding.settingsFullScreenIntentWrapper.visibility = View.GONE
         }
     }
 
@@ -347,6 +576,10 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                 ResourcesCompat.getColor(context.resources, R.color.nc_darkRed, null)
             )
             binding.callsRingtone.text = resources!!.getString(R.string.nc_common_disabled)
+
+            if (openedByNotificationWarning) {
+                DrawableUtils.blinkDrawable(binding.settingsCallSound.background)
+            }
         }
 
         if (NotificationUtils.isMessagesNotificationChannelEnabled(this)) {
@@ -358,30 +591,30 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                 ResourcesCompat.getColor(context.resources, R.color.nc_darkRed, null)
             )
             binding.messagesRingtone.text = resources!!.getString(R.string.nc_common_disabled)
+
+            if (openedByNotificationWarning) {
+                DrawableUtils.blinkDrawable(binding.settingsMessageSound.background)
+            }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            binding.settingsCallSound.setOnClickListener {
-                val intent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-                intent.putExtra(Settings.EXTRA_APP_PACKAGE, BuildConfig.APPLICATION_ID)
-                intent.putExtra(
-                    Settings.EXTRA_CHANNEL_ID,
-                    NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V4.name
-                )
+        binding.settingsCallSound.setOnClickListener {
+            val intent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, BuildConfig.APPLICATION_ID)
+            intent.putExtra(
+                Settings.EXTRA_CHANNEL_ID,
+                NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5.name
+            )
 
-                startActivity(intent)
-            }
-            binding.settingsMessageSound.setOnClickListener {
-                val intent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-                intent.putExtra(Settings.EXTRA_APP_PACKAGE, BuildConfig.APPLICATION_ID)
-                intent.putExtra(
-                    Settings.EXTRA_CHANNEL_ID,
-                    NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name
-                )
-                startActivity(intent)
-            }
-        } else {
-            Log.w(TAG, "setupSoundSettings currently not supported for versions < Build.VERSION_CODES.O")
+            startActivity(intent)
+        }
+        binding.settingsMessageSound.setOnClickListener {
+            val intent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, BuildConfig.APPLICATION_ID)
+            intent.putExtra(
+                Settings.EXTRA_CHANNEL_ID,
+                NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name
+            )
+            startActivity(intent)
         }
     }
 
@@ -390,24 +623,25 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             val dialogBuilder = MaterialAlertDialogBuilder(this)
                 .setTitle(R.string.nc_notifications_troubleshooting_dialog_title)
                 .setMessage(R.string.nc_notifications_troubleshooting_dialog_text)
-                .setNegativeButton(R.string.nc_diagnose_dialog_open_checklist) { _, _ ->
+                .setNegativeButton(R.string.nc_diagnosis_dialog_open_checklist) { _, _ ->
                     startActivity(
                         Intent(
                             Intent.ACTION_VIEW,
-                            Uri.parse(resources.getString(R.string.notification_checklist_url))
+                            resources.getString(R.string.notification_checklist_url).toUri()
                         )
                     )
                 }
-                .setPositiveButton(R.string.nc_diagnose_dialog_open_dontkillmyapp_website) { _, _ ->
+                .setPositiveButton(R.string.nc_diagnosis_dialog_open_dontkillmyapp_website) { _, _ ->
                     startActivity(
                         Intent(
                             Intent.ACTION_VIEW,
-                            Uri.parse(resources.getString(R.string.dontkillmyapp_url))
+                            resources.getString(R.string.dontkillmyapp_url).toUri()
                         )
                     )
                 }
-                .setNeutralButton(R.string.nc_diagnose_dialog_open_diagnose) { _, _ ->
-                    val intent = Intent(context, DiagnoseActivity::class.java)
+                .setNeutralButton(R.string.nc_diagnosis_dialog_open_diagnosis) { _, _ ->
+                    val intent = Intent(context, DiagnosisActivity::class.java)
+                    intent.putExtra(BundleKeys.KEY_INTERNAL_USER_ID, currentUser!!.id)
                     startActivity(intent)
                 }
             viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
@@ -431,13 +665,34 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    private fun setupSourceCodeUrl() {
-        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_source_code_url))) {
+    private fun setupServerNotificationAppCheck() {
+        val serverNotificationAppInstalled =
+            currentUser!!
+                .capabilities?.notificationsCapability?.features?.isNotEmpty()
+                ?: false
+        if (!serverNotificationAppInstalled) {
+            binding.settingsServerNotificationAppWrapper.visibility = View.VISIBLE
+
+            val description = context.getString(R.string.nc_settings_contact_admin_of) + LINEBREAK +
+                currentUser!!.baseUrl!!
+
+            binding.settingsServerNotificationAppDescription.text = description
+            if (openedByNotificationWarning) {
+                DrawableUtils.blinkDrawable(binding.settingsServerNotificationAppWrapper.background)
+            }
+        } else {
+            binding.settingsServerNotificationAppWrapper.visibility = View.GONE
+        }
+    }
+
+    private fun setupSourceCodeUrl(isOnline: Boolean) {
+        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_source_code_url)) && isOnline) {
+            binding.settingsSourceCode.visibility = View.VISIBLE
             binding.settingsSourceCode.setOnClickListener {
                 startActivity(
                     Intent(
                         Intent.ACTION_VIEW,
-                        Uri.parse(resources!!.getString(R.string.nc_source_code_url))
+                        resources!!.getString(R.string.nc_source_code_url).toUri()
                     )
                 )
             }
@@ -446,20 +701,28 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    private fun setupDiagnose() {
-        binding.diagnoseWrapper.setOnClickListener {
-            val intent = Intent(context, DiagnoseActivity::class.java)
+    private fun setupDiagnosis() {
+        binding.diagnosisWrapper.setOnClickListener {
+            val intent = Intent(context, DiagnosisActivity::class.java)
+            intent.putExtra(BundleKeys.KEY_INTERNAL_USER_ID, currentUser!!.id)
             startActivity(intent)
+        }
+        binding.logsWrapper.setOnClickListener {
+            startActivity(Intent(context, LogsActivity::class.java))
+        }
+        binding.shareReportWrapper.setOnClickListener {
+            showShareReportDialog(this, userManager, appPreferences, logsRepository, saveZipLauncher)
         }
     }
 
-    private fun setupPrivacyUrl() {
-        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_privacy_url))) {
+    private fun setupPrivacyUrl(isOnline: Boolean) {
+        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_privacy_url)) && isOnline) {
+            binding.settingsPrivacy.visibility = View.VISIBLE
             binding.settingsPrivacy.setOnClickListener {
                 startActivity(
                     Intent(
                         Intent.ACTION_VIEW,
-                        Uri.parse(resources!!.getString(R.string.nc_privacy_url))
+                        resources!!.getString(R.string.nc_privacy_url).toUri()
                     )
                 )
             }
@@ -468,18 +731,29 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    private fun setupLicenceSetting() {
-        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_gpl3_url))) {
+    private fun setupLicenceSetting(isOnline: Boolean) {
+        if (!TextUtils.isEmpty(resources!!.getString(R.string.nc_gpl3_url)) && isOnline) {
+            binding.settingsLicence.visibility = View.VISIBLE
             binding.settingsLicence.setOnClickListener {
                 startActivity(
                     Intent(
                         Intent.ACTION_VIEW,
-                        Uri.parse(resources!!.getString(R.string.nc_gpl3_url))
+                        resources!!.getString(R.string.nc_gpl3_url).toUri()
                     )
                 )
             }
         } else {
             binding.settingsLicence.visibility = View.GONE
+        }
+    }
+
+    private fun showSetupClientCertView(isOnline: Boolean) {
+        if (isOnline) {
+            binding.settingsClientCert.visibility = View.VISIBLE
+            binding.settingsProxyGroup.visibility = View.VISIBLE
+        } else {
+            binding.settingsClientCert.visibility = View.GONE
+            binding.settingsProxyGroup.visibility = View.GONE
         }
     }
 
@@ -515,7 +789,10 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                     }
                     Log.d(TAG, "host: $host and port: $port")
                     currentUser!!.clientCertificate = finalAlias
-                    userManager.updateOrCreateUser(currentUser!!)
+                    val userId = currentUser!!.id!!
+                    lifecycleScope.launch {
+                        userManager.updateClientCertificate(userId, finalAlias)
+                    }
                 },
                 arrayOf("RSA", "EC"),
                 null,
@@ -607,52 +884,54 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    @SuppressLint("CheckResult")
+    @SuppressLint("StringFormatInvalid")
     private fun removeCurrentAccount() {
-        userManager.scheduleUserForDeletionWithId(currentUser!!.id!!).blockingGet()
-        val accountRemovalWork = OneTimeWorkRequest.Builder(AccountRemovalWorker::class.java).build()
-        WorkManager.getInstance(applicationContext).enqueue(accountRemovalWork)
+        lifecycleScope.launch {
+            userManager.scheduleUserForDeletionWithId(currentUser!!.id!!)
+            val accountRemovalWork = OneTimeWorkRequest.Builder(AccountRemovalWorker::class.java)
+                .setExpeditedIfSupported()
+                .build()
+            WorkManager.getInstance(applicationContext).enqueue(accountRemovalWork)
 
-        WorkManager.getInstance(context).getWorkInfoByIdLiveData(accountRemovalWork.id)
-            .observeForever { workInfo: WorkInfo ->
+            WorkManager.getInstance(context).getWorkInfoByIdLiveData(accountRemovalWork.id)
+                .observeForever { workInfo: WorkInfo? ->
 
-                when (workInfo.state) {
-                    WorkInfo.State.SUCCEEDED -> {
-                        val text = String.format(
-                            context.resources.getString(R.string.nc_deleted_user),
-                            currentUser!!.displayName
-                        )
-                        Toast.makeText(
-                            context,
-                            text,
-                            Toast.LENGTH_LONG
-                        ).show()
-                        restartApp()
+                    when (workInfo?.state) {
+                        WorkInfo.State.SUCCEEDED -> {
+                            val text = String.format(
+                                context.resources.getString(R.string.nc_deleted_user),
+                                currentUser!!.displayName
+                            )
+                            Toast.makeText(
+                                context,
+                                text,
+                                Toast.LENGTH_LONG
+                            ).show()
+                            restartApp()
+                        }
+
+                        WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
+                            Toast.makeText(
+                                context,
+                                context.resources.getString(R.string.nc_common_error_sorry),
+                                Toast.LENGTH_LONG
+                            ).show()
+                            logger.e(TAG, "something went wrong when deleting user with id " + currentUser!!.userId)
+                            restartApp()
+                        }
+
+                        else -> {}
                     }
-
-                    WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
-                        Toast.makeText(
-                            context,
-                            context.resources.getString(R.string.nc_common_error_sorry),
-                            Toast.LENGTH_LONG
-                        ).show()
-                        Log.e(TAG, "something went wrong when deleting user with id " + currentUser!!.userId)
-                        restartApp()
-                    }
-
-                    else -> {}
                 }
-            }
+        }
     }
 
     private fun restartApp() {
-        val intent = Intent(context, MainActivity::class.java)
-        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        startActivity(intent)
+        startActivity(AppTasks.createRestartIntent(context))
     }
 
-    private fun getRingtoneName(context: Context, ringtoneUri: Uri?): String {
-        return if (ringtoneUri == null) {
+    private fun getRingtoneName(context: Context, ringtoneUri: Uri?): String =
+        if (ringtoneUri == null) {
             resources!!.getString(R.string.nc_settings_no_ringtone)
         } else if ((NotificationUtils.DEFAULT_CALL_RINGTONE_URI == ringtoneUri.toString()) ||
             (NotificationUtils.DEFAULT_MESSAGE_RINGTONE_URI == ringtoneUri.toString())
@@ -662,11 +941,13 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             val r = RingtoneManager.getRingtone(context, ringtoneUri)
             r.getTitle(context)
         }
-    }
 
     private fun themeSwitchPreferences() {
         binding.run {
             listOf(
+                settingsShowEcosystemSwitch,
+                settingsShowNotificationWarningSwitch,
+                settingsUnifiedpushSwitch,
                 settingsScreenLockSwitch,
                 settingsScreenSecuritySwitch,
                 settingsIncognitoKeyboardSwitch,
@@ -683,6 +964,7 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             listOf(
                 settingsNotificationsTitle,
                 settingsAboutTitle,
+                settingsDiagnosisTitle,
                 settingsAdvancedTitle,
                 settingsAppearanceTitle,
                 settingsPrivacyTitle
@@ -824,7 +1106,10 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                     }
                     if ((!TextUtils.isEmpty(displayName) && !(displayName == currentUser!!.displayName))) {
                         currentUser!!.displayName = displayName
-                        userManager.updateOrCreateUser(currentUser!!)
+                        val userId = currentUser!!.id!!
+                        lifecycleScope.launch {
+                            userManager.updateDisplayName(userId, displayName)
+                        }
                         binding.nameText.text = currentUser!!.displayName
                     }
                 },
@@ -861,37 +1146,46 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    private fun setupCheckables() {
-        binding.settingsScreenSecuritySwitch.isChecked = appPreferences.isScreenSecured
+    private fun setupCheckables(isOnline: Boolean) {
+        setupShowEcosystemCheckable()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            binding.settingsIncognitoKeyboardSwitch.isChecked = appPreferences.isKeyboardIncognito
+        binding.settingsShowNotificationWarningSwitch.isChecked =
+            appPreferences.showRegularNotificationWarning
+
+        if (ClosedInterfaceImpl().isGooglePlayServicesAvailable) {
+            binding.settingsShowNotificationWarning.setOnClickListener {
+                val isChecked = binding.settingsShowNotificationWarningSwitch.isChecked
+                binding.settingsShowNotificationWarningSwitch.isChecked = !isChecked
+                appPreferences.setShowRegularNotificationWarning(!isChecked)
+                if (!isChecked) {
+                    appPreferences.setNotificationWarningLastPostponedDate(NOTIFICATION_WARNING_DATE_NOT_SET)
+                }
+            }
         } else {
-            binding.settingsIncognitoKeyboardSwitch.visibility = View.GONE
+            binding.settingsShowNotificationWarning.visibility = View.GONE
         }
 
-        if (CapabilitiesUtil.isReadStatusAvailable(currentUser!!.capabilities!!.spreedCapability!!)) {
+        if (CapabilitiesUtil.isReadStatusAvailable(currentUser?.capabilities?.spreedCapability) &&
+            isOnline
+        ) {
+            binding.settingsReadPrivacy.visibility = View.VISIBLE
             binding.settingsReadPrivacySwitch.isChecked = !CapabilitiesUtil.isReadStatusPrivate(currentUser!!)
         } else {
             binding.settingsReadPrivacy.visibility = View.GONE
         }
 
-        setupTypingStatusSetting()
-
-        binding.settingsPhoneBookIntegrationSwitch.isChecked = appPreferences.isPhoneBookIntegrationEnabled
-
-        binding.settingsProxyUseCredentialsSwitch.isChecked = appPreferences.proxyCredentials
-        binding.settingsProxyUseCredentials.setOnClickListener {
-            val isChecked = binding.settingsProxyUseCredentialsSwitch.isChecked
-            binding.settingsProxyUseCredentialsSwitch.isChecked = !isChecked
-            appPreferences.setProxyNeedsCredentials(!isChecked)
-        }
+        setupTypingStatusSetting(isOnline)
+        setupProxyUseSetting()
 
         binding.settingsScreenLockSwitch.isChecked = appPreferences.isScreenLocked
         binding.settingsScreenLock.setOnClickListener {
             val isChecked = binding.settingsScreenLockSwitch.isChecked
             binding.settingsScreenLockSwitch.isChecked = !isChecked
             appPreferences.setScreenLock(!isChecked)
+            if (!isChecked) {
+                SecurityUtils.createKey(appPreferences.screenLockTimeout)
+                appPreferences.setLockTimestamp(System.currentTimeMillis())
+            }
         }
 
         binding.settingsReadPrivacy.setOnClickListener {
@@ -900,25 +1194,17 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             appPreferences.setReadPrivacy(!isChecked)
         }
 
+        binding.settingsIncognitoKeyboardSwitch.isChecked = appPreferences.isKeyboardIncognito
         binding.settingsIncognitoKeyboard.setOnClickListener {
             val isChecked = binding.settingsIncognitoKeyboardSwitch.isChecked
             binding.settingsIncognitoKeyboardSwitch.isChecked = !isChecked
             appPreferences.setIncognitoKeyboard(!isChecked)
         }
 
-        binding.settingsPhoneBookIntegration.setOnClickListener {
-            val isChecked = binding.settingsPhoneBookIntegrationSwitch.isChecked
-            binding.settingsPhoneBookIntegrationSwitch.isChecked = !isChecked
-            appPreferences.setPhoneBookIntegration(!isChecked)
-            if (!isChecked) {
-                if (checkPermission(this@SettingsActivity, (context))) {
-                    checkForPhoneNumber()
-                }
-            } else {
-                deleteAll()
-            }
-        }
+        setupMediaQualitySetting()
+        setupPhoneBookIntegrationSetting()
 
+        binding.settingsScreenSecuritySwitch.isChecked = appPreferences.isScreenSecured
         binding.settingsScreenSecurity.setOnClickListener {
             val isChecked = binding.settingsScreenSecuritySwitch.isChecked
             binding.settingsScreenSecuritySwitch.isChecked = !isChecked
@@ -932,12 +1218,131 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
-    private fun setupTypingStatusSetting() {
+    private fun setupShowEcosystemCheckable() {
+        binding.settingsShowEcosystemSwitch.isChecked = appPreferences.isShowEcosystem
+        binding.settingsShowEcosystem.setOnClickListener {
+            val isChecked = binding.settingsShowEcosystemSwitch.isChecked
+            binding.settingsShowEcosystemSwitch.isChecked = !isChecked
+            appPreferences.setShowEcosystem(!isChecked)
+        }
+    }
+
+    private fun setupMediaQualitySetting() {
+        updateMediaQualitySummary()
+        binding.settingsMediaQuality.setOnClickListener {
+            showMediaQualityDialog()
+        }
+    }
+
+    private fun updateMediaQualitySummary() {
+        binding.settingsMediaQualityDesc.text = if (appPreferences.compressUploadImages) {
+            getString(R.string.nc_media_quality_reduced)
+        } else {
+            getString(R.string.nc_media_quality_original)
+        }
+    }
+
+    private fun showMediaQualityDialog() {
+        var dialog: AlertDialog? = null
+        val view = buildMediaQualityDialogContentView { reducedQuality ->
+            appPreferences.setCompressUploadImages(reducedQuality)
+            updateMediaQualitySummary()
+            dialog?.dismiss()
+        }
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.nc_settings_media_quality_title)
+            .setView(view)
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        dialog = dialogBuilder.show()
+    }
+
+    // AlertDialog/MaterialAlertDialogBuilder doesn't reliably render both setMessage(...) and
+    // setSingleChoiceItems(...) together (the list ends up empty), so the hint and the two
+    // options are laid out manually here instead, mirroring buildShareDialogContentView's style.
+    private fun buildMediaQualityDialogContentView(
+        onSelect: (reducedQuality: Boolean) -> Unit
+    ): android.widget.LinearLayout {
+        val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density).toInt()
+        val selectableBackground = with(android.util.TypedValue()) {
+            theme.resolveAttribute(android.R.attr.selectableItemBackground, this, true)
+            resourceId
+        }
+
+        fun optionRow(label: String, reducedQuality: Boolean) =
+            android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                val h = dp(DIALOG_PADDING_H_DP)
+                val v = dp(DIALOG_PADDING_V_DP)
+                setPadding(h, v, h, v)
+                setBackgroundResource(selectableBackground)
+                isClickable = true
+                isFocusable = true
+                addView(
+                    android.widget.RadioButton(context).apply {
+                        isChecked = appPreferences.compressUploadImages == reducedQuality
+                        isClickable = false
+                    }
+                )
+                addView(
+                    android.widget.TextView(context).apply {
+                        text = label
+                        setPadding(dp(DIALOG_SPACING_DP), 0, 0, 0)
+                        setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
+                    }
+                )
+                setOnClickListener { onSelect(reducedQuality) }
+            }
+
+        return android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            addView(
+                android.widget.TextView(context).apply {
+                    text = getString(R.string.nc_media_quality_original_hint)
+                    val h = dp(DIALOG_PADDING_H_DP)
+                    val v = dp(DIALOG_PADDING_V_DP)
+                    setPadding(h, v, h, v)
+                    setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyMedium)
+                }
+            )
+            addView(optionRow(getString(R.string.nc_media_quality_original), reducedQuality = false))
+            addView(optionRow(getString(R.string.nc_media_quality_reduced), reducedQuality = true))
+        }
+    }
+
+    private fun setupPhoneBookIntegrationSetting() {
+        binding.settingsPhoneBookIntegrationSwitch.isChecked = appPreferences.isPhoneBookIntegrationEnabled
+        binding.settingsPhoneBookIntegration.setOnClickListener {
+            val isChecked = binding.settingsPhoneBookIntegrationSwitch.isChecked
+            binding.settingsPhoneBookIntegrationSwitch.isChecked = !isChecked
+            appPreferences.setPhoneBookIntegration(!isChecked)
+            if (!isChecked) {
+                if (checkPermission(this@SettingsActivity, (context))) {
+                    checkForPhoneNumber()
+                }
+            } else {
+                deleteAll()
+            }
+        }
+    }
+
+    private fun setupProxyUseSetting() {
+        binding.settingsProxyUseCredentialsSwitch.isChecked = appPreferences.proxyCredentials
+        binding.settingsProxyUseCredentials.setOnClickListener {
+            val isChecked = binding.settingsProxyUseCredentialsSwitch.isChecked
+            binding.settingsProxyUseCredentialsSwitch.isChecked = !isChecked
+            appPreferences.setProxyNeedsCredentials(!isChecked)
+        }
+    }
+
+    private fun setupTypingStatusSetting(isOnline: Boolean) {
         if (currentUser!!.externalSignalingServer?.externalSignalingServer?.isNotEmpty() == true) {
             binding.settingsTypingStatusOnlyWithHpb.visibility = View.GONE
             Log.i(TAG, "Typing Status Available: ${CapabilitiesUtil.isTypingStatusAvailable(currentUser!!)}")
 
-            if (CapabilitiesUtil.isTypingStatusAvailable(currentUser!!)) {
+            if (CapabilitiesUtil.isTypingStatusAvailable(currentUser!!) && isOnline) {
+                binding.settingsTypingStatus.visibility = View.VISIBLE
                 binding.settingsTypingStatusSwitch.isChecked = !CapabilitiesUtil.isTypingStatusPrivate(currentUser!!)
             } else {
                 binding.settingsTypingStatus.visibility = View.GONE
@@ -947,7 +1352,6 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             binding.settingsTypingStatusSwitch.isChecked = false
             binding.settingsTypingStatusOnlyWithHpb.visibility = View.VISIBLE
             binding.settingsTypingStatus.isEnabled = false
-            binding.settingsTypingStatusOnlyWithHpb.alpha = DISABLED_ALPHA
             binding.settingsTypingStatus.alpha = DISABLED_ALPHA
         }
     }
@@ -1053,6 +1457,7 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         }
     }
 
+    @Suppress("Detekt.TooGenericExceptionCaught")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
@@ -1076,16 +1481,14 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
 
             ConversationsListActivity.REQUEST_POST_NOTIFICATIONS_PERMISSION -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_DENIED) {
-                    Snackbar.make(
-                        binding.root,
-                        context.resources.getString(R.string.nc_settings_notifications_declined_hint),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                    Log.d(
-                        TAG,
-                        "Notification permission is denied. Either because user denied it when being asked. " +
-                            "Or permission is already denied and android decided to not offer the dialog."
-                    )
+                    try {
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        intent.putExtra(Settings.EXTRA_APP_PACKAGE, BuildConfig.APPLICATION_ID)
+                        startActivity(intent)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to open notification settings as fallback", e)
+                    }
                 }
             }
         }
@@ -1098,6 +1501,7 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
                 if (newBoolean != state) {
                     state = newBoolean
                     binding.settingsScreenLockTimeout.isEnabled = newBoolean
+                    binding.settingsScreenLockTimeoutLayoutDropdown.isEnabled = newBoolean
                     if (newBoolean) {
                         binding.settingsScreenLockTimeout.alpha = ENABLED_ALPHA
                     } else {
@@ -1274,78 +1678,72 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
             })
     }
 
+    @Suppress("Detekt.TooGenericExceptionCaught")
     private fun observeReadPrivacy() {
-        CoroutineScope(Dispatchers.Main).launch {
+        lifecycleScope.launch {
             var state = appPreferences.readPrivacy
             readPrivacyFlow.collect { newBoolean ->
                 if (state != newBoolean) {
                     state = newBoolean
                     val booleanValue = if (newBoolean) "0" else "1"
                     val json = "{\"key\": \"read_status_privacy\", \"value\" : $booleanValue}"
-                    ncApi.setReadStatusPrivacy(
-                        ApiUtils.getCredentials(currentUser!!.username, currentUser!!.token),
-                        ApiUtils.getUrlForUserSettings(currentUser!!.baseUrl!!),
-                        json.toRequestBody("application/json".toMediaTypeOrNull())
-                    )
-                        .subscribeOn(Schedulers.io())
-                        .observeOn(AndroidSchedulers.mainThread())
-                        .subscribe(object : Observer<GenericOverall> {
-                            override fun onSubscribe(d: Disposable) {
-                                // unused atm
+                    withContext(Dispatchers.IO) {
+                        try {
+                            credentials?.let { credentials ->
+                                ncApiCoroutines.setReadStatusPrivacy(
+                                    credentials,
+                                    ApiUtils.getUrlForUserSettings(currentUser!!.baseUrl!!),
+                                    json.toRequestBody("application/json".toMediaTypeOrNull())
+                                )
+                                Log.i(TAG, "reading status set")
                             }
-
-                            override fun onNext(genericOverall: GenericOverall) {
-                                // unused atm
-                            }
-
-                            override fun onError(e: Throwable) {
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
                                 appPreferences.setReadPrivacy(!newBoolean)
                                 binding.settingsReadPrivacySwitch.isChecked = !newBoolean
                             }
-
-                            override fun onComplete() {
-                                // unused atm
+                            if (e is HttpException && e.code() == HTTP_ERROR_CODE_BAD_REQUEST) {
+                                Log.e(TAG, "read_status_privacy : Key or value is invalid")
+                            } else {
+                                Log.e(TAG, "Error setting read status", e)
                             }
-                        })
+                        }
+                    }
                 }
             }
         }
     }
 
+    @Suppress("Detekt.TooGenericExceptionCaught")
     private fun observeTypingStatus() {
-        CoroutineScope(Dispatchers.Main).launch {
+        lifecycleScope.launch {
             var state = appPreferences.typingStatus
             typingStatusFlow.collect { newBoolean ->
                 if (state != newBoolean) {
                     state = newBoolean
                     val booleanValue = if (newBoolean) "0" else "1"
                     val json = "{\"key\": \"typing_privacy\", \"value\" : $booleanValue}"
-                    ncApi.setTypingStatusPrivacy(
-                        ApiUtils.getCredentials(currentUser!!.username, currentUser!!.token),
-                        ApiUtils.getUrlForUserSettings(currentUser!!.baseUrl!!),
-                        json.toRequestBody("application/json".toMediaTypeOrNull())
-                    )
-                        .subscribeOn(Schedulers.io())
-                        .observeOn(AndroidSchedulers.mainThread())
-                        .subscribe(object : Observer<GenericOverall> {
-                            override fun onSubscribe(d: Disposable) {
-                                // unused atm
+                    withContext(Dispatchers.IO) {
+                        try {
+                            credentials?.let { credentials ->
+                                ncApiCoroutines.setTypingStatusPrivacy(
+                                    credentials,
+                                    ApiUtils.getUrlForUserSettings(currentUser!!.baseUrl!!),
+                                    json.toRequestBody("application/json".toMediaTypeOrNull())
+                                )
                             }
-
-                            override fun onNext(genericOverall: GenericOverall) {
-                                loadCapabilitiesAndUpdateSettings()
-                                Log.i(TAG, "onNext called typing status set")
-                            }
-
-                            override fun onError(e: Throwable) {
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
                                 appPreferences.typingStatus = !newBoolean
                                 binding.settingsTypingStatusSwitch.isChecked = !newBoolean
                             }
-
-                            override fun onComplete() {
-                                // unused atm
+                            if (e is HttpException && e.code() == HTTP_ERROR_CODE_BAD_REQUEST) {
+                                Log.e(TAG, "typing_privacy : Key or value is invalid")
+                            } else {
+                                Log.e(TAG, "Error setting typing status", e)
                             }
-                        })
+                        }
+                    }
                 }
             }
         }
@@ -1357,6 +1755,12 @@ class SettingsActivity : BaseActivity(), SetPhoneNumberDialogFragment.SetPhoneNu
         private const val START_DELAY: Long = 5000
         private const val DISABLED_ALPHA: Float = 0.38f
         private const val ENABLED_ALPHA: Float = 1.0f
+        private const val LINEBREAK = "\n"
         const val HTTP_CODE_OK: Int = 200
+        const val HTTP_ERROR_CODE_BAD_REQUEST: Int = 400
+        const val NO_NOTIFICATION_REMINDER_WANTED = 0L
+        private const val DIALOG_PADDING_H_DP = 24
+        private const val DIALOG_PADDING_V_DP = 16
+        private const val DIALOG_SPACING_DP = 8
     }
 }

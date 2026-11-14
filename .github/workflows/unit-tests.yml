@@ -13,27 +13,71 @@ permissions:
     contents: read
     pull-requests: write
 
-concurrency: 
+concurrency:
     group: unit-tests-${{ github.head_ref || github.run_id }}
     cancel-in-progress: true
 
 jobs:
     test:
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-latest-max
+        timeout-minutes: 45
         steps:
-            -   uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
-            -   name: Set up JDK 17
-                uses: actions/setup-java@99b8673ff64fbf99d8d325f52d9a5bdedb8483e9 # v4.2.1
+            -   name: Checkout
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+
+            -   name: Set up JDK 21
+                uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
                 with:
                     distribution: "temurin"
-                    java-version: 17
-            -   name: Run unit tests with coverage
-                uses: gradle/gradle-build-action@4c39dd82cd5e1ec7c6fa0173bb41b4b6bb3b86ff # v3.3.2
+                    java-version: 25
+
+            -   name: Setup Gradle
+                uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+            # The cache holds one jar per SDK level the tests run on (@Config(sdk = [..])). Its key names the levels, so
+            # a test on a new level gets a new cache instead of downloading that jar on every run.
+            -   name: Read the Robolectric version and SDK levels
+                id: robolectric
+                run: |
+                    {
+                        echo "version=$(grep -oP 'org\.robolectric:robolectric:\K[0-9.]+' app/build.gradle.kts)"
+                        echo "sdks=$(grep -rhoP 'sdk\s*=\s*\[\K[0-9, ]+' app/src/test | tr -d ' ' | tr ',' '\n' | sort -un | paste -sd- -)"
+                    } >> "$GITHUB_OUTPUT"
+
+            -   name: Restore the Robolectric Android SDK jars
+                id: robolectric-cache
+                uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
                 with:
-                    arguments: testGplayDebugUnit
+                    path: ~/.m2/repository/org/robolectric
+                    key: robolectric-sdks-${{ runner.os }}-${{ steps.robolectric.outputs.version }}-${{ steps.robolectric.outputs.sdks }}
+
+            -   name: Run unit tests with coverage
+                run: ./gradlew --no-daemon testGplayDebugUnit
+
+            # A cache is never replaced once its key exists, so only one with a jar for every SDK level is saved.
+            -   name: Check the Robolectric Android SDK jars
+                id: robolectric-jars
+                if: ${{ always() && steps.robolectric-cache.outputs.cache-hit != 'true' }}
+                env:
+                    SDKS: ${{ steps.robolectric.outputs.sdks }}
+                run: |
+                    jars=$(find ~/.m2/repository/org/robolectric/android-all-instrumented -name '*.jar' 2>/dev/null | wc -l)
+                    levels=$(echo "$SDKS" | tr '-' '\n' | wc -l)
+                    echo "complete=$([ "$jars" -ge "$levels" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+            # Saved even when the suite fails, so a red run still leaves the jars behind.
+            -   name: Save the Robolectric Android SDK jars
+                if: ${{ always() && steps.robolectric-jars.outputs.complete == 'true' }}
+                uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ~/.m2/repository/org/robolectric
+                    key: robolectric-sdks-${{ runner.os }}-${{ steps.robolectric.outputs.version }}-${{ steps.robolectric.outputs.sdks }}
+
             -   name: Upload test artifacts
                 if: ${{ failure() }}
-                uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     name: test-results
                     path: app/build/reports/tests/testGplayDebugUnitTest/

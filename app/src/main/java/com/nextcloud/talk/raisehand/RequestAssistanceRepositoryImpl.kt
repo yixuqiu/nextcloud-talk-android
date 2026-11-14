@@ -7,50 +7,39 @@
 package com.nextcloud.talk.raisehand
 
 import com.nextcloud.talk.api.NcApi
-import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.models.json.generic.GenericMeta
-import com.nextcloud.talk.utils.ApiUtils
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.models.json.generic.GenericMetaDto
 import io.reactivex.Observable
 
-class RequestAssistanceRepositoryImpl(private val ncApi: NcApi, currentUserProvider: CurrentUserProviderNew) :
-    RequestAssistanceRepository {
+class RequestAssistanceRepositoryImpl(private val ncApi: NcApi) : RequestAssistanceRepository {
 
-    val currentUser: User = currentUserProvider.currentUser.blockingGet()
-    val credentials: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
-
-    var apiVersion = 1
-
-    override fun requestAssistance(roomToken: String): Observable<RequestAssistanceModel> {
-        return ncApi.requestAssistance(
+    override fun requestAssistance(
+        credentials: String,
+        url: String,
+        roomToken: String
+    ): Observable<RequestAssistanceModel> =
+        ncApi.requestAssistance(
             credentials,
-            ApiUtils.getUrlForRequestAssistance(
-                apiVersion,
-                currentUser.baseUrl,
-                roomToken
-            )
+            url
         ).map { mapToRequestAssistanceModel(it.ocs?.meta!!) }
-    }
 
-    override fun withdrawRequestAssistance(roomToken: String): Observable<WithdrawRequestAssistanceModel> {
-        return ncApi.withdrawRequestAssistance(
+    override fun withdrawRequestAssistance(
+        credentials: String,
+        url: String,
+        roomToken: String
+    ): Observable<WithdrawRequestAssistanceModel> =
+        ncApi.withdrawRequestAssistance(
             credentials,
-            ApiUtils.getUrlForRequestAssistance(
-                apiVersion,
-                currentUser.baseUrl,
-                roomToken
-            )
+            url
         ).map { mapToWithdrawRequestAssistanceModel(it.ocs?.meta!!) }
-    }
 
-    private fun mapToRequestAssistanceModel(response: GenericMeta): RequestAssistanceModel {
+    private fun mapToRequestAssistanceModel(response: GenericMetaDto): RequestAssistanceModel {
         val success = response.statusCode == HTTP_OK
         return RequestAssistanceModel(
             success
         )
     }
 
-    private fun mapToWithdrawRequestAssistanceModel(response: GenericMeta): WithdrawRequestAssistanceModel {
+    private fun mapToWithdrawRequestAssistanceModel(response: GenericMetaDto): WithdrawRequestAssistanceModel {
         val success = response.statusCode == HTTP_OK
         return WithdrawRequestAssistanceModel(
             success

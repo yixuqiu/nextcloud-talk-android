@@ -1,0 +1,169 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.chooseaccount.ui
+
+import android.content.res.Configuration
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.tooling.preview.Preview
+import com.nextcloud.talk.models.json.status.ClearAtDto
+import com.nextcloud.talk.models.json.status.predefined.PredefinedStatusDto
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Preview(name = "Light", showBackground = true)
+@Preview(name = "Dark", showBackground = true, uiMode = Configuration.UI_MODE_NIGHT_YES)
+@Preview(
+    name = "Light · Landscape",
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Preview(
+    name = "Dark · Landscape",
+    uiMode = Configuration.UI_MODE_NIGHT_YES,
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Composable
+private fun PreviewStatusMessageSheet() {
+    val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+    MaterialTheme(colorScheme = colorScheme) {
+        ModalBottomSheet(
+            onDismissRequest = {},
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            StatusMessageSheetContentStateless(
+                emoji = "🏖️",
+                message = "On vacation",
+                clearAtPosition = 3,
+                predefinedStatuses = previewPredefinedStatuses(),
+                isBackupStatusAvailable = false,
+                onEmojiButtonClick = {},
+                onMessageChanged = {},
+                onClearAtPositionSelected = {},
+                onRevertStatus = {},
+                onSelectStatus = {},
+                onClear = {},
+                onSet = {}
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Preview(name = "RTL · Arabic", showBackground = true, locale = "ar")
+@Preview(
+    name = "RTL · Arabic · Landscape",
+    locale = "ar",
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Composable
+private fun PreviewStatusMessageSheetRtl() {
+    MaterialTheme(colorScheme = lightColorScheme()) {
+        ModalBottomSheet(
+            onDismissRequest = {},
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            StatusMessageSheetContentStateless(
+                emoji = "📆",
+                message = "In a meeting",
+                clearAtPosition = 1,
+                predefinedStatuses = previewPredefinedStatuses(),
+                isBackupStatusAvailable = false,
+                onEmojiButtonClick = {},
+                onMessageChanged = {},
+                onClearAtPositionSelected = {},
+                onRevertStatus = {},
+                onSelectStatus = {},
+                onClear = {},
+                onSet = {}
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Preview(name = "With backup status · Light")
+@Preview(name = "With backup status · Dark · German", uiMode = Configuration.UI_MODE_NIGHT_YES, locale = "de")
+@Preview(name = "With backup status · RTL · Arabic", locale = "ar")
+@Preview(
+    name = "With backup status · Light · Landscape",
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Preview(
+    name = "With backup status · Dark · German · Landscape",
+    uiMode = Configuration.UI_MODE_NIGHT_YES,
+    locale = "de",
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Preview(
+    name = "With backup status · RTL · Arabic · Landscape",
+    locale = "ar",
+    device = "spec:width=411dp,height=891dp,orientation=landscape"
+)
+@Composable
+private fun PreviewStatusMessageSheetWithBackup() {
+    val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+    MaterialTheme(colorScheme = colorScheme) {
+        ModalBottomSheet(
+            onDismissRequest = {},
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ) {
+            StatusMessageSheetContentStateless(
+                emoji = "🏖️",
+                message = "On vacation",
+                clearAtPosition = 0,
+                predefinedStatuses = previewPredefinedStatusesWithBackup(),
+                isBackupStatusAvailable = true,
+                onEmojiButtonClick = {},
+                onMessageChanged = {},
+                onClearAtPositionSelected = {},
+                onRevertStatus = {},
+                onSelectStatus = {},
+                onClear = {},
+                onSet = {}
+            )
+        }
+    }
+}
+
+private fun previewPredefinedStatuses() =
+    listOf(
+        PredefinedStatusDto(
+            id = "meeting",
+            icon = "📆",
+            message = "In a meeting",
+            clearAt = ClearAtDto(type = "period", time = "3600")
+        ),
+        PredefinedStatusDto(
+            id = "commuting",
+            icon = "🚌",
+            message = "Commuting",
+            clearAt = ClearAtDto(type = "period", time = "1800")
+        ),
+        PredefinedStatusDto(
+            id = "remote",
+            icon = "🏡",
+            message = "Working remotely",
+            clearAt = ClearAtDto(type = "end-of", time = "day")
+        ),
+        PredefinedStatusDto(
+            id = "sick",
+            icon = "🤒",
+            message = "Out sick",
+            clearAt = ClearAtDto(type = "end-of", time = "day")
+        ),
+        PredefinedStatusDto(id = "vacation", icon = "🏖️", message = "On vacation", clearAt = null)
+    )
+
+private fun previewPredefinedStatusesWithBackup() =
+    listOf(PredefinedStatusDto(id = "backup", icon = "⌛", message = "Be right back", clearAt = null)) +
+        previewPredefinedStatuses()

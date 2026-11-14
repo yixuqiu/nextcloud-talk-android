@@ -9,6 +9,8 @@ package com.nextcloud.talk.dagger.modules;
 
 import android.content.Context;
 
+import com.nextcloud.talk.data.network.NetworkMonitor;
+import com.nextcloud.talk.data.network.NetworkMonitorImpl;
 import com.nextcloud.talk.data.source.local.TalkDatabase;
 import com.nextcloud.talk.utils.preferences.AppPreferences;
 import com.nextcloud.talk.utils.preferences.AppPreferencesImpl;
@@ -40,8 +42,13 @@ public class DatabaseModule {
 
     @Provides
     @Singleton
-    public TalkDatabase provideTalkDatabase(@NonNull final Context context,
-                                            @NonNull final AppPreferences appPreferences) {
-        return TalkDatabase.getInstance(context, appPreferences);
+    public TalkDatabase provideTalkDatabase(@NonNull final Context context) {
+        return TalkDatabase.getInstance(context);
+    }
+
+    @Provides
+    @Singleton
+    public NetworkMonitor provideNetworkMonitor(@NonNull final Context poContext) {
+        return new NetworkMonitorImpl(poContext);
     }
 }

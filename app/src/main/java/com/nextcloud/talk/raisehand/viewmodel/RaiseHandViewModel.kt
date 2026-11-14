@@ -10,10 +10,12 @@ import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.raisehand.RequestAssistanceModel
 import com.nextcloud.talk.raisehand.RequestAssistanceRepository
 import com.nextcloud.talk.raisehand.WithdrawRequestAssistanceModel
 import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -34,6 +36,8 @@ class RaiseHandViewModel @Inject constructor(private val repository: RequestAssi
     object LoweredHandState : ViewState
     object ErrorState : ViewState
 
+    private lateinit var currentUser: User
+
     private val _viewState: MutableLiveData<ViewState> = MutableLiveData(LoweredHandState)
     val viewState: LiveData<ViewState>
         get() = _viewState
@@ -53,7 +57,19 @@ class RaiseHandViewModel @Inject constructor(private val repository: RequestAssi
     private fun raiseHand() {
         _viewState.value = RaisedHandState
         if (isBreakoutRoom) {
-            repository.requestAssistance(roomToken)
+            val credentials: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
+            val apiVersion = 1
+            val url = ApiUtils.getUrlForRequestAssistance(
+                apiVersion,
+                currentUser.baseUrl,
+                roomToken
+            )
+
+            repository.requestAssistance(
+                credentials,
+                url,
+                roomToken
+            )
                 .subscribeOn(Schedulers.io())
                 ?.observeOn(AndroidSchedulers.mainThread())
                 ?.subscribe(RequestAssistanceObserver())
@@ -63,14 +79,27 @@ class RaiseHandViewModel @Inject constructor(private val repository: RequestAssi
     fun lowerHand() {
         _viewState.value = LoweredHandState
         if (isBreakoutRoom) {
-            repository.withdrawRequestAssistance(roomToken)
+            val credentials: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
+            val apiVersion = 1
+            val url = ApiUtils.getUrlForRequestAssistance(
+                apiVersion,
+                currentUser.baseUrl,
+                roomToken
+            )
+
+            repository.withdrawRequestAssistance(
+                credentials,
+                url,
+                roomToken
+            )
                 .subscribeOn(Schedulers.io())
                 ?.observeOn(AndroidSchedulers.mainThread())
                 ?.subscribe(WithdrawRequestAssistanceObserver())
         }
     }
 
-    fun setData(roomToken: String, isBreakoutRoom: Boolean) {
+    fun setData(user: User, roomToken: String, isBreakoutRoom: Boolean) {
+        this.currentUser = user
         this.roomToken = roomToken
         this.isBreakoutRoom = isBreakoutRoom
     }

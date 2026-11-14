@@ -1,5 +1,5 @@
 <!--
- ~ SPDX-FileCopyrightText: 2021-2024 Nextcloud GmbH and Nextcloud contributors
+ ~ SPDX-FileCopyrightText: 2021-2026 Nextcloud GmbH and Nextcloud contributors
  ~ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 # Debugging push notifications
@@ -9,70 +9,104 @@ not be complete. Please contribute to this list as you gain new knowledge. Just 
 "notification" label or create a pull request for this document. 
 
 ## 📱 Users
-- Please make sure to install the app from the Google PlayStore. The f-droid version doesn't support push notifications.
+- If you install the app from Google PlayStore, notifications will work out of the box if you respect the settings 
+  in this document. 
   
   [<img src="https://play.google.com/intl/en_us/badges/images/generic/en_badge_web_generic.png"
   alt="Download from Google Play"
   height="80">](https://play.google.com/store/apps/details?id=com.nextcloud.talk2)
 
-- Only talk notifications will be delivered by the Talk app, for all other notifications install the Nextcloud Files 
-  app from Google PlayStore.
-  
-  [<img src="https://play.google.com/intl/en_us/badges/images/generic/en_badge_web_generic.png"
-  alt="Download from Google Play"
-  height="80">](https://play.google.com/store/apps/details?id=com.nextcloud.client)
+- If you install the app from F-droid or install the generic apk, you have to set up [UnifiedPush](https://github.com/nextcloud/talk-android/blob/master/docs/unifiedPush.md) in order to receive notifications.
 
 If your problem still occurs after checking all these hints, create an issue at https://github.com/nextcloud/talk-android/issues
 
 ### 🤖 Check android settings
 
-Please check the "Notifications" section in the app settings which should show warnings if anything needs to be 
-adjusted.
-Please take into account that the android settings might be different for each manufacturer.
-It might be worth it to check what other messaging apps recommend to get their apps running on a certain smartphone and adapt this to the talk app.
-Also [https://dontkillmyapp.com/](https://dontkillmyapp.com/) might be good starting point.
-
-- Check that your phone is not in "do not disturb" mode
+First of all, please make sure that the following requirements are met:
 
 - Check that your phone has internet access
 
-- Check the android settings like **"energy saving"** and **"notifications"** regularly as they might be reset by
-  android at any time!
+- Check that your phone is not in "do not disturb" mode
 
-    - Energy saving options example for Xiaomi RedMi:
+#### Grant permissions on install
 
-		- go to "Settings" 
+After the installation of Nextcloud Talk Android, dialogs appear asking you to grant the permissions.
+Please note that the dialogs only appear once to respect the first decision of the users.
+Depending on the Android version, only the dialogs appear that are necessary.
 
-        - "Battery & performance"
+##### Grant notification permission
 
-        - "App battery saver"
+A dialog to enable notification permissions after install will only be shown for Android 13 and upwards. For older 
+Android versions notifications have to be enabled in the AppInfo settings.
 
-        - tap on the Talk app 
+![Grant notification permission after install](/docs/grantNotificationPermissionAfterInstall.png "Grant notification permission after install")
 
-        - set "No restrictions"
+##### Ignore battery optimization
 
-    - Notification options example for Xiaomi RedMi:
+For some smartphone models, ignoring battery optimization is not necessary while for others it is. If you absolutely want to be sure notifications are received, turning it off is highly recommended.
 
-		- go to "Settings" 
+![Ignore battery optimization dialog](/docs/ignoreBatteryOptimizationDialog.png "Ignore battery optimization dialog")
 
-        - "Notifications" 
+Please follow the description to turn off battery optimization for the Talk app. In the available apps you can use the search so you don't have to scroll through the whole app list.
+The android settings may look different depending on manufacturer and android version. Below are two examples how it may look like:
 
-        - tap on the Talk app 
+Example 1:
+- Search app in list. 
 
-        - enable "Show notifications" and if you like 
-          enable "Lock screen notifications"
+  ![Ignore battery optimization - select all apps](/docs/ignoreBatteryOptimizationSelectAllApps.png "Ignore battery optimization - select all apps")
 
-### 🗨️ Check talk app settings
-- In the settings, check if ringtones are set for calls and notifications and if vibration is activated if you would 
-  like so.
+- Please note that the switch has to be turned off.
 
+  ![Ignore battery optimization - turn off switch](/docs/ignoreBatteryOptimizationTurnOffSwitch.png "Ignore battery optimization - turn off switch")
+
+Example 2:
+- Select app from list.
+- Please allow background usage. The switch has to be *turned on*. Also, please click on the text to reach the next menu.
+
+  ![Allow background usage. Turn on switch and click on text](/docs/ignoreBatteryOptimization_newerAndroid_allowBackgroundUsage.png "Allow background usage. Turn on switch and click on text")
+
+- Set the background usage to "unrestricted".
+
+  ![Set unrestricted background usage](/docs/ignoreBatteryOptimization_newerAndroid_unrestricted.png "Set unrestricted background usage")
+
+#### Grant permissions in settings
+
+##### Regular warning
+
+If notifications settings are not set up correctly, there will be a warning in the conversation list. This is displayed regularly unless it is changed in the settings so that you are not reminded of incorrect settings.
+If you select "Not now", the warning will be shown again after a few days if the settings are still wrong. When 
+selecting "Settings", the settings screen will appear. All incorrect settings will blink and their description is in 
+red color. 
+
+##### Notification settings
+
+The notification settings can either be reached when selecting "Settings" in the regular notification warning or by 
+clicking on the user avatar in the right corner of the conversation list and by selecting "Settings".
+
+In the "Notifications" section, please change every setting that is marked with a red color.
+Please take into account that the android settings might look different for each manufacturer. 
+You can also reach these settings by long pressing on the Nextcloud Android Talk App in Android itself and by selecting 
+"App info".
+
+![Warning that notifications are not set up correctly](/docs/notificationsNotSetUpCorrectlyWarning.png "Warning that notifications are not set up correctly")
+
+![Notification settings](/docs/notificationSettingsExample.png "Notification settings")
+
+##### Further help for permission settings
+
+If setting the above listed permission won't help, it might be that there are special settings for your phone. It 
+might be worth it to check what other messaging apps recommend to get their apps running on a certain smartphone and adapt this to the talk app.
+Also [https://dontkillmyapp.com/](https://dontkillmyapp.com/) might be good starting point.
+
+### 🗨️ Check conversation settings
 - In the conversation settings (in the upper right corner of a conversation), check that notifications are set to 
   "Always notify" or "Notify when mentioned"
 
 	- Be aware that this is a per conversation setting. Set it for every conversation differently depending on your 
       needs.
 
-- Also be aware that notifications are not generated when you have an active session for a conversation. This also applies for tabs that are open in the background, etc.
+- Also be aware that notifications are not generated when you have an active session for a conversation. This also 
+  applies for browser tabs that are open in the background, etc.
 
 ### 🖥 Check server settings
 
@@ -81,6 +115,14 @@ Run the `notification:test-push` command for the user who is logged in at the de
 ```bash
 sudo -u www-data php /var/www/yourinstance/occ notification:test-push --talk youruser
 ```
+Alternatively, you can check if push notifications are set up correctly on the server from the app’s Diagnosis screen:
+
+- Select the user avatar in the upper right corner of the conversation list
+- Select "Settings" from the menu.
+- In "Advanced" section of settings menu, select "Diagnosis"
+- Click on “Test push notifications” button located at the bottom of the Diagnosis.
+
+If google play services are not available on the device, then you cannot see "Test push notifications" button in the Diagnosis screen.
 
 It should print something like the following:
 ```

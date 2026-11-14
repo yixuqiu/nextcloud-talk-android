@@ -6,6 +6,7 @@
  */
 package com.nextcloud.talk.viewmodels
 
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.test.fakes.FakeCallRecordingRepository
 import com.vividsolutions.jts.util.Assert
 import org.junit.Before
@@ -16,6 +17,8 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
 
     private val repository = FakeCallRecordingRepository()
 
+    private val user = User(id = 1L, username = "user1", baseUrl = "https://server1", token = "token")
+
     @Before
     fun setUp() {
         MockitoAnnotations.openMocks(this)
@@ -24,7 +27,7 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
     @Test
     fun testCallRecordingViewModel_clickStartRecord() {
         val viewModel = CallRecordingViewModel(repository)
-        viewModel.setData("foo")
+        viewModel.setData(user, "foo")
         viewModel.clickRecordButton()
 
         Assert.isTrue(viewModel.viewState.value is CallRecordingViewModel.RecordingStartingState)
@@ -38,7 +41,7 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
     @Test
     fun testCallRecordingViewModel_clickStopRecord() {
         val viewModel = CallRecordingViewModel(repository)
-        viewModel.setData("foo")
+        viewModel.setData(user, "foo")
         viewModel.setRecordingState(CallRecordingViewModel.RECORDING_STARTED_VIDEO_CODE)
 
         Assert.equals(true, (viewModel.viewState.value as CallRecordingViewModel.RecordingStartedState).showStartedInfo)
@@ -55,7 +58,7 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
     @Test
     fun testCallRecordingViewModel_keepConfirmState() {
         val viewModel = CallRecordingViewModel(repository)
-        viewModel.setData("foo")
+        viewModel.setData(user, "foo")
         viewModel.setRecordingState(CallRecordingViewModel.RECORDING_STARTED_VIDEO_CODE)
 
         Assert.equals(true, (viewModel.viewState.value as CallRecordingViewModel.RecordingStartedState).showStartedInfo)
@@ -72,7 +75,7 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
     @Test
     fun testCallRecordingViewModel_continueRecordingWhenDismissStopDialog() {
         val viewModel = CallRecordingViewModel(repository)
-        viewModel.setData("foo")
+        viewModel.setData(user, "foo")
         viewModel.setRecordingState(CallRecordingViewModel.RECORDING_STARTED_VIDEO_CODE)
         viewModel.clickRecordButton()
 
@@ -91,7 +94,7 @@ class CallRecordingViewModelTest : AbstractViewModelTest() {
     @Test
     fun testSetRecordingStateDirectly() {
         val viewModel = CallRecordingViewModel(repository)
-        viewModel.setData("foo")
+        viewModel.setData(user, "foo")
 
         viewModel.setRecordingState(CallRecordingViewModel.RECORDING_STOPPED_CODE)
         Assert.isTrue(viewModel.viewState.value is CallRecordingViewModel.RecordingStoppedState)

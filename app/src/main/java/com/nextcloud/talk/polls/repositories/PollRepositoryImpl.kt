@@ -8,79 +8,61 @@
 package com.nextcloud.talk.polls.repositories
 
 import com.nextcloud.talk.api.NcApi
-import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.polls.model.Poll
 import com.nextcloud.talk.polls.model.PollDetails
-import com.nextcloud.talk.polls.repositories.model.PollDetailsResponse
-import com.nextcloud.talk.polls.repositories.model.PollResponse
-import com.nextcloud.talk.utils.ApiUtils
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.polls.repositories.model.PollDetailsResponseDto
+import com.nextcloud.talk.polls.repositories.model.PollResponseDto
 import io.reactivex.Observable
 import kotlin.collections.forEach as kForEach
 
-class PollRepositoryImpl(private val ncApi: NcApi, private val currentUserProvider: CurrentUserProviderNew) :
-    PollRepository {
-
-    val currentUser: User = currentUserProvider.currentUser.blockingGet()
-    val credentials: String = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
+class PollRepositoryImpl(private val ncApi: NcApi) : PollRepository {
 
     override fun createPoll(
+        credentials: String?,
+        url: String,
         roomToken: String,
         question: String,
         options: List<String>,
         resultMode: Int,
         maxVotes: Int
-    ): Observable<Poll> {
-        return ncApi.createPoll(
+    ): Observable<Poll> =
+        ncApi.createPoll(
             credentials,
-            ApiUtils.getUrlForPoll(
-                currentUser.baseUrl!!,
-                roomToken
-            ),
+            url,
             question,
             options,
             resultMode,
             maxVotes
         ).map { mapToPoll(it.ocs?.data!!) }
-    }
 
-    override fun getPoll(roomToken: String, pollId: String): Observable<Poll> {
-        return ncApi.getPoll(
+    override fun getPoll(credentials: String?, url: String, roomToken: String, pollId: String): Observable<Poll> =
+        ncApi.getPoll(
             credentials,
-            ApiUtils.getUrlForPoll(
-                currentUser.baseUrl!!,
-                roomToken,
-                pollId
-            )
+            url
         ).map { mapToPoll(it.ocs?.data!!) }
-    }
 
-    override fun vote(roomToken: String, pollId: String, options: List<Int>): Observable<Poll> {
-        return ncApi.votePoll(
+    override fun vote(
+        credentials: String?,
+        url: String,
+        roomToken: String,
+        pollId: String,
+        options: List<Int>
+    ): Observable<Poll> =
+        ncApi.votePoll(
             credentials,
-            ApiUtils.getUrlForPoll(
-                currentUser.baseUrl!!,
-                roomToken,
-                pollId
-            ),
+            url,
             options
         ).map { mapToPoll(it.ocs?.data!!) }
-    }
 
-    override fun closePoll(roomToken: String, pollId: String): Observable<Poll> {
-        return ncApi.closePoll(
+    override fun closePoll(credentials: String?, url: String, roomToken: String, pollId: String): Observable<Poll> =
+        ncApi.closePoll(
             credentials,
-            ApiUtils.getUrlForPoll(
-                currentUser.baseUrl!!,
-                roomToken,
-                pollId
-            )
+            url
         ).map { mapToPoll(it.ocs?.data!!) }
-    }
 
     companion object {
 
-        private fun mapToPoll(pollResponse: PollResponse): Poll {
+        private fun mapToPoll(pollResponse: PollResponseDto): Poll {
             val pollDetails = pollResponse.details?.map { it -> mapToPollDetails(it) }
 
             return Poll(
@@ -108,13 +90,12 @@ class PollRepositoryImpl(private val ncApi: NcApi, private val currentUserProvid
             return resultMap
         }
 
-        private fun mapToPollDetails(pollDetailsResponse: PollDetailsResponse): PollDetails {
-            return PollDetails(
+        private fun mapToPollDetails(pollDetailsResponse: PollDetailsResponseDto): PollDetails =
+            PollDetails(
                 pollDetailsResponse.actorType,
                 pollDetailsResponse.actorId,
                 pollDetailsResponse.actorDisplayName,
                 pollDetailsResponse.optionId
             )
-        }
     }
 }

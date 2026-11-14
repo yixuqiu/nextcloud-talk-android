@@ -11,23 +11,23 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
 import android.util.Log
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import androidx.lifecycle.ViewModelProvider
+import androidx.core.graphics.drawable.toDrawable
 import autodagger.AutoInjector
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.nextcloud.talk.R
 import com.nextcloud.talk.activities.BaseActivity
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.dagger.modules.assistedViewModels
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.ActivityTranslateBinding
-import com.nextcloud.talk.translate.repositories.model.Language
+import com.nextcloud.talk.translate.repositories.model.LanguageDto
 import com.nextcloud.talk.translate.viewmodels.TranslateViewModel
-import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import java.util.Locale
 import javax.inject.Inject
@@ -37,25 +37,24 @@ import javax.inject.Inject
 class TranslateActivity : BaseActivity() {
 
     @Inject
-    lateinit var userManager: UserManager
+    lateinit var viewModelFactory: TranslateViewModel.Factory
 
-    @Inject
-    lateinit var viewModelFactory: ViewModelProvider.Factory
+    private lateinit var user: User
 
-    lateinit var viewModel: TranslateViewModel
+    val viewModel: TranslateViewModel by assistedViewModels { viewModelFactory.build(user) }
     lateinit var binding: ActivityTranslateBinding
 
     private var toLanguages: Array<String>? = null
     private var fromLanguages: Array<String>? = null
-    private var languages: List<Language>? = null
+    private var languages: List<LanguageDto>? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        user = setUpBoundUserOrFinish() ?: return
 
         binding = ActivityTranslateBinding.inflate(layoutInflater)
-        viewModel = ViewModelProvider(this, viewModelFactory)[TranslateViewModel::class.java]
 
         viewModel.viewState.observe(this) { state ->
             when (state) {
@@ -86,7 +85,7 @@ class TranslateActivity : BaseActivity() {
         }
         setupActionBar()
         setContentView(binding.root)
-        setupSystemColors()
+        initSystemBars()
         setupTextViews()
         viewModel.getLanguages()
         setupCopyButton()
@@ -130,7 +129,7 @@ class TranslateActivity : BaseActivity() {
         }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(R.color.transparent, null)))
+        supportActionBar?.setIcon(resources!!.getColor(R.color.transparent, null).toDrawable())
         supportActionBar?.title = resources!!.getString(R.string.translation)
         viewThemeUtils.material.themeToolbar(binding.translationToolbar)
     }

@@ -6,6 +6,8 @@ name: "Assemble"
 on:
   pull_request:
     branches: [ master, stable-* ]
+  push:
+      branches: [ master, stable-* ]
 
 # Declare default permissions as read only.
 permissions: read-all
@@ -16,24 +18,36 @@ concurrency:
 
 jobs:
   flavor:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-max
     strategy:
       fail-fast: false
       matrix:
         flavor: [ Generic, Gplay ]
     steps:
-      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
-      - name: set up JDK 17
-        uses: actions/setup-java@99b8673ff64fbf99d8d325f52d9a5bdedb8483e9 # v4.2.1
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: set up JDK 21
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: "temurin"
-          java-version: 17
+          java-version: 25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Gradle validate
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
       - name: Build ${{ matrix.flavor }}
         run: |
-          echo "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError" >> gradle.properties
-          ./gradlew assemble${{ matrix.flavor }}
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8" >> gradle.properties
+          ./gradlew --no-daemon assemble${{ matrix.flavor }}
+
       - name: Archive apk
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() }}
         with:
           name: Nextcloud-${{ matrix.flavor }}-APK

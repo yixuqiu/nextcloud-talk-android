@@ -1,0 +1,1302 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2024 Marcel Hibbe <dev@mhibbe.de>
+ * SPDX-FileCopyrightText: 2024 Julius Linus <juliuslinus1@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.chat.data.network
+
+import android.os.Bundle
+import android.util.Log
+import com.nextcloud.talk.chat.data.ChatMessageRepository
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.conversationlist.data.network.ConversationListUpdater
+import com.nextcloud.talk.data.database.dao.ChatBlocksDao
+import com.nextcloud.talk.data.database.dao.ChatMessagesDao
+import com.nextcloud.talk.data.database.mappers.asEntity
+import com.nextcloud.talk.data.database.mappers.toDomainModel
+import com.nextcloud.talk.data.database.model.ChatBlockEntity
+import com.nextcloud.talk.data.database.model.ChatMessageEntity
+import com.nextcloud.talk.data.database.model.SendStatus
+import com.nextcloud.talk.data.network.NetworkMonitor
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.extensions.toIntOrZero
+import com.nextcloud.talk.logger.Logger
+import com.nextcloud.talk.models.domain.ConversationModel
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
+import com.nextcloud.talk.models.json.chat.ChatOverallSingleMessage
+import com.nextcloud.talk.models.json.converters.EnumActorTypeConverter
+import com.nextcloud.talk.models.json.generic.GenericOverall
+import com.nextcloud.talk.models.json.participants.ParticipantDto
+import com.nextcloud.talk.utils.Undo
+import com.nextcloud.talk.utils.message.SendMessageUtils
+import com.nextcloud.talk.utils.optimisticAction
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import retrofit2.HttpException
+import java.io.IOException
+import javax.inject.Inject
+import kotlin.math.min
+
+@Suppress("LargeClass", "TooManyFunctions")
+class OfflineFirstChatRepository @Inject constructor(
+    private val logger: Logger,
+    private val chatDao: ChatMessagesDao,
+    private val chatBlocksDao: ChatBlocksDao,
+    private val network: ChatNetworkDataSource,
+    private val networkMonitor: NetworkMonitor,
+    private val syncer: ChatMessageSyncer,
+    private val conversationListUpdater: ConversationListUpdater
+) : ChatMessageRepository {
+
+    lateinit var currentUser: User
+
+    // Placeholder rows sort by "timestamp ASC, id ASC" (ChatMessagesDao) same as real messages, but
+    // id here is a hash of a random referenceId with no relation to call order - so if several
+    // files are sent at once and their (second-granularity) timestamps tie, as is near-certain,
+    // they'd otherwise sort arbitrarily instead of in the order they were actually sent. Tracking
+    // the last-used value and never handing out the same one twice keeps placeholders strictly in
+    // call order regardless of how many land within the same wall-clock second.
+    private var lastPlaceholderTimestampSeconds = 0L
+
+    private fun nextPlaceholderTimestampSeconds(): Long =
+        synchronized(this) {
+            val timestamp = maxOf(System.currentTimeMillis() / MILLIES, lastPlaceholderTimestampSeconds + 1)
+            lastPlaceholderTimestampSeconds = timestamp
+            timestamp
+        }
+
+    override val messageFlow:
+        Flow<
+            Triple<
+                Boolean,
+                Boolean,
+                List<ChatMessage>
+                >
+            >
+        get() = _messageFlow
+
+    private val _messageFlow:
+        MutableSharedFlow<
+            Triple<
+                Boolean,
+                Boolean,
+                List<ChatMessage>
+                >
+            > = MutableSharedFlow()
+
+    override val updateMessageFlow: Flow<ChatMessage>
+        get() = _updateMessageFlow
+
+    private val _updateMessageFlow:
+        MutableSharedFlow<ChatMessage> = MutableSharedFlow()
+
+    override val lastCommonReadFlow: Flow<Int>
+        get() = _lastCommonReadFlow
+
+    private val _lastCommonReadFlow:
+        MutableSharedFlow<Int> = MutableSharedFlow(replay = 1)
+
+    override val lastReadMessageFlow: Flow<Int>
+        get() = _lastReadMessageFlow
+
+    private val _lastReadMessageFlow:
+        MutableSharedFlow<Int> = MutableSharedFlow()
+
+    override val roomRefreshFlow: Flow<Unit>
+        get() = _roomRefreshFlow
+
+    private val _roomRefreshFlow: MutableSharedFlow<Unit> = MutableSharedFlow()
+
+    override val incomingMessageFlow: Flow<Unit>
+        get() = _incomingMessageFlow
+
+    private val _incomingMessageFlow: MutableSharedFlow<Unit> = MutableSharedFlow()
+
+    override val isLoadingFlow: Flow<Boolean>
+        get() = _isLoadingFlow
+
+    private val _isLoadingFlow: MutableStateFlow<Boolean> = MutableStateFlow(false)
+
+    private var newXChatLastCommonRead: Int? = null
+
+    // written on the main thread by handleOnPause/handleOnResume, read and observed by fetch and polling coroutines
+    private val isPaused = MutableStateFlow(false)
+
+    lateinit var internalConversationId: String
+    private lateinit var roomToken: String
+    private lateinit var conversationModel: ConversationModel
+    private lateinit var credentials: String
+    private lateinit var urlForChatting: String
+    private var threadId: Long? = null
+
+    private val requestedParentIds = mutableSetOf<Long>()
+
+    override fun initData(
+        currentUser: User,
+        credentials: String,
+        urlForChatting: String,
+        roomToken: String,
+        threadId: Long?
+    ) {
+        this.currentUser = currentUser
+        this.roomToken = roomToken
+
+        internalConversationId = currentUser.id.toString() + "@" + roomToken
+        this.credentials = credentials
+        this.urlForChatting = urlForChatting
+        this.threadId = threadId
+    }
+
+    override fun updateConversation(conversationModel: ConversationModel) {
+        this.conversationModel = conversationModel
+    }
+
+    private val syncTarget: ChatMessageSyncer.SyncTarget
+        get() = ChatMessageSyncer.SyncTarget(
+            user = currentUser,
+            roomToken = roomToken,
+            threadId = threadId,
+            credentials = credentials,
+            urlForChatting = urlForChatting
+        )
+
+    private val syncEvents = object : ChatMessageSyncer.Events {
+        override suspend fun onLastCommonReadChanged(lastCommonRead: Int?) {
+            newXChatLastCommonRead = lastCommonRead ?: newXChatLastCommonRead
+            updateUiForLastCommonRead()
+        }
+
+        override suspend fun onLoadingChanged(isLoading: Boolean) {
+            _isLoadingFlow.value = isLoading
+        }
+
+        override suspend fun onRoomRefreshNeeded() {
+            _roomRefreshFlow.emit(Unit)
+        }
+
+        override suspend fun onIncomingMessagesFromOthers() {
+            _incomingMessageFlow.emit(Unit)
+        }
+    }
+
+    override suspend fun loadInitialMessages(withNetworkParams: Bundle) {
+        logger.d(TAG, "---- loadInitialMessages ------------")
+        cleanupExpiredMessages()
+        newXChatLastCommonRead = conversationModel.lastCommonReadMessage
+        updateUiForLastCommonRead()
+
+        Log.d(TAG, "conversationModel.internalId: " + conversationModel.internalId)
+        Log.d(TAG, "conversationModel.lastReadMessage:" + conversationModel.lastReadMessage)
+
+        val latestBlock = chatBlocksDao.getLatestChatBlock(internalConversationId, threadId).first()
+        Log.d(TAG, "latestBlock: ${latestBlock?.oldestMessageId}..${latestBlock?.newestMessageId}")
+
+        if (latestBlock == null) {
+            fetchInitialMessages(weAlreadyHaveSomeOfflineMessages = false)
+            return
+        }
+
+        // The chat shows the messages of the latest chat block, and the unread marker can only be
+        // placed correctly when that block reaches back to the last read message. A block floating
+        // entirely above the boundary (e.g. created by a capped newest-messages fetch) must be
+        // repaired by an anchored fetch — only closing the backlog above it would keep the marker
+        // pinned to the block's oldest message, in the middle of the unread messages.
+        val lastReadMessage = conversationModel.lastReadMessage.toLong()
+        val blockNotFloatingAboveLastReadMessage = lastReadMessage <= 0 ||
+            latestBlock.oldestMessageId <= lastReadMessage ||
+            !latestBlock.hasHistory
+
+        Log.d(TAG, "blockNotFloatingAboveLastReadMessage:$blockNotFloatingAboveLastReadMessage")
+
+        if (blockNotFloatingAboveLastReadMessage) {
+            tryCloseBacklogFromNewestOfflineMessage(latestBlock.newestMessageId)
+        } else {
+            fetchInitialMessages(weAlreadyHaveSomeOfflineMessages = true)
+        }
+    }
+
+    /**
+     * Tries to close the backlog since the newest offline message.
+     */
+    private suspend fun tryCloseBacklogFromNewestOfflineMessage(newestMessageIdFromDb: Long) {
+        Log.d(TAG, "Try to close the backlog from the newest offline message for initial loading")
+
+        syncer.tryCloseBacklog(
+            target = syncTarget,
+            fromMessageId = newestMessageIdFromDb,
+            lastCommonRead = newXChatLastCommonRead,
+            events = syncEvents
+        )
+    }
+
+    /**
+     * Fetches the initial message window via [ChatMessageSyncer.initialCatchUp]: anchored at the
+     * last read message when a large unread backlog exists, the newest messages otherwise.
+     */
+    private suspend fun fetchInitialMessages(weAlreadyHaveSomeOfflineMessages: Boolean) {
+        if (!weAlreadyHaveSomeOfflineMessages) {
+            Log.d(TAG, "An initial online request is made because offline chat is empty")
+            if (networkMonitor.isOnline.value.not()) {
+                // _generalUIFlow.emit(ChatActivity.NO_OFFLINE_MESSAGES_FOUND)
+            }
+        } else {
+            Log.d(
+                TAG,
+                "An initial online request is made because the cached messages don't reach the " +
+                    "lastReadMessage (gaps could be closed by scrolling up to merge the chatblocks)"
+            )
+        }
+
+        Log.d(TAG, "Starting online request for initial loading")
+        syncer.initialCatchUp(
+            target = syncTarget,
+            lastReadMessage = conversationModel.lastReadMessage,
+            unreadMessages = conversationModel.unreadMessages,
+            lastCommonRead = newXChatLastCommonRead,
+            events = syncEvents
+        )
+    }
+
+    override suspend fun startMessagePolling(hasHighPerformanceBackend: Boolean) {
+        if (hasHighPerformanceBackend) {
+            initInsuranceRequests()
+        } else {
+            initLongPolling()
+        }
+    }
+
+    private suspend fun updateUiForLastCommonRead() {
+        newXChatLastCommonRead?.let {
+            _lastCommonReadFlow.emit(it)
+        }
+    }
+
+    suspend fun initLongPolling() {
+        Log.d(TAG, "---- initLongPolling ------------")
+
+        // timeout for first longpoll is 0, so "unread message" info is not shown if there were
+        // initially no messages but someone writes us in the first 30 seconds.
+        var timeout = 0
+        var failureDelayMillis = LONG_POLLING_FAILURE_INITIAL_DELAY
+
+        while (true) {
+            // A paused chat opens no new request. One that is already open is not cancelled: the server keeps
+            // processing a cancelled long poll until its timeout, so cancelling it on every pause, e.g. on each
+            // rotation, only piles up requests on the server.
+            isPaused.first { paused -> !paused }
+
+            // checked right before the request, as the device may have gone offline during the pause or the backoff
+            if (!networkMonitor.isOnline.value) {
+                failureDelayMillis = LONG_POLLING_FAILURE_INITIAL_DELAY
+                networkMonitor.isOnline.first { isOnline -> isOnline }
+                // the chat may have been paused meanwhile
+                continue
+            }
+
+            val newestMessage = chatBlocksDao.getNewestMessageIdFromChatBlocks(internalConversationId, threadId)
+            val fieldMap = getFieldMap(
+                lookIntoFuture = true,
+                timeout = timeout,
+                includeLastKnown = false,
+                lastKnown = newestMessage.toInt()
+            )
+
+            // sync database with server
+            // (This is a long blocking call because long polling (lookIntoFuture and timeout) is set)
+            Log.d(TAG, "Starting online request for long polling after message $newestMessage")
+            val outcome = try {
+                // a failed request is not retried while the chat is paused or the device is offline, the loop waits
+                // for the resume or the network instead
+                syncer.pullAndPersistMessages(syncTarget, fieldMap, syncEvents) {
+                    !isPaused.value && networkMonitor.isOnline.value
+                }
+            } catch (e: CancellationException) {
+                // a cancellation of the polling itself is rethrown, any other CancellationException is a failed
+                // request that must not stop the polling
+                currentCoroutineContext().ensureActive()
+                Log.e(TAG, "Long polling request failed", e)
+                ChatMessageSyncer.SYNC_FAILED
+            }
+            if (outcome.syncFailed) {
+                // A failed request returns right away, e.g. with rejected credentials, which the server counts as a
+                // failed login. Without waiting, the next requests would follow at once until the server throttles.
+                // It is repeated as it was, so a failed first long poll keeps its timeout of 0.
+                failureDelayMillis = waitAfterFailedRequest(failureDelayMillis)
+            } else {
+                timeout = LONG_POLLING_TIMEOUT_SECONDS
+                failureDelayMillis = LONG_POLLING_FAILURE_INITIAL_DELAY
+            }
+        }
+    }
+
+    /**
+     * Waits [delayMillis] after a failed long polling request, and returns how long to wait if the next one fails too.
+     * Requests that failed while the device went offline should not delay the next one, so the wait ends early once
+     * it is online again.
+     */
+    private suspend fun waitAfterFailedRequest(delayMillis: Long): Long {
+        Log.d(TAG, "Long polling failed, next request in $delayMillis ms")
+        val gotOnlineAgain = withTimeoutOrNull(delayMillis) {
+            networkMonitor.isOnline.drop(1).first { isOnline -> isOnline }
+        } != null
+
+        return if (gotOnlineAgain) {
+            LONG_POLLING_FAILURE_INITIAL_DELAY
+        } else {
+            min(delayMillis * 2, LONG_POLLING_FAILURE_MAX_DELAY)
+        }
+    }
+
+    suspend fun initInsuranceRequests() {
+        Log.d(TAG, "---- initInsuranceRequests ------------")
+
+        while (true) {
+            delay(INSURANCE_REQUEST_DELAY)
+            if (isPaused.value) {
+                // ChatViewModel.onResume fetches right away when the chat comes back to the foreground
+                Log.d(TAG, "skip insurance request while paused")
+                continue
+            }
+            Log.d(TAG, "execute insurance request")
+
+            fetchNewMessages()
+        }
+    }
+
+    private suspend fun cleanupExpiredMessages() {
+        syncer.cleanupExpiredMessages(internalConversationId)
+    }
+
+    /**
+     * Fetches messages newer than the newest message known from HTTP syncs.
+     *
+     * The anchor deliberately EXCLUDES messages that were delivered via signaling: those extend
+     * the latest chat block optimistically (assuming they are contiguous on top of it), and this
+     * request is the insurance that verifies the assumption — anchoring on the chat block's
+     * newest message would skip exactly the range it has to check. The anchor lives in the
+     * singleton [ChatMessageSyncer], so it survives reopening the chat.
+     *
+     * No-ops when no HTTP sync has happened yet for this conversation: that means the initial
+     * load hasn't completed (or hasn't even started), which is already fetching this room from
+     * scratch — anchoring at 0 instead would try to close the backlog from the very beginning of
+     * the conversation's history, which for a busy room can't close within
+     * [ChatMessageSyncer.tryCloseBacklog]'s round budget and just burns requests before falling
+     * back anyway.
+     *
+     * Server push notifications are only cleared while the chat is on screen: when the chat is
+     * paused (background, another screen) the request carries markNotificationsAsRead=0, so the
+     * fetch does not dismiss notifications for messages the user has not seen yet.
+     *
+     * @return `true` if at least one new message was received and persisted.
+     */
+    override suspend fun fetchNewMessages(): Boolean {
+        cleanupExpiredMessages()
+
+        val lastHttpSyncedMessageId = syncer.lastHttpSyncedMessageId(internalConversationId, threadId) ?: run {
+            Log.d(TAG, "No HTTP-synced anchor yet for $internalConversationId, skipping insurance fetch")
+            return false
+        }
+
+        // tryCloseBacklog loops until the backlog is fully closed, so a backlog larger than the
+        // request limit is caught up within one insurance cycle instead of narrowing it by one
+        // page every cycle.
+        val outcome = syncer.tryCloseBacklog(
+            target = syncTarget,
+            fromMessageId = lastHttpSyncedMessageId,
+            limit = 200,
+            lastCommonRead = newXChatLastCommonRead,
+            markNotificationsAsRead = !isPaused.value,
+            events = syncEvents
+        )
+        return outcome.persistedNewMessages
+    }
+
+    override suspend fun updateLocalReadState(lastReadMessage: Int) {
+        conversationListUpdater.updateLocalReadState(syncTarget, lastReadMessage)
+    }
+
+    override suspend fun updateLocalUnreadCountOnly(lastReadMessage: Int) {
+        conversationListUpdater.updateLocalUnreadCountOnly(syncTarget, lastReadMessage)
+    }
+
+    override suspend fun updateLocalUnreadState(lastReadMessage: Int) {
+        conversationListUpdater.updateLocalUnreadState(syncTarget, lastReadMessage)
+    }
+
+    override fun markPendingReadMarker(lastReadMessage: Int) {
+        conversationListUpdater.markPendingReadMarker(syncTarget.internalConversationId, lastReadMessage)
+    }
+
+    override suspend fun loadMoreMessages(
+        anchorMessageId: Long,
+        direction: ChatMessageRepository.LoadMoreDirection,
+        roomToken: String,
+        withMessageLimit: Int,
+        withNetworkParams: Bundle
+    ): ChatMessageRepository.MessagesRange? {
+        Log.d(TAG, "---- loadMoreMessages for $anchorMessageId ($direction) ------------")
+
+        val lookIntoFuture = direction == ChatMessageRepository.LoadMoreDirection.NEWER
+
+        val fieldMap = getFieldMap(
+            lookIntoFuture = lookIntoFuture,
+            timeout = 0,
+            includeLastKnown = true,
+            lastKnown = anchorMessageId.toInt(),
+            limit = withMessageLimit
+        )
+
+        Log.d(TAG, "Starting online request for loadMoreMessages")
+        syncer.pullUntilVisibleMessage(syncTarget, fieldMap, syncEvents)
+
+        return syncer.getBlockOfMessage(syncTarget, anchorMessageId.toInt())?.let {
+            ChatMessageRepository.MessagesRange(
+                oldestMessageId = it.oldestMessageId,
+                newestMessageId = it.newestMessageId
+            )
+        }
+    }
+
+    private fun getFieldMap(
+        lookIntoFuture: Boolean,
+        timeout: Int,
+        includeLastKnown: Boolean,
+        lastKnown: Int?,
+        limit: Int = DEFAULT_MESSAGES_LIMIT
+    ): HashMap<String, Int> =
+        syncer.buildFieldMap(
+            lookIntoFuture = lookIntoFuture,
+            timeout = timeout,
+            includeLastKnown = includeLastKnown,
+            lastKnown = lastKnown,
+            limit = limit,
+            threadId = threadId,
+            lastCommonRead = newXChatLastCommonRead
+        )
+
+    override suspend fun getNumberOfThreadReplies(threadId: Long): Int =
+        chatDao.getNumberOfThreadReplies(internalConversationId, threadId)
+
+    override fun getMessage(messageId: Long, bundle: Bundle): Flow<ChatMessage> =
+        flow {
+            val local = chatDao.getChatMessageEntity(internalConversationId, messageId)
+
+            if (local != null) {
+                emit(local.toDomainModel())
+                return@flow
+            }
+
+            fetchAndPersistSingleMessage(messageId)
+
+            emitAll(
+                observeMessageNonNull(internalConversationId, messageId)
+                    .map { it.toDomainModel() }
+                    .take(1)
+            )
+        }
+
+    private suspend fun fetchAndPersistSingleMessage(messageId: Long) {
+        val messages = network.getContextForChatMessage(
+            credentials = credentials,
+            baseUrl = currentUser.baseUrl!!,
+            token = roomToken,
+            messageId = messageId.toString(),
+            limit = 1,
+            threadId = threadId?.toInt()
+        )
+        persistChatMessagesAndHandleSystemMessages(messages)
+    }
+
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    override suspend fun loadMessageContext(
+        messageId: Long,
+        limit: Int,
+        threadId: Long?
+    ): Result<ChatMessageRepository.MessagesRange> =
+        runCatching {
+            val messages = network.getContextForChatMessage(
+                credentials = credentials,
+                baseUrl = currentUser.baseUrl!!,
+                token = roomToken,
+                messageId = messageId.toString(),
+                limit = limit,
+                threadId = threadId?.toInt()
+            )
+
+            val filteredMessages = if (threadId == null) {
+                messages.filter { !it.hasThread || it.threadId == it.id }
+            } else {
+                messages
+            }
+
+            require(filteredMessages.isNotEmpty()) { "No context messages returned" }
+
+            val persisted = persistChatMessagesAndHandleSystemMessages(filteredMessages)
+            val oldestId = persisted.minOf { it.id }
+            val newestId = persisted.maxOf { it.id }
+
+            val block = ChatBlockEntity(
+                internalConversationId = internalConversationId,
+                accountId = currentUser.id!!,
+                token = roomToken,
+                threadId = this.threadId,
+                oldestMessageId = oldestId,
+                newestMessageId = newestId,
+                hasHistory = true
+            )
+            chatBlocksDao.upsertAndMergeConnectedChatBlocks(block)
+
+            ChatMessageRepository.MessagesRange(
+                oldestMessageId = oldestId,
+                newestMessageId = newestId
+            )
+        }
+
+    override fun observeParentMessages(parentIds: List<Long>): Flow<List<ChatMessage>> =
+        chatDao.getMessagesFromIds(parentIds)
+            .map { entities -> entities.map { it.toDomainModel() } }
+
+    fun observeMessageNonNull(internalConversationId: String, messageId: Long): Flow<ChatMessageEntity> =
+        chatDao.observeMessage(internalConversationId, messageId)
+            .filterNotNull()
+
+    override suspend fun getParentMessageById(messageId: Long): Flow<ChatMessage> =
+        chatDao.getChatMessageForConversation(
+            internalConversationId,
+            messageId
+        ).map(ChatMessageEntity::toDomainModel)
+
+    override suspend fun fetchMissingParents(conversationId: String, parentIds: List<Long>) {
+        val newIds = parentIds.filterNot { it in requestedParentIds }
+
+        if (newIds.isEmpty()) return
+
+        requestedParentIds.addAll(newIds)
+
+        for (id in newIds) {
+            try {
+                val messages = network.getContextForChatMessage(
+                    credentials = credentials,
+                    baseUrl = currentUser.baseUrl!!,
+                    token = roomToken,
+                    messageId = id.toString(),
+                    limit = 1,
+                    threadId = null
+                )
+
+                val message = messages.firstOrNull { it.id == id } ?: continue
+                chatDao.upsertChatMessage(message.asEntity(currentUser.id!!))
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to fetch parent message $id", e)
+            }
+        }
+    }
+
+    private fun isUntranslatedSystemMessage(messagesJson: List<ChatMessageDto>): Boolean =
+        syncer.isUntranslatedSystemMessage(messagesJson)
+
+    override fun handleOnPause() {
+        isPaused.value = true
+    }
+
+    override fun handleOnResume() {
+        isPaused.value = false
+    }
+
+    override fun handleOnStop() {
+        // not used
+    }
+
+    @Suppress("LongParameterList")
+    override suspend fun sendChatMessage(
+        credentials: String,
+        url: String,
+        message: String,
+        displayName: String,
+        replyTo: Int,
+        sendWithoutNotification: Boolean,
+        referenceId: String,
+        threadTitle: String?
+    ): Flow<Result<ChatMessage?>> {
+        if (!networkMonitor.isOnline.value) {
+            return flow {
+                emit(Result.failure(IOException("Skipped to send message as device is offline")))
+            }
+        }
+
+        return flow {
+            val response = network.sendChatMessage(
+                credentials,
+                url,
+                message,
+                displayName,
+                replyTo,
+                sendWithoutNotification,
+                referenceId,
+                threadTitle
+            )
+
+            val chatMessageModel = response.ocs?.data?.toDomainModel()
+
+            val sentMessage = if (this@OfflineFirstChatRepository::internalConversationId.isInitialized) {
+                chatDao
+                    .getTempMessageForConversation(
+                        internalConversationId,
+                        referenceId,
+                        threadId
+                    ).firstOrNull()
+            } else {
+                null
+            }
+
+            sentMessage?.let {
+                it.sendStatus = SendStatus.SENT_PENDING_ACK
+                chatDao.updateChatMessage(it)
+            }
+
+            Log.d(TAG, "sending chat message succeeded: " + message)
+            emit(Result.success(chatMessageModel))
+        }
+            .catch { e ->
+                Log.e(TAG, "Error when sending message", e)
+
+                val failedMessage = if (this@OfflineFirstChatRepository::internalConversationId.isInitialized) {
+                    chatDao.getTempMessageForConversation(
+                        internalConversationId,
+                        referenceId,
+                        threadId
+                    ).firstOrNull()
+                } else {
+                    null
+                }
+                failedMessage?.let {
+                    it.sendStatus = SendStatus.FAILED
+                    chatDao.updateChatMessage(it)
+
+                    val failedMessageModel = it.toDomainModel()
+                    _updateMessageFlow.emit(failedMessageModel)
+                }
+                emit(Result.failure(e))
+            }
+    }
+
+    override suspend fun markMessageForResend(referenceId: String): Flow<Result<ChatMessage?>> {
+        val messageToResend = chatDao.getTempMessageForConversation(
+            internalConversationId,
+            referenceId,
+            threadId
+        ).firstOrNull()
+        return if (messageToResend != null) {
+            messageToResend.sendStatus = SendStatus.PENDING
+            chatDao.updateChatMessage(messageToResend)
+
+            val messageToResendModel = messageToResend.toDomainModel()
+            _updateMessageFlow.emit(messageToResendModel)
+
+            flow {
+                emit(Result.success(messageToResendModel))
+            }
+        } else {
+            flow {
+                emit(Result.failure(IllegalStateException("No temporary message found to resend")))
+            }
+        }
+    }
+
+    override suspend fun failPendingMessagesWithoutSendWork(createdBefore: Long): Int =
+        chatDao.failPendingTempTextMessages(internalConversationId, createdBefore)
+
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    override suspend fun addTemporaryMessage(
+        message: CharSequence,
+        displayName: String,
+        replyTo: Int,
+        sendWithoutNotification: Boolean,
+        referenceId: String
+    ): Flow<Result<ChatMessage?>> =
+        flow {
+            try {
+                val tempChatMessageEntity = createChatMessageEntity(
+                    internalConversationId,
+                    message.toString(),
+                    replyTo,
+                    sendWithoutNotification,
+                    referenceId
+                )
+                chatDao.upsertChatMessage(tempChatMessageEntity)
+                emit(Result.success(tempChatMessageEntity.toDomainModel()))
+            } catch (e: CancellationException) {
+                // a collector (e.g. first()/take(1)) is done with the flow, not a real failure -
+                // rethrow instead of turning it into a Result.failure emission, which would violate
+                // flow exception transparency since the collector already stopped listening
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Something went wrong when adding temporary message", e)
+                emit(Result.failure(e))
+            }
+        }
+
+    @Suppress("Detekt.TooGenericExceptionCaught", "LongMethod")
+    override suspend fun addUploadPlaceholderMessage(
+        localFileUri: String,
+        fileName: String,
+        caption: String,
+        mimeType: String?,
+        fileSize: Long,
+        referenceId: String
+    ): Flow<Result<ChatMessage?>> =
+        flow {
+            try {
+                // Use referenceId.hashCode() as the placeholder id so that:
+                // 1. It is unique per file even when multiple files are selected simultaneously
+                // 2. It fits in an Int, so it survives the Long→Int cast in ChatMessageUi.id without
+                //    truncation, keeping DB lookups consistent when the message is tapped.
+                // 3. It is always negative -> sending the lastReadMessage to server checks "-1 < messageId"
+                //    to avoid temporary/placeholder messages (see createChatMessageEntity)
+                @Suppress("MagicNumber")
+                val placeholderId = -(referenceId.hashCode().toLong() and 0x7FFF_FFFFL)
+
+                Log.d(
+                    TAG,
+                    "addUploadPlaceholderMessage: referenceId=$referenceId " +
+                        "placeholderId=$placeholderId caption=$caption"
+                )
+
+                val fileParams = hashMapOf<String?, String?>(
+                    "type" to "file",
+                    "name" to fileName,
+                    "mimetype" to (mimeType ?: ""),
+                    "size" to fileSize.toString(),
+                    "path" to localFileUri
+                )
+                val messageParameters = hashMapOf<String?, HashMap<String?, String?>>(
+                    "file" to fileParams
+                )
+
+                val entity = ChatMessageEntity(
+                    internalId = "$internalConversationId@_temp_$referenceId",
+                    internalConversationId = internalConversationId,
+                    id = placeholderId,
+                    threadId = threadId,
+                    // "{file}" is the sentinel the server (and rest of this app) uses for "no caption"
+                    message = caption.ifEmpty { "{file}" },
+                    deleted = false,
+                    token = conversationModel.token,
+                    actorId = currentUser.userId!!,
+                    actorType = EnumActorTypeConverter().convertToString(ParticipantDto.ActorType.USERS),
+                    accountId = currentUser.id!!,
+                    messageParameters = messageParameters,
+                    messageType = "comment",
+                    parentMessageId = null,
+                    systemMessageType = ChatMessage.SystemMessageType.DUMMY,
+                    replyable = false,
+                    timestamp = nextPlaceholderTimestampSeconds(),
+                    expirationTimestamp = 0,
+                    actorDisplayName = currentUser.displayName!!,
+                    referenceId = referenceId,
+                    isTemporary = true,
+                    sendStatus = SendStatus.PENDING,
+                    silent = false
+                )
+                // The worker is enqueued before this runs, so a sync may already have stored the server copy.
+                // upsertChatMessagesAndDeleteTemp removed temp messages only at that time, so a placeholder
+                // stored now would stay pending next to the real message.
+                if (!chatDao.upsertTempChatMessageUnlessServerCopyExists(entity)) {
+                    Log.d(TAG, "addUploadPlaceholderMessage: skipped, server copy of $referenceId already stored")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "addUploadPlaceholderMessage failed for referenceId=$referenceId", e)
+                emit(Result.failure(e))
+            }
+        }
+
+    override suspend fun deleteTempMessageByReferenceId(referenceId: String): Boolean =
+        chatDao.deleteTempChatMessageIfPending(internalConversationId, referenceId) > 0
+
+    override suspend fun markUploadPlaceholderFailed(referenceId: String) {
+        val entity = chatDao.getTempMessageForConversation(internalConversationId, referenceId, null).firstOrNull()
+        if (entity?.sendStatus == SendStatus.PENDING) {
+            // called from viewModelScope: updateChatMessage is a blocking Room call
+            withContext(Dispatchers.IO) { chatDao.updateChatMessage(entity.copy(sendStatus = SendStatus.FAILED)) }
+        }
+    }
+
+    override suspend fun editChatMessage(
+        credentials: String,
+        url: String,
+        messageId: Long,
+        text: String
+    ): Result<ChatOverallSingleMessage> {
+        val result = optimisticAction(
+            apply = { applyLocalEdit(messageId, text) },
+            isConfirmed = ::editAccepted,
+            request = { network.editChatMessage(credentials, url, text) }
+        ).onFailure { logger.e(TAG, "Failed to edit chat message $messageId", it) }
+
+        result.getOrNull()?.takeIf(::editAccepted)?.let { persistEditedMessage(messageId, it) }
+
+        return result
+    }
+
+    /**
+     * A status code other than 200 means the server refused the edit, for instance because the
+     * message is too old, and the optimistic edit has to be taken back.
+     */
+    private fun editAccepted(response: ChatOverallSingleMessage): Boolean =
+        response.ocs?.meta?.statusCode.let { it == null || it == HTTP_OK }
+
+    /**
+     * Writes [text] into the cached message together with the edit metadata the bubble shows, and
+     * returns the action that restores the previous version. The revert only applies while the message
+     * still carries the local edit, so a server payload that arrived meanwhile stays authoritative.
+     */
+    private suspend fun applyLocalEdit(messageId: Long, text: String): Undo? {
+        val message = chatDao.getChatMessageEntity(internalConversationId, messageId)
+        if (message == null || message.message == text) return null
+
+        val previousMessage = message.message
+        val previousTimestamp = message.lastEditTimestamp
+        val previousActorId = message.lastEditActorId
+        val previousActorType = message.lastEditActorType
+        val previousActorDisplayName = message.lastEditActorDisplayName
+
+        message.message = text
+        message.lastEditTimestamp = System.currentTimeMillis() / MILLIES
+        message.lastEditActorId = currentUser.userId
+        message.lastEditActorType = ParticipantDto.ActorType.USERS.name.lowercase()
+        message.lastEditActorDisplayName = currentUser.displayName
+        withContext(Dispatchers.IO) { chatDao.updateChatMessage(message) }
+
+        return {
+            val current = chatDao.getChatMessageEntity(internalConversationId, messageId)
+            if (current != null && current.message == text) {
+                current.message = previousMessage
+                current.lastEditTimestamp = previousTimestamp
+                current.lastEditActorId = previousActorId
+                current.lastEditActorType = previousActorType
+                current.lastEditActorDisplayName = previousActorDisplayName
+                withContext(Dispatchers.IO) { chatDao.updateChatMessage(current) }
+            }
+        }
+    }
+
+    /**
+     * The edit endpoint answers with the system message about the edit; the edited message itself is
+     * that system message's parent, the same shape [ChatMessageSyncer] handles for MESSAGE_EDITED.
+     * Without a usable parent the local edit stands as it is and the next sync confirms it.
+     */
+    private suspend fun persistEditedMessage(messageId: Long, response: ChatOverallSingleMessage) {
+        val edited = response.ocs?.data?.parentMessage?.takeIf { it.id == messageId } ?: return
+        val message = chatDao.getChatMessageEntity(internalConversationId, messageId) ?: return
+
+        message.message = edited.message ?: message.message
+        message.lastEditTimestamp = edited.lastEditTimestamp ?: message.lastEditTimestamp
+        message.lastEditActorId = edited.lastEditActorId ?: message.lastEditActorId
+        message.lastEditActorType = edited.lastEditActorType ?: message.lastEditActorType
+        message.lastEditActorDisplayName = edited.lastEditActorDisplayName ?: message.lastEditActorDisplayName
+        withContext(Dispatchers.IO) { chatDao.updateChatMessage(message) }
+    }
+
+    override suspend fun deleteChatMessage(
+        credentials: String,
+        url: String,
+        messageId: Long,
+        deletedPlaceholder: String
+    ): Result<ChatOverallSingleMessage?> =
+        optimisticAction(
+            apply = { applyLocalDeletion(messageId, deletedPlaceholder) },
+            request = {
+                try {
+                    network.deleteChatMessage(credentials, url)
+                } catch (e: HttpException) {
+                    if (e.code() != HTTP_NOT_FOUND) throw e
+                    // the server does not know the message any more, so it is gone either way and the
+                    // local deletion stands
+                    logger.w(TAG, "Message $messageId was already gone on the server when deleting it", e)
+                    null
+                }
+            }
+        ).onFailure { logger.e(TAG, "Failed to delete chat message $messageId", it) }
+
+    /**
+     * Renders the message as deleted in the local database and returns the action that puts it back,
+     * or null when there was nothing to change. The revert only applies while the message still carries
+     * the local deletion, so a server payload that arrived meanwhile stays authoritative.
+     */
+    private suspend fun applyLocalDeletion(messageId: Long, deletedPlaceholder: String): Undo? {
+        val message = chatDao.getChatMessageEntity(internalConversationId, messageId)
+        if (message == null || message.messageType == MESSAGE_TYPE_DELETED) return null
+
+        val previousMessageType = message.messageType
+        val previousMessage = message.message
+        val previousDeleted = message.deleted
+        // the deleted message the server sends back carries no file, poll or location any more, so the
+        // parameters have to go as well - otherwise the bubble keeps rendering the attachment
+        val previousMessageParameters = message.messageParameters
+
+        message.messageType = MESSAGE_TYPE_DELETED
+        message.message = deletedPlaceholder
+        message.deleted = true
+        message.messageParameters = null
+        withContext(Dispatchers.IO) { chatDao.updateChatMessage(message) }
+
+        return {
+            val current = chatDao.getChatMessageEntity(internalConversationId, messageId)
+            if (current != null && current.messageType == MESSAGE_TYPE_DELETED) {
+                current.messageType = previousMessageType
+                current.message = previousMessage
+                current.deleted = previousDeleted
+                current.messageParameters = previousMessageParameters
+                withContext(Dispatchers.IO) { chatDao.updateChatMessage(current) }
+            }
+        }
+    }
+
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    override suspend fun editTempChatMessage(message: ChatMessage, editedMessageText: String): Flow<Boolean> =
+        flow {
+            try {
+                // Only the text is written: the row is shared with SendMessageWorker, which sets sendStatus.
+                chatDao.updateMessageText(
+                    internalConversationId,
+                    message.jsonMessageId.toLong(),
+                    editedMessageText
+                )
+                val messageToEdit = chatDao.getChatMessageForConversation(
+                    internalConversationId,
+                    message.jsonMessageId.toLong()
+                ).first()
+
+                val editedMessageModel = messageToEdit.toDomainModel()
+                _updateMessageFlow.emit(editedMessageModel)
+                emit(true)
+            } catch (e: Exception) {
+                logger.e(TAG, "Failed to edit temp chat message ${message.jsonMessageId}", e)
+                emit(false)
+            }
+        }
+
+    override suspend fun sendUnsentChatMessages(credentials: String, url: String) {
+        val tempMessages = chatDao.getTempUnsentMessagesForConversation(internalConversationId, threadId).first()
+        // File-upload placeholders are also temporary messages, but they must never be resent as plain
+        // text here: their "message" field is just the "{file}" sentinel, and a failed/interrupted upload
+        // needs a real re-upload, not a bogus text message reusing its referenceId.
+        val unsentTextMessages = tempMessages.filterNot { it.messageParameters?.containsKey("file") == true }
+        unsentTextMessages.sortedBy { it.internalId }.onEach {
+            sendChatMessage(
+                credentials,
+                url,
+                it.message,
+                it.actorDisplayName,
+                it.parentMessageId?.toIntOrZero() ?: 0,
+                it.silent,
+                it.referenceId.orEmpty(),
+                null
+            ).collect { result ->
+                if (result.isSuccess) {
+                    Log.d(TAG, "Sent temp message")
+                } else {
+                    Log.e(TAG, "Failed to send temp message")
+                }
+            }
+        }
+    }
+
+    override suspend fun deleteTempMessage(chatMessage: ChatMessage) {
+        chatDao.deleteTempChatMessages(internalConversationId, listOf(chatMessage.referenceId.orEmpty()))
+    }
+
+    override suspend fun pinMessage(
+        credentials: String,
+        url: String,
+        pinUntil: Int,
+        messageId: Long
+    ): Result<ChatMessage?> =
+        withLocalPinnedMessage(messageId, pinned = true) {
+            network.pinMessage(credentials, url, pinUntil)
+        }
+
+    override suspend fun unPinMessage(credentials: String, url: String, messageId: Long): Result<ChatMessage?> =
+        withLocalPinnedMessage(messageId, pinned = false) {
+            network.unPinMessage(credentials, url)
+        }
+
+    private suspend fun withLocalPinnedMessage(
+        messageId: Long,
+        pinned: Boolean,
+        request: suspend () -> ChatOverallSingleMessage
+    ): Result<ChatMessage?> {
+        // the shared items screen pins and unpins without ever opening the chat, so there is no local
+        // conversation to update from here
+        val restore = if (isChatDataInitialized()) {
+            conversationListUpdater.updateLocalPinnedMessage(syncTarget, messageId, pinned)
+        } else {
+            null
+        }
+
+        return optimisticAction(apply = { restore }, request = request)
+            .onSuccess {
+                // the room refresh that follows is computed after this change reached the server, so
+                // the guard has done its job and must not outlive the request
+                conversationListUpdater.clearPendingPinnedMessage(internalConversationId)
+            }
+            .onFailure { logger.e(TAG, "Error while pinning or unpinning a message", it) }
+            .map { it.ocs?.data?.toDomainModel() }
+    }
+
+    private fun isChatDataInitialized(): Boolean =
+        this::currentUser.isInitialized && this::roomToken.isInitialized && this::credentials.isInitialized
+
+    override suspend fun hidePinnedMessage(credentials: String, url: String, messageId: Long): Result<Boolean> {
+        // the shared items screen has no chat data, the same way pinning handles it
+        val restore = if (isChatDataInitialized()) {
+            conversationListUpdater.updateLocalHiddenPinnedMessage(syncTarget, messageId)
+        } else {
+            null
+        }
+
+        return optimisticAction(apply = { restore }, request = { network.hidePinnedMessage(credentials, url) })
+            .onSuccess { conversationListUpdater.clearPendingHiddenPinnedMessage(internalConversationId) }
+            .onFailure { logger.e(TAG, "Error while hiding the pinned message", it) }
+            .map { true }
+    }
+
+    override suspend fun onSignalingChatMessageReceived(chatMessages: List<ChatMessageDto>) {
+        // check if we need to get user specific data from the backend
+        if (!isUntranslatedSystemMessage(chatMessages) ||
+            chatMessages.any { it.messageParameters?.containsKey("file") == true }
+        ) {
+            Log.d(TAG, "onSignalingChatMessageReceived force data refresh")
+            fetchNewMessages()
+            return
+        }
+
+        persistChatMessagesAndHandleSystemMessages(chatMessages, emitOnIncoming = true)
+
+        // we assume that the signaling messages are on top of the latest chatblock and include them inside it.
+        // If for whatever reason the assumption was not correct and there would be messages in between, the
+        // insurance request should fix this by adding the missing messages and updating the chatblocks.
+        val latestChatBlock = chatBlocksDao.getLatestChatBlock(internalConversationId, threadId)
+        latestChatBlock.first()?.apply {
+            newestMessageId = chatMessages.maxOf { it.id }
+            chatBlocksDao.upsertChatBlock(this)
+        }
+    }
+
+    suspend fun persistChatMessagesAndHandleSystemMessages(
+        chatMessages: List<ChatMessageDto>,
+        emitOnIncoming: Boolean = false
+    ): List<ChatMessageEntity> =
+        syncer.persistChatMessagesAndHandleSystemMessages(syncTarget, chatMessages, emitOnIncoming, syncEvents)
+
+    override fun observeLatestMessages(internalConversationId: String): Flow<List<ChatMessageEntity>> =
+        chatBlocksDao
+            .getLatestChatBlock(internalConversationId, threadId)
+            .distinctUntilChanged()
+            .flatMapLatest { latestBlock ->
+
+                if (latestBlock == null) {
+                    flowOf(emptyList())
+                } else {
+                    chatDao.getMessagesEqualOrNewerThan(
+                        internalConversationId = internalConversationId,
+                        threadId = threadId,
+                        oldestMessageId = latestBlock.oldestMessageId
+                    )
+                }
+            }
+
+    override fun observeMessagesForAnchor(
+        internalConversationId: String,
+        anchorMessageId: Long
+    ): Flow<List<ChatMessageEntity>> =
+        chatBlocksDao
+            .getChatBlocksContainingMessageId(
+                internalConversationId = internalConversationId,
+                threadId = threadId,
+                messageId = anchorMessageId
+            )
+            .distinctUntilChanged()
+            .flatMapLatest { blocks ->
+                val block = blocks.firstOrNull()
+                if (block == null) {
+                    flowOf(emptyList())
+                } else {
+                    chatDao.getMessagesInRange(
+                        internalConversationId = internalConversationId,
+                        threadId = threadId,
+                        oldestMessageId = block.oldestMessageId,
+                        newestMessageId = block.newestMessageId
+                    )
+                }
+            }
+
+    @Suppress("LongParameterList")
+    override suspend fun sendScheduledChatMessage(
+        credentials: String,
+        url: String,
+        message: String,
+        replyTo: Int?,
+        sendWithoutNotification: Boolean,
+        threadTitle: String?,
+        threadId: Long?,
+        sendAt: Int?
+    ): Flow<Result<ChatOverallSingleMessage>> =
+        flow {
+            val response = network.sendScheduledChatMessage(
+                credentials,
+                url,
+                message,
+                replyTo,
+                sendWithoutNotification,
+                threadTitle,
+                threadId,
+                sendAt
+            )
+            emit(Result.success(response))
+        }.catch { e ->
+            Log.e(TAG, "Error when scheduling message", e)
+            emit(Result.failure(e))
+        }
+
+    override suspend fun updateScheduledChatMessage(
+        credentials: String,
+        url: String,
+        message: String,
+        sendAt: Int?,
+        sendWithoutNotification: Boolean
+    ): Flow<Result<ChatMessage>> =
+        flow {
+            val response = network.updateScheduledMessage(
+                credentials,
+                url,
+                message,
+                sendAt,
+                sendWithoutNotification
+            )
+
+            val messageJson = response.ocs?.data
+                ?: error("updateScheduledMessage: response.ocs?.data is null")
+
+            val updatedMessage = messageJson.toDomainModel().copy(
+                token = messageJson.id.toString()
+            )
+
+            emit(Result.success(updatedMessage))
+        }.catch { e ->
+            Log.e(TAG, "Error when updating scheduled message", e)
+            emit(Result.failure(e))
+        }
+
+    override suspend fun deleteScheduledChatMessage(credentials: String, url: String): Flow<Result<GenericOverall>> =
+        flow {
+            val response = network.deleteScheduledMessage(credentials, url)
+            emit(Result.success(response))
+        }.catch { e ->
+            Log.e(TAG, "Error when deleting scheduled message", e)
+            emit(Result.failure(e))
+        }
+
+    override suspend fun getScheduledChatMessages(credentials: String, url: String): Flow<Result<List<ChatMessage>>> =
+        flow {
+            val response = network.getScheduledMessages(credentials, url)
+            val messages = response.ocs?.data.orEmpty().map { messageJson ->
+                val jsonToModel = messageJson.toDomainModel()
+                jsonToModel.copy(
+                    token = messageJson.id.toString()
+                )
+            }
+            emit(Result.success(messages))
+            Log.d("Get Scheduled", "$messages")
+        }.catch { e ->
+            Log.e(TAG, "Error when fetching scheduled messages", e)
+            emit(Result.failure(e))
+        }
+
+    private fun createChatMessageEntity(
+        internalConversationId: String,
+        message: String,
+        replyTo: Int,
+        sendWithoutNotification: Boolean,
+        referenceId: String
+    ): ChatMessageEntity {
+        val currentTimeMillis = System.currentTimeMillis()
+
+        // only use the time of a day so it can fit into an integer
+        val timeOfDayMillis = SendMessageUtils().timeOfDayMillis(currentTimeMillis)
+
+        // make it negative -> sending the lastReadMessage to server checks "-1 < messageId" to avoid temporary messages
+        val negativeTimeOfDayMillis = timeOfDayMillis * MINUS_ONE
+
+        val parentMessageId = if (replyTo != 0) {
+            replyTo.toLong()
+        } else {
+            null
+        }
+
+        val entity = ChatMessageEntity(
+            internalId = "$internalConversationId@_temp_$currentTimeMillis",
+            internalConversationId = internalConversationId,
+            id = negativeTimeOfDayMillis,
+            threadId = threadId,
+            message = message,
+            deleted = false,
+            token = conversationModel.token,
+            actorId = currentUser.userId!!,
+            actorType = EnumActorTypeConverter().convertToString(ParticipantDto.ActorType.USERS),
+            accountId = currentUser.id!!,
+            messageParameters = null,
+            messageType = "comment",
+            parentMessageId = parentMessageId,
+            systemMessageType = ChatMessage.SystemMessageType.DUMMY,
+            replyable = false,
+            timestamp = currentTimeMillis / MILLIES,
+            expirationTimestamp = 0,
+            actorDisplayName = currentUser.displayName!!,
+            referenceId = referenceId,
+            isTemporary = true,
+            sendStatus = SendStatus.PENDING,
+            silent = sendWithoutNotification
+        )
+        return entity
+    }
+
+    companion object {
+        val TAG: String = OfflineFirstChatRepository::class.java.simpleName
+        private const val LONG_POLLING_TIMEOUT_SECONDS = 30
+        private const val LONG_POLLING_FAILURE_INITIAL_DELAY = 1_000L
+        private const val LONG_POLLING_FAILURE_MAX_DELAY = 60_000L
+        private const val DEFAULT_MESSAGES_LIMIT = 100
+        private const val MILLIES = 1000L
+        private const val INSURANCE_REQUEST_DELAY = 2 * 60 * MILLIES
+
+        private const val MINUS_ONE = -1L
+
+        private const val MESSAGE_TYPE_DELETED = "comment_deleted"
+        private const val HTTP_OK = 200
+        private const val HTTP_NOT_FOUND = 404
+    }
+}

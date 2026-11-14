@@ -7,11 +7,13 @@
 package com.nextcloud.talk.ui.dialog
 
 import android.app.Dialog
+import android.content.DialogInterface
 import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.core.os.BundleCompat
 import androidx.fragment.app.DialogFragment
 import autodagger.AutoInjector
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -19,9 +21,12 @@ import com.nextcloud.talk.R
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
 import com.nextcloud.talk.conversationlist.ConversationsListActivity
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.DialogFilterConversationBinding
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
-import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil.hasSpreedFeatureCapability
+import com.nextcloud.talk.utils.SpreedFeatures
 import com.nextcloud.talk.utils.UserIdUtils
 import javax.inject.Inject
 
@@ -30,9 +35,7 @@ class FilterConversationFragment : DialogFragment() {
     lateinit var binding: DialogFilterConversationBinding
     private var dialogView: View? = null
     private lateinit var filterState: HashMap<String, Boolean>
-
-    @Inject
-    lateinit var userManager: UserManager
+    private lateinit var user: User
 
     @Inject
     lateinit var viewThemeUtils: ViewThemeUtils
@@ -40,18 +43,20 @@ class FilterConversationFragment : DialogFragment() {
     @Inject
     lateinit var arbitraryStorageManager: ArbitraryStorageManager
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
-        binding = DialogFilterConversationBinding.inflate(LayoutInflater.from(context))
+        binding = DialogFilterConversationBinding.inflate(layoutInflater)
         dialogView = binding.root
         filterState = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             arguments?.getSerializable(FILTER_STATE_ARG, HashMap::class.java) as HashMap<String, Boolean>
         } else {
             arguments?.getSerializable(FILTER_STATE_ARG) as HashMap<String, Boolean>
         }
+        user = BundleCompat.getParcelable(requireArguments(), USER_ARG, User::class.java)!!
         return MaterialAlertDialogBuilder(requireContext()).setView(dialogView).create()
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
         setUpColors()
         setUpListeners()
         return inflater.inflate(R.layout.dialog_filter_conversation, container, false)
@@ -69,9 +74,10 @@ class FilterConversationFragment : DialogFragment() {
         binding.run {
             listOf(
                 unreadFilterChip,
-                mentionedFilterChip
+                mentionedFilterChip,
+                archivedFilterChip
             )
-        }.forEach(viewThemeUtils.material::themeChipFilter)
+        }.forEach(viewThemeUtils.talk::themeChipFilter)
 
         setUpChips()
     }
@@ -89,7 +95,21 @@ class FilterConversationFragment : DialogFragment() {
             processSubmit()
         }
 
+        binding.archivedFilterChip.setOnCheckedChangeListener { _, isChecked ->
+            filterState[ARCHIVE] = isChecked
+            binding.archivedFilterChip.isChecked = isChecked
+            processSubmit()
+        }
+
         binding.buttonClose.setOnClickListener {
+            val noFiltersActive = !(
+                filterState[MENTION] == true ||
+                    filterState[UNREAD] == true ||
+                    filterState[ARCHIVE] == true
+                )
+            if (noFiltersActive) {
+                (requireActivity() as ConversationsListActivity).showOnlyNearFutureEvents()
+            }
             dismiss()
         }
     }
@@ -97,28 +117,52 @@ class FilterConversationFragment : DialogFragment() {
     private fun setUpChips() {
         binding.unreadFilterChip.isChecked = filterState[UNREAD]!!
         binding.mentionedFilterChip.isChecked = filterState[MENTION]!!
+
+        binding.archivedFilterChip.visibility = View.GONE
+        user.capabilities?.spreedCapability?.let {
+            if (hasSpreedFeatureCapability(it, SpreedFeatures.ARCHIVE_CONVERSATIONS)) {
+                binding.archivedFilterChip.visibility = View.VISIBLE
+                binding.archivedFilterChip.isChecked = filterState[ARCHIVE]!!
+            }
+        }
     }
 
     private fun processSubmit() {
         // store
-        val accountId = UserIdUtils.getIdForUser(userManager.currentUser.blockingGet())
+        val accountId = UserIdUtils.getIdForUser(user)
         val mentionValue = filterState[MENTION] == true
         val unreadValue = filterState[UNREAD] == true
+        val archivedValue = filterState[ARCHIVE] == true
 
         arbitraryStorageManager.storeStorageSetting(accountId, MENTION, mentionValue.toString(), "")
         arbitraryStorageManager.storeStorageSetting(accountId, UNREAD, unreadValue.toString(), "")
+        arbitraryStorageManager.storeStorageSetting(accountId, ARCHIVE, archivedValue.toString(), "")
 
         (requireActivity() as ConversationsListActivity).filterConversation()
     }
 
+    override fun onDismiss(dialog: DialogInterface) {
+        super.onDismiss(dialog)
+        val noFiltersActive = !(
+            filterState[MENTION] == true ||
+                filterState[UNREAD] == true ||
+                filterState[ARCHIVE] == true
+            )
+        if (noFiltersActive) {
+            (requireActivity() as ConversationsListActivity).showOnlyNearFutureEvents()
+        }
+    }
+
     companion object {
         private const val FILTER_STATE_ARG = "FILTER_STATE_ARG"
+        private const val USER_ARG = "USER_ARG"
 
         @JvmStatic
-        fun newInstance(savedFilterState: MutableMap<String, Boolean>): FilterConversationFragment {
+        fun newInstance(savedFilterState: MutableMap<String, Boolean>, user: User): FilterConversationFragment {
             val filterConversationFragment = FilterConversationFragment()
             val args = Bundle()
             args.putSerializable(FILTER_STATE_ARG, HashMap(savedFilterState))
+            args.putParcelable(USER_ARG, user)
             filterConversationFragment.arguments = args
             return filterConversationFragment
         }
@@ -126,5 +170,7 @@ class FilterConversationFragment : DialogFragment() {
         val TAG: String = FilterConversationFragment::class.java.simpleName
         const val MENTION: String = "mention"
         const val UNREAD: String = "unread"
+        const val ARCHIVE: String = "archive"
+        const val DEFAULT: String = "default"
     }
 }

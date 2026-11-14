@@ -9,6 +9,503 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Types of changes can be: Added/Changed/Deprecated/Removed/Fixed/Security
 
+## [25.0.2] - 2026-10-02
+
+### Fixed
+- Long-press on messages fails to open menu (for reactions etc)
+- Notifications sometimes do not show up when using Android 11 or lower
+- Ports in links are discarded
+- Crashes
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/116?closed=1
+
+## [25.0.1] - 2026-09-23
+
+### Added
+- More logging
+- Faster feedback when adding reactions, deletion messages, do edits and pin messages
+
+### Fixed
+- Message gets marked as read after set it to unread
+- Crashes
+- Call interruptions
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/115?closed=1
+
+## [25.0.0] - 2026-09-15
+
+### Added
+- Conversation tags
+- Classified conversations (@thirumani-vihaan)
+- Support conversation types announcement, channel, webinar, presentation, classified conversation
+- New file-share preview screen with compression option
+- Show upload progress for files inside chat (@anakin78z)
+- Grouping and swiping of files in chat
+- Preloading of conversations and chats in background (improve offline handling, performance and UX)
+- Voice message playback via android controls
+- Emoji picker and color picker for conversation avatars
+- New diagnosis and logs section in settings
+- Crash screen with reporting options
+- Android Auto support (@anakin78z)
+- Improved markdown tables rendering
+- Show avatar in appbar also for groupchats
+- Show images in notifications
+
+### Changed
+- Use android OS camera instead in-app camera
+- New emoji picker
+- Light/dark map styles for geolocation map
+
+### Fixed
+- Emoji picker flickering
+- Call issues for Android 9 and below
+- Fail to allow self signed certificate without SAN
+- App warns it is outdated when E2EE is enabled for calls on server side (fix for now is to allow chats but show a "unsupported" warning for calls. Please update Nextcloud servers to newest versions. E2EE for mobile calls will come in the future.)
+- Various bugs (@tareko)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/113?closed=1
+
+## [24.0.4] - 2026-08-24
+
+### Fixed
+- Same fixes as in 24.0.3 but the wrong flavor was released at gplay so notifications did not work.
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+## [24.0.3] - 2026-08-20
+
+### Fixed
+- bugs and crashes
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/112?closed=1
+
+## [24.0.2] - 2026-07-03
+
+### Changed
+- Remove call blur feature for generic build (F-droid compatible)
+
+### Fixed
+- Fix linebreaks in chat
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/111?closed=1
+
+## [24.0.1] - 2026-06-15
+
+### Changed
+- Improved markdown tables styling
+- Improved Chat Bubble corner radius
+
+### Fixed
+- Timestamp for some messages is shown squeezed
+- Some notifications are not shown
+- Some markdown tables are not shown
+- Long messages in edit text field are not scrollable / Edit controls are not reachable
+- Crashes
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/110?closed=1
+
+## [24.0.0] - 2026-06-08
+
+### Added
+- Unified Push support (@p1gp1g)
+- Permanent call rooms (requires spreed 24.0)
+- Support attachment folders per room (requires spreed 24.0)
+- New message search
+- Improve ordering of search results in main screen
+- Jump to old quoted messages in chat (no more popup result windows)
+- Sticky date header in chat
+- Improve chat performance with HPB (chat relay)
+- Loading progress bar for chat and search
+- Blurhash for image previews
+- Background blurring for calls
+- Direct Share targets (@anakin78z)
+- Deep link support (@angrymuesli)
+- Add fullscreen permission config in settings (please activate if calls have problems with lockscreen)
+
+### Changed
+- Major changes behind the scene (remove ChatKit library, rewrite chat logic, migrations to Jetpack Compose)
+- Multiple design changes
+- Hardening of attachment uploads (@IIMacGyverII)
+
+### Fixed
+- Various bug fixes
+- Various fixes for calls (@alauzon & @tareko)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/107?closed=1
+
+## [23.0.1] - 2026-04-27
+
+### Added
+- Add ecosystem bar to account chooser dialog
+
+### Changed
+- Call notification design
+
+### Fixed
+- Ringtone does not stop in rare scenarios
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/108?closed=1
+
+## [23.0.0] - 2026-02-17
+
+### Added
+- Message pinning
+- Scheduled messages
+- One time QR code login
+
+### Changed
+- Design improvements
+
+### Fixed
+- another app instance is opened after opening media files or shared files screen
+- various bugs (also thanks to @p1gp1g)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/106?closed=1
+
+## [22.1.0] - 2026-01-13
+
+### Added
+- In a call, show screenshares as fullscreen
+
+### Changed
+- Login with username and password now needs to be done via browser (Login Flow v2)
+
+### Fixed
+- Crashes
+- On some devices, call ends when display is turned off (@tareko)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/102?closed=1
+
+## [22.0.3] - 2025-11-28
+
+### Fixed
+- Minor bugs
+- Crashes
+- Notification not shown when Nextcloud instance is not reachable
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/105?closed=1
+
+## [22.0.2] - 2025-10-06
+
+### Fixed
+- Crashes in some scenarios
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/104?closed=1
+
+## [22.0.1] - 2025-10-02
+
+### Fixed
+- Minor bugs
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/103?closed=1
+
+## [22.0.0] - 2025-09-26
+
+### Added
+- Implement threads feature
+- QR code login
+
+### Changed
+- Increase default chat message size (@ariedov)
+
+### Fixed
+- Flickering in the conversation list (@ariedov)
+- Date picker does not respect dark mode
+- Notification sometimes doesn’t open correct conversation
+- Minor bugs
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/101?closed=1
+
+## [21.2.0] - 2025-08-26
+
+### Added
+- Android 15 support
+
+### Fixed
+- Minor bugs
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+Please note: QR code login and loginV2 from RC1 were reverted because it not worked reliable yet. The features will come with the next releases.
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/96?closed=1
+
+## [21.1.2] - 2025-07-01
+
+### Fixed
+- Crash when sending chat message (happened for some users)
+- Avoid crash when deleting all messages for a conversation (the config on serverside was ignored so that the option was displayed incorrectly)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/98?closed=1
+
+## [21.1.1] - 2025-06-30
+
+### Fixed
+- Duplicate messages
+- Crashes
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/97?closed=1
+
+## [21.1.0] - 2025-06-05
+
+### Added
+- Allow adding participants to one-to-one chats creating a new conversation
+- Handling of event conversations
+- Show info about participant (organization, role, timezone, ...) in 1:1 conversation info screen
+- Added gallery option in chat attachment menu (access photos and videos with one click without giving permissions)
+- Add self-test button for push notifications in diagnosis screen
+- Edit checkbox in chat messages
+- Team mentions in chat
+- Add option to mark a conversation as sensitive
+- Allow bluetooth headset to be discovered and used during a call (@gavine99)
+
+### Changed
+- Design of participants grid in call
+- Improve subline in conversations screen when last message is attachment
+- Improve message search
+- In search window, show messages at last
+- Switch video capture for calls between 4:3 and 16:9 ratio depending on portrait/ landscape mode
+
+### Fixed
+- Crashes
+- Videos in videocall lost after app comes back to foreground
+- Open conversations not being shown in search
+- Minor bugs (@MmAaXx500)
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/94?closed=1
+
+## [21.0.1] - 2025-04-15
+
+### Fixed
+- No sound transmitted from android device in initial call after granting microphone permission
+- Duplicated chat messages are shown (e.g. after taking a picture)
+- Crashes
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/95?closed=1
+
+## [21.0.0] - 2025-02-24
+
+### Added
+- Sending status for text messages
+- "Retry" button for messages where sending failed
+- Playback speed control for voice messages (@arkascha)
+- Auto play consecutive voice messages (@Ruggero1912)
+- Show info in offline mode when no chat messages are available for a conversation
+- Archive/unarchive conversation from context menu
+- Search in main screen shows open conversations and contacts
+
+### Changed
+- Edit & delete buttons for an offline written message (queued state) are moved to the context menu
+- Move archive conversation button in conversation-info screen to "Danger zone"
+
+### Fixed
+- Duplicated chat messages are shown after screen rotation
+- Chat loading animation overlays with chat messages
+- Wrong reaction backgrounds
+- Mentioned teams are not rendered in chat
+- Crashes
+- Minor bugs
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/92?closed=1
+
+## [20.1.1] - 2025-01-16
+
+### Added
+- Display conversation avatars for open conversations search
+
+### Changed
+- play ".webm" videos in internal player
+
+### Fixed
+- Video is not shown in android to android calls
+- App crashes
+- Send and voice-message icons overlay
+- minor bugs
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/93?closed=1
+
+## [20.1.0] - 2024-12-03
+
+### Added
+- Archive conversations
+- Show regular warning if notification settings are not set up correctly (can be disabled)
+- Identify guests invited via email address
+- Long press options for end call button (leave or end call for all)
+- Textsearch in "Join open conversations" screen
+
+### Changed
+- Call started indicator is now at bottom of chat
+
+Minimum: NC 17 Server, Android 8.0 Oreo
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/86?closed=1
+
+## [20.0.6] - 2024-11-28
+
+### Added
+- Permanent warning if notification settings are not set up correctly (can be disabled)
+
+Minimum: NC 17 Server, Android 7.0 Nougat
+
+## [20.0.5] - 2024-11-18
+
+### Fixed
+- Fix a crash when opening chat
+
+Minimum: NC 17 Server, Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/91?closed=1
+
+## [20.0.4] - 2024-11-14
+
+### Fixed
+- Emojis to react in call are missing (now with horizontal scrolling)
+- Fix crashes
+
+Minimum: NC 17 Server, Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/90?closed=1
+
+## [20.0.3] - 2024-11-11
+
+### Added
+- Improvements to offline support ("offline first")
+- Queuing and editing of offline written messages
+- New "unread messages marker" behavior
+- Align grouping of chat messages with server behavior
+- Set full screen width for messages in 'Note To Self' (@arkascha)
+
+### Fixed
+- Sometimes offline messages need to be re-downloaded
+- Unread messages marker is shown multiple times
+- Deck cards are shown as {object}
+- Minor bugs
+
+Minimum: NC 17 Server, Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/89?closed=1
+
+## [20.0.2] - 2024-09-26
+
+### Added
+- Improvements for conversation creation
+
+### Fixed
+- Conversation list + chat does not load for very old server versions
+- TextInput field is shown when user has no permission to write
+- Call buttons sometimes disappear after 30 sec for federated rooms
+- Avoid crashes that could happen when entering chat
+
+Minimum: NC 17 Server, Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/88?closed=1
+
+## [20.0.1] - 2024-09-17
+
+### Fixed
+- Chat does not load for older server versions
+- Status icons are not shown
+- Account is missing in account switcher dialog
+- Error for federated invitation is shown although server does not support them
+
+Minimum: Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/87?closed=1
+
+## [20.0.0] - 2024-09-14
+
+### Added
+- Offline support for conversations list and chat
+- Federated calls
+- Allow banning users and guests
+- Open internal links for files app from any screen
+- Show conversation description in chat and when listing open conversations
+
+### Changed
+- New workflow for conversation creation
+
+### Fixed
+- Connection fails with wired internet
+- Minor bugs
+
+Minimum: Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/85?closed=1
+
+## [19.0.1] - 2024-05-23
+
+### Fixed
+- Wrong availability of "leave conversation" and "delete conversation"
+- Chats jump to last message instead to first unread message
+- Sent text from "share to" feature is set repeatedly for text input
+- Shared files from Nextcloud fail to open Nextcloud files app
+- Minor bugs
+
+Minimum: Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/83?closed=1
+
+## [19.0.0] - 2024-04-23
+
+### Added
+- Federated conversations
+- Message editing
+
+### Changed
+- Updated file icons
+
+### Fixed
+- Participants in conversation info screen are missing
+- Flickering appbar when scrolling conversation list
+- Call notification screen is sometimes incomplete/unresponsive
+- Polls won't open
+- Note to self icon is not shown for languages other than english
+- Minor bugs
+
+Minimum: Android 7.0 Nougat
+
+For a full list, please see https://github.com/nextcloud/talk-android/milestone/81?closed=1
+
 ## [18.1.0] - 2024-03-12
 
 ### Added

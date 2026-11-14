@@ -13,8 +13,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.MenuItem
 import android.view.View
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.res.ResourcesCompat
+import androidx.activity.viewModels
 import androidx.lifecycle.ViewModelProvider
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -22,30 +21,55 @@ import androidx.recyclerview.widget.RecyclerView
 import autodagger.AutoInjector
 import com.google.android.material.tabs.TabLayout
 import com.nextcloud.talk.R
+import com.nextcloud.talk.activities.BaseActivity
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.chat.viewmodels.ChatViewModel
+import com.nextcloud.talk.contextchat.ContextChatViewModel
+import com.nextcloud.talk.dagger.modules.assistedViewModels
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.ActivitySharedItemsBinding
 import com.nextcloud.talk.shareditems.adapters.SharedItemsAdapter
 import com.nextcloud.talk.shareditems.model.SharedItemType
 import com.nextcloud.talk.shareditems.viewmodels.SharedItemsViewModel
-import com.nextcloud.talk.ui.theme.ViewThemeUtils
-import com.nextcloud.talk.utils.DisplayUtils
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_CONVERSATION_NAME
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
-import com.nextcloud.talk.utils.database.user.CurrentUserProviderNew
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_THREAD_ID
 import javax.inject.Inject
+import kotlin.getValue
 
 @AutoInjector(NextcloudTalkApplication::class)
-class SharedItemsActivity : AppCompatActivity() {
-
-    @Inject
-    lateinit var currentUserProvider: CurrentUserProviderNew
+class SharedItemsActivity : BaseActivity() {
 
     @Inject
     lateinit var viewModelFactory: ViewModelProvider.Factory
 
     @Inject
-    lateinit var viewThemeUtils: ViewThemeUtils
+    lateinit var chatViewModelFactory: ChatViewModel.ChatViewModelFactory
+
+    private lateinit var conversationUser: User
+
+    val roomToken: String by lazy {
+        intent.getStringExtra(KEY_ROOM_TOKEN)
+            ?: error("roomToken missing")
+    }
+
+    val conversationThreadId: Long? by lazy {
+        if (intent.hasExtra(KEY_THREAD_ID)) {
+            intent.getLongExtra(KEY_THREAD_ID, 0L)
+        } else {
+            null
+        }
+    }
+
+    val chatViewModel: ChatViewModel by assistedViewModels {
+        chatViewModelFactory.build(
+            conversationUser,
+            roomToken,
+            conversationThreadId
+        )
+    }
+
+    private val contextChatViewModel: ContextChatViewModel by viewModels { viewModelFactory }
 
     private lateinit var binding: ActivitySharedItemsBinding
     private lateinit var viewModel: SharedItemsViewModel
@@ -53,26 +77,20 @@ class SharedItemsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
-
-        val roomToken = intent.getStringExtra(KEY_ROOM_TOKEN)!!
+        conversationUser = setUpBoundUserOrFinish() ?: return
         val conversationName = intent.getStringExtra(KEY_CONVERSATION_NAME)
 
-        val user = currentUserProvider.currentUser.blockingGet()
-
         val isUserConversationOwnerOrModerator = intent.getBooleanExtra(KEY_USER_IS_OWNER_OR_MODERATOR, false)
+        val isOne2One = intent.getBooleanExtra(KEY_IS_ONE_2_ONE, false)
 
         binding = ActivitySharedItemsBinding.inflate(layoutInflater)
         setSupportActionBar(binding.sharedItemsToolbar)
         setContentView(binding.root)
 
-        viewThemeUtils.platform.themeStatusBar(this)
+        initSystemBars()
+
         viewThemeUtils.material.themeToolbar(binding.sharedItemsToolbar)
         viewThemeUtils.material.themeTabLayoutOnSurface(binding.sharedItemsTabs)
-
-        DisplayUtils.applyColorToNavigationBar(
-            this.window,
-            ResourcesCompat.getColor(resources, R.color.bg_default, null)
-        )
 
         supportActionBar?.title = conversationName
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -80,7 +98,7 @@ class SharedItemsActivity : AppCompatActivity() {
         viewModel = ViewModelProvider(this, viewModelFactory)[SharedItemsViewModel::class.java]
 
         viewModel.viewState.observe(this) { state ->
-            handleModelChange(state, user, roomToken, isUserConversationOwnerOrModerator)
+            handleModelChange(state, conversationUser, roomToken, isUserConversationOwnerOrModerator, isOne2One)
         }
 
         binding.imageRecycler.addOnScrollListener(object : RecyclerView.OnScrollListener() {
@@ -92,14 +110,15 @@ class SharedItemsActivity : AppCompatActivity() {
             }
         })
 
-        viewModel.initialize(user, roomToken)
+        viewModel.initialize(conversationUser, roomToken)
     }
 
     private fun handleModelChange(
         state: SharedItemsViewModel.ViewState?,
         user: User,
         roomToken: String,
-        isUserConversationOwnerOrModerator: Boolean
+        isUserConversationOwnerOrModerator: Boolean,
+        isOne2One: Boolean
     ) {
         clearEmptyLoading()
         when (state) {
@@ -125,9 +144,10 @@ class SharedItemsActivity : AppCompatActivity() {
                     user,
                     roomToken,
                     isUserConversationOwnerOrModerator,
+                    isOne2One,
                     viewThemeUtils
                 ).apply {
-                    items = sharedMediaItems.items
+                    items = sharedMediaItems.items.toMutableList()
                 }
                 binding.imageRecycler.adapter = adapter
                 binding.imageRecycler.layoutManager = layoutManager
@@ -139,6 +159,28 @@ class SharedItemsActivity : AppCompatActivity() {
         }
 
         viewThemeUtils.material.themeTabLayoutOnSurface(binding.sharedItemsTabs)
+    }
+
+    fun startContextChatWindowForMessage(user: User, roomToken: String, messageId: String?, threadId: String?) {
+        binding.genericComposeView.apply {
+            setContent {
+                contextChatViewModel.getContextForChatMessages(
+                    user = user,
+                    token = roomToken,
+                    threadId = threadId,
+                    messageId = messageId!!,
+                    title = ""
+                )
+                // Context chat Compose integration is pending for this screen.
+                // ContextChatView(
+                //     user = user,
+                //     context,
+                //     viewThemeUtils = viewThemeUtils,
+                //     contextChatViewModel
+                // )
+            }
+        }
+        Log.d(TAG, "Should open something else")
     }
 
     private fun clearEmptyLoading() {
@@ -157,6 +199,7 @@ class SharedItemsActivity : AppCompatActivity() {
         binding.sharedItemsTabs.visibility = View.GONE
     }
 
+    @Suppress("LongMethod")
     private fun initTabs(sharedItemTypes: Set<SharedItemType>) {
         binding.sharedItemsTabs.removeAllTabs()
 
@@ -202,6 +245,13 @@ class SharedItemsActivity : AppCompatActivity() {
             binding.sharedItemsTabs.addTab(tabVoice)
         }
 
+        if (sharedItemTypes.contains(SharedItemType.PINNED)) {
+            val tabPinned: TabLayout.Tab = binding.sharedItemsTabs.newTab()
+            tabPinned.tag = SharedItemType.PINNED
+            tabPinned.setText(R.string.pinned)
+            binding.sharedItemsTabs.addTab(tabPinned)
+        }
+
         if (sharedItemTypes.contains(SharedItemType.LOCATION)) {
             val tabLocation: TabLayout.Tab = binding.sharedItemsTabs.newTab()
             tabLocation.tag = SharedItemType.LOCATION
@@ -234,18 +284,18 @@ class SharedItemsActivity : AppCompatActivity() {
         })
     }
 
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        return if (item.itemId == android.R.id.home) {
+    override fun onOptionsItemSelected(item: MenuItem): Boolean =
+        if (item.itemId == android.R.id.home) {
             onBackPressedDispatcher.onBackPressed()
             true
         } else {
             super.onOptionsItemSelected(item)
         }
-    }
 
     companion object {
         private val TAG = SharedItemsActivity::class.simpleName
         const val SPAN_COUNT: Int = 4
         const val KEY_USER_IS_OWNER_OR_MODERATOR = "userIsOwnerOrModerator"
+        const val KEY_IS_ONE_2_ONE = "KEY_IS_ONE_2_ONE"
     }
 }

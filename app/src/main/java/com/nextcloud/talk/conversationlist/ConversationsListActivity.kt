@@ -1,949 +1,1043 @@
 /*
  * Nextcloud Talk - Android Client
  *
- * SPDX-FileCopyrightText: 2022-2024 Marcel Hibbe <dev@mhibbe.de>
- * SPDX-FileCopyrightText: 2022-2023 Andy Scherzinger <info@andy-scherzinger.de>
- * SPDX-FileCopyrightText: 2023 Tobias Kaminsky <tobias@kaminsky.me>
- * SPDX-FileCopyrightText: 2023 Ezhil Shanmugham <ezhil56x.contact@gmail.com>
- * SPDX-FileCopyrightText: 2022 Álvaro Brey <alvaro.brey@nextcloud.com>
- * SPDX-FileCopyrightText: 2017-2020 Mario Danic <mario@lovelyhq.com>
+ * SPDX-FileCopyrightText: 2017-2026 Nextcloud GmbH and Nextcloud contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 package com.nextcloud.talk.conversationlist
 
 import android.Manifest
-import android.animation.AnimatorInflater
 import android.annotation.SuppressLint
-import android.app.SearchManager
+import android.app.NotificationManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.drawable.ColorDrawable
-import android.graphics.drawable.Drawable
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
+import android.database.SQLException
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
 import android.provider.Settings
-import android.text.InputType
 import android.text.TextUtils
 import android.util.Log
-import android.view.Menu
-import android.view.MenuItem
-import android.view.MotionEvent
-import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
-import androidx.annotation.OptIn
+import androidx.activity.compose.setContent
+import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.widget.SearchView
-import androidx.core.view.MenuItemCompat
-import androidx.fragment.app.DialogFragment
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
+import androidx.core.net.toUri
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
-import androidx.recyclerview.widget.RecyclerView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.withResumed
 import androidx.work.Data
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import autodagger.AutoInjector
-import coil.imageLoader
-import coil.request.ImageRequest
-import coil.target.Target
-import coil.transform.CircleCropTransformation
-import com.google.android.material.appbar.AppBarLayout
-import com.google.android.material.badge.BadgeDrawable
-import com.google.android.material.badge.BadgeUtils
-import com.google.android.material.badge.ExperimentalBadgeUtils
-import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.snackbar.Snackbar
-import com.nextcloud.android.common.ui.theme.utils.ColorRole
+import com.nextcloud.android.common.core.utils.AccountNameUtils
+import com.nextcloud.android.common.core.utils.ecosystem.AccountReceiverCallback
+import com.nextcloud.android.common.core.utils.ecosystem.EcosystemManager
 import com.nextcloud.talk.R
+import com.nextcloud.talk.account.BrowserLoginActivity
 import com.nextcloud.talk.account.ServerSelectionActivity
-import com.nextcloud.talk.account.WebViewLoginActivity
 import com.nextcloud.talk.activities.BaseActivity
 import com.nextcloud.talk.activities.CallActivity
-import com.nextcloud.talk.activities.MainActivity
-import com.nextcloud.talk.adapters.items.ConversationItem
-import com.nextcloud.talk.adapters.items.GenericTextHeaderItem
-import com.nextcloud.talk.adapters.items.LoadMoreResultsItem
-import com.nextcloud.talk.adapters.items.MessageResultItem
-import com.nextcloud.talk.adapters.items.MessagesTextHeaderItem
-import com.nextcloud.talk.api.NcApi
+import com.nextcloud.talk.activities.DeepLinkActivity
+import com.nextcloud.talk.activities.DeepLinkRouting
+import com.nextcloud.talk.activities.DeepLinkRoutingViewModel
+import com.nextcloud.talk.activities.collectWhileUnlocked
+import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.application.NextcloudTalkApplication
-import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
 import com.nextcloud.talk.chat.ChatActivity
+import com.nextcloud.talk.chat.audio.ChatAudioKey
+import com.nextcloud.talk.chat.audio.ChatAudioPlayer
+import com.nextcloud.talk.chat.audio.ChatAudioSpeeds
+import com.nextcloud.talk.chat.audio.ChatAudioStore
+import com.nextcloud.talk.chat.audio.openMessageIntent
 import com.nextcloud.talk.contacts.ContactsActivity
+import com.nextcloud.talk.contacts.ContactsViewModel
+import com.nextcloud.talk.conversation.RenameConversationDialogFragment
+import com.nextcloud.talk.conversationlist.ui.ConversationOpsAction
+import com.nextcloud.talk.conversationlist.ui.ConversationsListScreen
+import com.nextcloud.talk.conversationlist.ui.ConversationsListScreenCallbacks
+import com.nextcloud.talk.conversationlist.ui.ConversationsListScreenState
 import com.nextcloud.talk.conversationlist.viewmodels.ConversationsListViewModel
+import com.nextcloud.talk.conversationtags.viewmodels.ConversationTagsViewModel
+import com.nextcloud.talk.dagger.modules.assistedViewModels
+import com.nextcloud.talk.data.network.NetworkMonitor
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.databinding.ActivityConversationsBinding
 import com.nextcloud.talk.events.ConversationsListFetchDataEvent
 import com.nextcloud.talk.events.EventStatus
 import com.nextcloud.talk.invitation.InvitationsActivity
 import com.nextcloud.talk.jobs.AccountRemovalWorker
 import com.nextcloud.talk.jobs.ContactAddressBookWorker.Companion.run
 import com.nextcloud.talk.jobs.DeleteConversationWorker
-import com.nextcloud.talk.jobs.UploadAndShareFilesWorker
-import com.nextcloud.talk.messagesearch.MessageSearchHelper
-import com.nextcloud.talk.messagesearch.MessageSearchHelper.MessageSearchResults
-import com.nextcloud.talk.models.json.conversations.Conversation
-import com.nextcloud.talk.models.json.conversations.RoomsOverall
-import com.nextcloud.talk.repositories.unifiedsearch.UnifiedSearchRepository
+import com.nextcloud.talk.jobs.LeaveConversationWorker
+import com.nextcloud.talk.jobs.RemoteWipeSuccessWorker
+import com.nextcloud.talk.models.domain.ConversationModel
+import com.nextcloud.talk.models.domain.SearchMessageEntry
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
 import com.nextcloud.talk.settings.SettingsActivity
-import com.nextcloud.talk.ui.dialog.ChooseAccountDialogFragment
-import com.nextcloud.talk.ui.dialog.ChooseAccountShareToDialogFragment
-import com.nextcloud.talk.ui.dialog.ConversationsListBottomDialog
+import com.nextcloud.talk.threadsoverview.ThreadsOverviewActivity
+import com.nextcloud.talk.ui.chat.ChatAudioPlayerHost
+import com.nextcloud.talk.ui.chat.chatAudioPlayerCallbacks
+import com.nextcloud.talk.ui.chooseaccount.ChooseAccountShareToDialogFragment
 import com.nextcloud.talk.ui.dialog.FilterConversationFragment
-import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.ARCHIVE
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.MENTION
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.UNREAD
+import com.nextcloud.talk.utils.AccountUtils
 import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.AppTasks
+import com.nextcloud.talk.utils.BrandingUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.CapabilitiesUtil.hasSpreedFeatureCapability
 import com.nextcloud.talk.utils.CapabilitiesUtil.isServerEOL
-import com.nextcloud.talk.utils.CapabilitiesUtil.isUnifiedSearchAvailable
-import com.nextcloud.talk.utils.CapabilitiesUtil.isUserStatusAvailable
 import com.nextcloud.talk.utils.ClosedInterfaceImpl
+import com.nextcloud.talk.utils.ConversationUtils
+import com.nextcloud.talk.utils.ConversationUtils.checkIfVoiceRoom
+import com.nextcloud.talk.utils.DeepLinkHandler
 import com.nextcloud.talk.utils.FileUtils
-import com.nextcloud.talk.utils.Mimetype
+import com.nextcloud.talk.utils.InternalEntryPoint
+import com.nextcloud.talk.utils.NotificationUtils
 import com.nextcloud.talk.utils.ParticipantPermissions
+import com.nextcloud.talk.utils.RemoteWipeHandler
+import com.nextcloud.talk.utils.SecurityUtils
+import com.nextcloud.talk.utils.ShareUtils
+import com.nextcloud.talk.utils.SharedFileCopies
+import com.nextcloud.talk.utils.ShortcutManagerHelper
 import com.nextcloud.talk.utils.SpreedFeatures
+import com.nextcloud.talk.utils.UnifiedPushUtils
 import com.nextcloud.talk.utils.UserIdUtils
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.bundle.BundleKeys.ADD_ADDITIONAL_ACCOUNT
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_CALL_VOICE_ONLY
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_CONVERSATION_NAME
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_FORWARD_HIDE_SOURCE_ROOM
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_FORWARD_MSG_FLAG
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_FORWARD_MSG_TEXT
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_INTERNAL_USER_ID
-import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_NEW_CONVERSATION
-import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_ID
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_IS_BREAKOUT_ROOM
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_IS_MODERATOR
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_RECORDING_STATE
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SCROLL_TO_NOTIFICATION_CATEGORY
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SHARED_TEXT
+import com.nextcloud.talk.utils.permissions.LocalNetworkPermission
 import com.nextcloud.talk.utils.permissions.PlatformPermissionUtil
 import com.nextcloud.talk.utils.power.PowerManagerUtils
-import com.nextcloud.talk.utils.rx.SearchViewObservable.Companion.observeSearchView
+import com.nextcloud.talk.utils.setExpeditedIfSupported
 import com.nextcloud.talk.utils.singletons.ApplicationWideCurrentRoomHolder
-import eu.davidea.flexibleadapter.FlexibleAdapter
-import eu.davidea.flexibleadapter.common.SmoothScrollLinearLayoutManager
-import eu.davidea.flexibleadapter.items.AbstractFlexibleItem
-import io.reactivex.Observable
-import io.reactivex.android.schedulers.AndroidSchedulers
-import io.reactivex.disposables.Disposable
-import io.reactivex.schedulers.Schedulers
-import io.reactivex.subjects.BehaviorSubject
-import org.apache.commons.lang3.builder.CompareToBuilder
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
 import retrofit2.HttpException
-import java.util.Objects
-import java.util.concurrent.TimeUnit
-import javax.inject.Inject
 
+@SuppressLint("StringFormatInvalid")
 @AutoInjector(NextcloudTalkApplication::class)
-class ConversationsListActivity :
-    BaseActivity(),
-    FlexibleAdapter.OnItemClickListener,
-    FlexibleAdapter.OnItemLongClickListener {
+@Suppress("LargeClass", "TooManyFunctions", "NestedBlockDepth")
+class ConversationsListActivity : BaseActivity() {
 
-    private lateinit var binding: ActivityConversationsBinding
-
-    @Inject
-    lateinit var userManager: UserManager
+    // Started without an account on app start, when sharing from other apps and after login.
+    override val allowsDefaultAccount = true
 
     @Inject
-    lateinit var ncApi: NcApi
+    lateinit var viewModelFactory: ViewModelProvider.Factory
 
     @Inject
-    lateinit var unifiedSearchRepository: UnifiedSearchRepository
+    lateinit var ncApiCoroutines: NcApiCoroutines
 
     @Inject
     lateinit var platformPermissionUtil: PlatformPermissionUtil
 
     @Inject
-    lateinit var arbitraryStorageManager: ArbitraryStorageManager
+    lateinit var conversationsListViewModelFactory: ConversationsListViewModel.Factory
 
     @Inject
-    lateinit var viewModelFactory: ViewModelProvider.Factory
+    lateinit var conversationTagsViewModelFactory: ConversationTagsViewModel.Factory
 
-    lateinit var conversationsListViewModel: ConversationsListViewModel
+    @Inject
+    lateinit var networkMonitor: NetworkMonitor
 
-    override val appBarLayoutType: AppBarLayoutType
-        get() = AppBarLayoutType.SEARCH_BAR
+    @Inject
+    lateinit var contactsViewModelFactory: ContactsViewModel.Factory
 
-    private var currentUser: User? = null
-    private var roomsQueryDisposable: Disposable? = null
-    private var openConversationsQueryDisposable: Disposable? = null
-    private var adapter: FlexibleAdapter<AbstractFlexibleItem<*>>? = null
-    private var conversationItems: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-    private var conversationItemsWithHeader: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-    private val searchableConversationItems: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-    private var filterableConversationItems: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-    private var searchItem: MenuItem? = null
-    private var chooseAccountItem: MenuItem? = null
-    private var searchView: SearchView? = null
-    private var searchQuery: String? = null
+    @Inject
+    lateinit var remoteWipeHandler: RemoteWipeHandler
+
+    val contactsViewModel: ContactsViewModel by assistedViewModels { contactsViewModelFactory.build(currentUser) }
+
+    @Inject
+    lateinit var chatAudioStore: ChatAudioStore
+
+    @Inject
+    lateinit var chatAudioSpeeds: ChatAudioSpeeds
+
+    private lateinit var chatAudioPlayer: ChatAudioPlayer
+
+    val conversationsListViewModel: ConversationsListViewModel by assistedViewModels {
+        conversationsListViewModelFactory.build(currentUser)
+    }
+
+    val conversationTagsViewModel: ConversationTagsViewModel by assistedViewModels {
+        conversationTagsViewModelFactory.build(currentUser)
+    }
+
+    private lateinit var currentUser: User
+    private val localNetworkPermission = LocalNetworkPermission(this, { viewThemeUtils })
+
+    // checked when the list is created, not again when it is recreated, e.g. after a rotation
+    private var isLocalNetworkCheckDue = false
+    private val snackbarHostState = SnackbarHostState()
+    private val isMaintenanceModeState = MutableStateFlow(false)
+    private val showUnreadBubbleState = MutableStateFlow(false)
+    private val isFabVisibleState = MutableStateFlow(true)
+    private val showNotificationWarningState = MutableStateFlow(false)
+    private val isRefreshingState = MutableStateFlow(false)
+    private val showAccountDialogState = MutableStateFlow(false)
+
+    // Lazy list state – set from inside setContent, read from onPause
+    private var conversationListLazyListState: androidx.compose.foundation.lazy.LazyListState? = null
+
+    // restored once per activity lifetime; a late scrollToItem on resume would jump the rendered list
+    private var scrollPositionRestored = false
+
+    private var nextUnreadConversationScrollPosition = 0
     private var credentials: String? = null
-    private var adapterWasNull = true
-    private var isRefreshing = false
-    private var showShareToScreen = false
+    private val showShareToScreenState = MutableStateFlow(false)
+    private val forwardMessageState = MutableStateFlow(false)
+    private val hasMultipleAccountsState = MutableStateFlow(false)
+    private val showShareToScreen get() = showShareToScreenState.value
+    private val forwardMessage get() = forwardMessageState.value
     private var filesToShare: ArrayList<String>? = null
-    private var selectedConversation: Conversation? = null
+    private var selectedConversation: ConversationModel? = null
     private var textToPaste: String? = ""
     private var selectedMessageId: String? = null
-    private var forwardMessage: Boolean = false
-    private var nextUnreadConversationScrollPosition = 0
-    private var layoutManager: SmoothScrollLinearLayoutManager? = null
-    private val callHeaderItems = HashMap<String, GenericTextHeaderItem>()
-    private var conversationsListBottomDialog: ConversationsListBottomDialog? = null
-    private var searchHelper: MessageSearchHelper? = null
-    private var searchViewDisposable: Disposable? = null
-    private var filterState =
-        mutableMapOf(
-            FilterConversationFragment.MENTION to false,
-            FilterConversationFragment.UNREAD to false
-        )
-    val searchBehaviorSubject = BehaviorSubject.createDefault(false)
-    private lateinit var accountIconBadge: BadgeDrawable
+    private var pendingShortcutToken: String? = null
+
+    // set when the list is shown again, see switchToDefaultAccountIfChanged
+    private var isDefaultAccountCheckDue = false
+
+    private var unauthorizedDialog: AlertDialog? = null
+    private var unauthorizedHandling: Job? = null
+
+    // The list syncs again on every resume, e.g. after the unauthorized dialog was closed, while the server answers
+    // only 10 wipe checks per 5 minutes from an IP and further ones with 429. So the server is asked once per list.
+    private var isWipeChecked = false
+
+    // From starting to remove the account of this list until that ended. Meanwhile the account is not to be
+    // reauthorized or removed again.
+    private var isRemovingAccount = false
+
+    lateinit var ecosystemManager: EcosystemManager
 
     private val onBackPressedCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
             if (forwardMessage) {
-                finish()
+                cancelForwarding()
             } else {
                 finishAffinity()
             }
         }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
-
-        conversationsListViewModel = ViewModelProvider(this, viewModelFactory)[ConversationsListViewModel::class.java]
-
-        binding = ActivityConversationsBinding.inflate(layoutInflater)
-        setupActionBar()
-        setContentView(binding.root)
-        setupSystemColors()
-        viewThemeUtils.material.themeCardView(binding.searchToolbar)
-        viewThemeUtils.material.themeSearchBarText(binding.searchText)
-
-        forwardMessage = intent.getBooleanExtra(KEY_FORWARD_MSG_FLAG, false)
-        onBackPressedDispatcher.addCallback(this, onBackPressedCallback)
-
-        initObservers()
+    // The source chat finished itself when forwarding started and this list may be the one below it, so finishing
+    // here would leave the app. Instead leave the forward mode and return to the source chat.
+    private fun cancelForwarding() {
+        val sourceRoomToken = intent.getStringExtra(KEY_FORWARD_HIDE_SOURCE_ROOM)
+        intent.removeExtra(KEY_FORWARD_MSG_FLAG)
+        intent.removeExtra(KEY_FORWARD_MSG_TEXT)
+        intent.removeExtra(KEY_FORWARD_HIDE_SOURCE_ROOM)
+        forwardMessageState.value = false
+        conversationsListViewModel.setHideRoomToken(null)
+        if (sourceRoomToken != null) {
+            startActivity(ChatActivity.createIntent(context, currentUser.id!!, sourceRoomToken))
+        }
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // before super.onCreate(), it switches from the launch theme to postSplashScreenTheme
+        val splashScreen = installSplashScreen()
+        // before BaseActivity reads the account
+        removeExtrasOfApp(intent)
+        super.onCreate(savedInstanceState)
+        NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
+        if (isLauncherTapOnAppTask() || finishIfNotShown()) {
+            // finishIfNotShown() finished the list already
+            if (!isFinishing) finish()
+            return
+        }
+        currentUser = setUpBoundUserOrFinish() ?: return
+        // kept for a recreation, which would otherwise remove the account from the intent again
+        intent = intentOfAccount(this, intent, currentUser.id)
+        if (savedInstanceState == null) {
+            AppTasks.removeTasksLeftInRecents(this)
+        }
+        setUpOncePerProcess()
+        ecosystemManager = EcosystemManager(this@ConversationsListActivity)
+        chatAudioPlayer = ChatAudioPlayer(this, chatAudioStore, lifecycleScope)
+        lifecycle.addObserver(chatAudioPlayer)
+
+        if (!currentUser.current) {
+            // The shown account becomes the last used one, which the account switcher and status views rely on.
+            lifecycleScope.launch { userManager.setUserAsActive(currentUser) }
+        }
+
+        startForegroundRefreshLoop()
+
+        setSupportActionBar(null)
+        forwardMessageState.value = intent.getBooleanExtra(KEY_FORWARD_MSG_FLAG, false)
+        savedInstanceState?.let(::restoreState)
+        onBackPressedDispatcher.addCallback(this, onBackPressedCallback)
+
+        val audioPlayerCallbacks = chatAudioPlayerCallbacks(
+            player = chatAudioPlayer,
+            speeds = chatAudioSpeeds,
+            scope = lifecycleScope,
+            onOpenMessage = { key, threadId -> openAudioMessage(key, threadId) }
+        )
+        setContent {
+            ConversationsListScreen(
+                viewModel = conversationsListViewModel,
+                tagsViewModel = conversationTagsViewModel,
+                state = buildScreenState(),
+                callbacks = buildScreenCallbacks(),
+                audioPlayer = {
+                    val audioState by chatAudioPlayer.state.collectAsStateWithLifecycle()
+                    ChatAudioPlayerHost(state = audioState, callbacks = audioPlayerCallbacks)
+                }
+            )
+        }
+
+        intent?.let {
+            handleEcoSystemIntent(it)
+        }
+        initObservers()
+
+        val deepLinkRoutingViewModel = ViewModelProvider(this, viewModelFactory)[DeepLinkRoutingViewModel::class.java]
+        deepLinkRouting = DeepLinkRouting(this, deepLinkRoutingViewModel) { currentUser.id }
+        deepLinkRouting.start(intent, savedInstanceState)
+        // a deep link that starts the app shows the launch screen until its chat covers the list or it asks first
+        splashScreen.setKeepOnScreenCondition { deepLinkRouting.keepsLaunchScreen }
+    }
+
+    /**
+     * Whether the launcher started this list on top of a task of the app it isn't the root of, e.g. one a notification
+     * or a deep link started: the launcher only brings a task to the front whose root has its intent, so it adds a list
+     * to any other one, while finishing this list just shows that task.
+     */
+    private fun isLauncherTapOnAppTask(): Boolean =
+        !isTaskRoot &&
+            intent.action == Intent.ACTION_MAIN &&
+            intent.hasCategory(Intent.CATEGORY_LAUNCHER) &&
+            AppTasks.isRunningAppTask(this, taskId)
+
+    /**
+     * Passes the intent of another app on, finishes this list and returns true if it is not shown for its intent.
+     * Without an account, setUpBoundUserOrFinish opens the login.
+     */
+    private fun finishIfNotShown(): Boolean {
+        val isViewOfOtherApp = isViewOfOtherApp(intent)
+        val otherIntent = when {
+            isShareOfOtherApp(intent) -> InternalEntryPoint.createForwardIntent(this, intent, ShareActivity::class.java)
+            isViewOfOtherApp -> createDeepLinkForwardIntent(intent)
+            else -> null
+        } ?: return false
+        startActivity(otherIntent)
+        // a task of its own is removed before DeepLinkActivity passes the intent on, so it doesn't end up there
+        if (isViewOfOtherApp && isTaskRoot) finishAndRemoveTask() else finish()
+        return true
+    }
+
+    private fun setUpOncePerProcess() {
+        if (isAppStartSetUpDone) return
+        isAppStartSetUpDone = true
+        setUpPushRegistration()
+        // a key that became invalid, e.g. after the lock screen of the device was reset, is created anew when it is
+        // checked
+        if (appPreferences.isScreenLocked) {
+            SecurityUtils.createKey(appPreferences.screenLockTimeout)
+        }
+    }
+
+    /** Registers for push messages, as the app was started. */
+    private fun setUpPushRegistration() {
+        if (appPreferences.useUnifiedPush) {
+            UnifiedPushUtils.setPeriodicPushRegistrationWorker(context)
+        } else {
+            ClosedInterfaceImpl().setUpPushTokenRegistration()
+        }
+    }
+
+    private fun createDeepLinkForwardIntent(intent: Intent): Intent =
+        InternalEntryPoint.createForwardIntent(
+            this,
+            intent,
+            DeepLinkActivity::class.java,
+            Intent.FLAG_ACTIVITY_NEW_TASK
+        )
+
+    private fun restoreState(savedInstanceState: Bundle) {
+        showAccountDialogState.value = savedInstanceState.getBoolean(KEY_ACCOUNT_DIALOG_VISIBLE, false)
+        // the conversation of a shortcut that wasn't opened yet; the one of the intent was taken already, which the
+        // intent restored after the process was killed has again
+        pendingShortcutToken = savedInstanceState.getString(KEY_PENDING_SHORTCUT_TOKEN)
+        intent.removeExtra(KEY_ROOM_TOKEN)
+        intent.removeExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_ACCOUNT_DIALOG_VISIBLE, showAccountDialogState.value)
+        // Only for a recreated list: the conversation of a shortcut isn't opened anymore once the list is left, and
+        // before Android 9 the state is saved before the list is stopped, which would restore the one the user left
+        if (isChangingConfigurations) outState.putString(KEY_PENDING_SHORTCUT_TOKEN, pendingShortcutToken)
+        if (::deepLinkRouting.isInitialized) deepLinkRouting.onSaveInstanceState(outState)
+    }
+
+    // the routing of the deep links and contact chats DeepLinkActivity passes on to this list
+    private lateinit var deepLinkRouting: DeepLinkRouting
+
+    // Set once this list is replaced by one for another account. onRestart and onNewIntent can both trigger that when
+    // the list is brought back with an intent for another account, which must only relaunch it once.
+    private var isRelaunching = false
+
+    // set once the shared content was passed on to the chat that was picked for it
+    private var isSharePassedOn = false
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        isDefaultAccountCheckDue = false
+        removeExtrasOfApp(intent)
+        val newUserId = intent.getLongExtra(KEY_INTERNAL_USER_ID, 0L)
+        when {
+            isShareOfOtherApp(intent) ->
+                startActivity(InternalEntryPoint.createForwardIntent(this, intent, ShareActivity::class.java))
+            isViewOfOtherApp(intent) -> startActivity(createDeepLinkForwardIntent(intent))
+            // a list that finished in onCreate has no account or routing; the system doesn't pass intents to a
+            // finishing activity, so this only guards against reading them uninitialized
+            !::deepLinkRouting.isInitialized -> Unit
+            // the list stays for its account and only routes the deep link
+            deepLinkRouting.onNewIntent(intent) -> Unit
+            // while relaunching, relaunchForAccount ignores the intent
+            isRelaunching || newUserId != 0L && newUserId != currentUser.id -> relaunchForAccount(newUserId, intent)
+            else -> showNewIntent(intent)
+        }
+    }
+
+    private fun showNewIntent(intent: Intent) {
+        setIntent(intentOfAccount(this, intent, currentUser.id))
+        forwardMessageState.value = intent.getBooleanExtra(KEY_FORWARD_MSG_FLAG, false)
+        conversationsListViewModel.setHideRoomToken(intent.getStringExtra(KEY_FORWARD_HIDE_SOURCE_ROOM))
+        handleEcoSystemIntent(intent)
+    }
+
+    private fun buildScreenState() =
+        ConversationsListScreenState(
+            currentUser = currentUser,
+            credentials = credentials ?: "",
+            showLogo = BrandingUtils.isOriginalNextcloudClient(applicationContext),
+            viewThemeUtils = viewThemeUtils,
+            isShowEcosystem = appPreferences.isShowEcosystem && !resources.getBoolean(R.bool.is_branded_client),
+            snackbarHostState = snackbarHostState,
+            isMaintenanceModeFlow = isMaintenanceModeState,
+            isOnlineFlow = networkMonitor.isOnline,
+            showUnreadBubbleFlow = showUnreadBubbleState,
+            isFabVisibleFlow = isFabVisibleState,
+            showNotificationWarningFlow = showNotificationWarningState,
+            isRefreshingFlow = isRefreshingState,
+            showShareToFlow = showShareToScreenState,
+            forwardMessageFlow = forwardMessageState,
+            hasMultipleAccountsFlow = hasMultipleAccountsState,
+            showAccountDialogFlow = showAccountDialogState,
+            selectedConversationForOpsFlow = conversationsListViewModel.selectedConversationForOps
+        )
+
+    @Suppress("LongMethod")
+    private fun buildScreenCallbacks() =
+        ConversationsListScreenCallbacks(
+            onLazyListStateAvailable = { listState -> conversationListLazyListState = listState },
+            onScrollChanged = { isFabVisibleState.value = !it },
+            onScrollStopped = { checkToShowUnreadBubble(it) },
+            onConversationClick = { handleConversation(it) },
+            onConversationLongClick = { handleConversationLongClick(it) },
+            onMessageResultClick = { showContextChatForMessage(it) },
+            onContactClick = { contactsViewModel.createRoom(ROOM_TYPE_ONE_ONE, null, it.actorId!!, null) },
+            onLoadMoreClick = { conversationsListViewModel.loadMoreMessages(context) },
+            onRefresh = {
+                isMaintenanceModeState.value = false
+                isRefreshingState.value = true
+                appPreferences.setConversationListPositionAndOffset(0, 0)
+                fetchRooms(forceFullSync = true)
+                fetchPendingInvitations()
+            },
+            onFabClick = {
+                run(context)
+                showNewConversationsScreen()
+            },
+            onUnreadBubbleClick = {
+                lifecycleScope.launch {
+                    val listState = conversationListLazyListState ?: return@launch
+                    val viewportHeight = listState.layoutInfo.viewportEndOffset
+                    val avgItemHeight = listState.layoutInfo.visibleItemsInfo
+                        .map { it.size }
+                        .average()
+                        .takeIf { it.isFinite() }
+                        ?.toInt() ?: 0
+                    val scrollOffset = -(viewportHeight / 2) + (avgItemHeight / 2)
+                    listState.scrollToItem(nextUnreadConversationScrollPosition, scrollOffset)
+                    val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    checkToShowUnreadBubble(lastVisible)
+                }
+            },
+            onNotificationWarningNotNow = {
+                appPreferences.setNotificationWarningLastPostponedDate(System.currentTimeMillis())
+                showNotificationWarningState.value = false
+            },
+            onNotificationWarningShowSettings = {
+                val bundle = Bundle()
+                bundle.putBoolean(KEY_SCROLL_TO_NOTIFICATION_CATEGORY, true)
+                val settingsIntent = Intent(context, SettingsActivity::class.java)
+                settingsIntent.putExtras(bundle)
+                settingsIntent.putExtra(KEY_INTERNAL_USER_ID, currentUser.id)
+                startActivity(settingsIntent)
+            },
+            onFederationHintClick = {
+                val intent = Intent(context, InvitationsActivity::class.java)
+                intent.putExtra(KEY_INTERNAL_USER_ID, currentUser.id)
+                startActivity(intent)
+            },
+            onFilterClick = {
+                FilterConversationFragment
+                    .newInstance(
+                        conversationsListViewModel.filterStateFlow.value.toMutableMap(),
+                        conversationsListViewModel.currentUser
+                    )
+                    .show(supportFragmentManager, FilterConversationFragment.TAG)
+            },
+            onThreadsClick = { openFollowedThreadsOverview() },
+            onAvatarClick = {
+                if (resources.getBoolean(R.bool.multiaccount_support)) {
+                    showChooseAccountDialog()
+                } else {
+                    val settingsIntent = Intent(context, SettingsActivity::class.java)
+                    settingsIntent.putExtra(KEY_INTERNAL_USER_ID, currentUser.id)
+                    startActivity(settingsIntent)
+                }
+            },
+            onNavigateBack = { onBackPressedDispatcher.onBackPressed() },
+            onAccountChooserClick = {
+                ChooseAccountShareToDialogFragment.newInstance(currentUser)
+                    .show(supportFragmentManager, ChooseAccountShareToDialogFragment.TAG)
+            },
+            onNewConversation = { showNewConversationsScreen() },
+            onAccountDialogDismiss = { showAccountDialogState.value = false },
+            onConversationOpsDismiss = { conversationsListViewModel.setSelectedConversationForOps(null) },
+            onConversationOpsAction = { action, conversation -> handleConversationOpsAction(action, conversation) }
+        )
+
+    private fun handleEcoSystemIntent(intent: Intent) {
+        ecosystemManager.receiveAccount(
+            intent,
+            object : AccountReceiverCallback {
+                override fun onAccountReceived(accountName: String) {
+                    lifecycleScope.launch {
+                        val user = AccountUtils.findUserForFilesAccount(context, accountName, userManager.getUsers())
+                        if (user != null && userManager.setUserAsActive(user)) {
+                            startActivity(createInPlaceAccountSwitchIntent(context, user.id!!))
+                        } else {
+                            showSnackbar(getString(R.string.nc_no_account_found))
+                        }
+                    }
+                    Log.d(TAG, AccountNameUtils.getUserPart(accountName))
+                }
+
+                override fun onAccountError(reason: String) {
+                    Log.d(TAG, "handleEcosystemIntent: $reason")
+                }
+            }
+        )
+    }
+
+    @SuppressLint("InlinedApi")
     override fun onPostCreate(savedInstanceState: Bundle?) {
         super.onPostCreate(savedInstanceState)
+        isLocalNetworkCheckDue = savedInstanceState == null
 
         // handle notification permission on API level >= 33
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            !platformPermissionUtil.isPostNotificationsPermissionGranted() &&
-            ClosedInterfaceImpl().isGooglePlayServicesAvailable
-        ) {
+        if (needsPostNotificationsPermission()) {
             requestPermissions(
                 arrayOf(Manifest.permission.POST_NOTIFICATIONS),
                 REQUEST_POST_NOTIFICATIONS_PERMISSION
             )
+        } else {
+            checkLocalNetworkPermission()
+        }
+    }
+
+    // Accounts added before the local network permission existed, or a server that only resolves to the local
+    // network at home, never went through the check on server selection. The chat also connects to the signaling
+    // server of a high-performance backend, which can be on the local network behind a public server.
+    private fun checkLocalNetworkPermission() {
+        if (isLocalNetworkCheckDue && ::currentUser.isInitialized) {
+            isLocalNetworkCheckDue = false
+            localNetworkPermission.ensure(
+                listOf(currentUser.baseUrl, currentUser.externalSignalingServer?.externalSignalingServer)
+            )
+        }
+    }
+
+    private fun needsPostNotificationsPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        if (platformPermissionUtil.isPostNotificationsPermissionGranted()) return false
+        val usesPush = ClosedInterfaceImpl().isGooglePlayServicesAvailable ||
+            appPreferences.useUnifiedPush ||
+            UnifiedPushUtils.hasEmbeddedDistributor(context)
+        return usesPush
+    }
+
+    /**
+     * The list shows the default account. If another account became the default while the list was in the background
+     * (e.g. by joining a call for it), switch to that account. Not while forwarding or sharing, which would lose the
+     * pending message. The new list gets a plain intent: the list's own one may hold a deep link it already routed,
+     * which would be routed again, or a contact uri it may not grant.
+     */
+    private fun switchToDefaultAccountIfChanged() {
+        if (isRelaunching) return
+        val defaultUserId = defaultAccountProvider.getDefaultUserBlocking()?.id ?: return
+        val isPickingConversation = forwardMessage || isShare(intent)
+        if (defaultUserId != currentUser.id && !isPickingConversation) {
+            relaunchForAccount(defaultUserId, createIntent(this))
         }
     }
 
     override fun onResume() {
         super.onResume()
-
-        // actionBar?.show()
-        if (adapter == null) {
-            adapter = FlexibleAdapter(conversationItems, this, true)
-        } else {
-            binding?.loadingContent?.visibility = View.GONE
+        // Not while the lock screen covers the list: the list of the default account would start above it and open
+        // a lock screen of its own. The check stays due for the resume after unlocking.
+        if (isDefaultAccountCheckDue && !isCoveredByLockScreen) {
+            isDefaultAccountCheckDue = false
+            switchToDefaultAccountIfChanged()
+            // the list of the default account loads its own data
+            if (isRelaunching) return
         }
-        adapter!!.addListener(this)
-        prepareViews()
 
-        showShareToScreen = hasActivityActionSendIntent()
+        showNotificationWarningState.value = shouldShowNotificationWarning()
+        showShareToScreenState.value = isShare(intent)
+
+        takeConversationOfShortcut()
 
         if (!eventBus.isRegistered(this)) {
             eventBus.register(this)
         }
-        currentUser = userManager.currentUser.blockingGet()
-        if (currentUser != null) {
-            if (isServerEOL(currentUser!!.serverVersion?.major)) {
-                showServerEOLDialog()
-                return
-            }
-            if (isUnifiedSearchAvailable(currentUser!!.capabilities!!.spreedCapability!!)) {
-                searchHelper = MessageSearchHelper(unifiedSearchRepository)
-            }
-            credentials = ApiUtils.getCredentials(currentUser!!.username, currentUser!!.token)
 
-            loadUserAvatar(binding.switchAccountButton)
-            viewThemeUtils.material.colorMaterialTextButton(binding.switchAccountButton)
-            viewThemeUtils.material.themeCardView(binding.conversationListHintInclude.hintLayoutCardview)
-            searchBehaviorSubject.onNext(false)
-            fetchRooms()
-            fetchPendingInvitations()
-        } else {
-            Log.e(TAG, "userManager.currentUser.blockingGet() returned null")
-            Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
+        if (isServerEOL(currentUser.serverVersion?.major)) {
+            showServerEOLDialog()
+            return
+        }
+        credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token)
+
+        if (currentUser.id != appPreferences.getConversationListLastUserId()) {
+            appPreferences.setConversationListPositionAndOffset(0, 0)
         }
 
-        showSearchOrToolbar()
+        lifecycleScope.launch {
+            val users = userManager.getUsers()
+            hasMultipleAccountsState.value = users.size > 1
+            if (!areShortcutsOfEarlierVersionsUpdated) {
+                // reset if they couldn't be updated, so a later list tries again
+                areShortcutsOfEarlierVersionsUpdated = true
+                var isUpdated = false
+                try {
+                    isUpdated = withContext(Dispatchers.IO) {
+                        ShortcutManagerHelper.updateShortcutsOfEarlierVersions(context, users)
+                    }
+                } finally {
+                    areShortcutsOfEarlierVersionsUpdated = isUpdated
+                }
+            }
+        }
+        conversationsListViewModel.setHideRoomToken(intent.getStringExtra(KEY_FORWARD_HIDE_SOURCE_ROOM))
+        openConversationOfShortcutAfter(fetchRooms())
+        fetchPendingInvitations()
+
+        conversationsListViewModel.checkIfThreadsExist()
+        conversationsListViewModel.reloadFilterFromStorage(UserIdUtils.getIdForUser(currentUser))
+        conversationTagsViewModel.loadConversationTags()
     }
 
-    private fun initObservers() {
-        conversationsListViewModel.getFederationInvitationsViewState.observe(this) { state ->
-            when (state) {
-                is ConversationsListViewModel.GetFederationInvitationsStartState -> {
-                    binding.conversationListHintInclude.conversationListHintLayout.visibility = View.GONE
-                }
+    /** Takes the conversation of the shortcut that started the list from its intent, see [pendingShortcutToken]. */
+    private fun takeConversationOfShortcut() {
+        // Shortcut tap, e.g. on the home screen or of a notification: the shortcut uses ACTION_VIEW with
+        // KEY_ROOM_TOKEN to open the conversation directly without showing the share picker. It is opened once, not
+        // again when the list is shown again, e.g. by going back from the conversation or from the recents.
+        if (Intent.ACTION_VIEW == intent.action && !AppTasks.isRelaunchedFromRecents(intent)) {
+            intent.getStringExtra(KEY_ROOM_TOKEN)?.takeIf(DeepLinkHandler::isValidToken)?.let {
+                pendingShortcutToken = it
+            }
+            intent.removeExtra(KEY_ROOM_TOKEN)
+        }
 
-                is ConversationsListViewModel.GetFederationInvitationsSuccessState -> {
-                    if (state.showInvitationsHint) {
-                        binding.conversationListHintInclude.conversationListHintLayout.visibility = View.VISIBLE
-                    } else {
-                        binding.conversationListHintInclude.conversationListHintLayout.visibility = View.GONE
+        // Share sheet shortcut tap: Android delivers ACTION_SEND with EXTRA_SHORTCUT_ID, before Android 10 through
+        // ChooserTargetServiceCompat. Extract the room token from the shortcut ID so we can pre-select the
+        // conversation.
+        if (isShare(intent)) {
+            val target = intent.getStringExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
+                ?.let(ShortcutManagerHelper::conversationOfShortcutId)
+            if (target != null && target.first != currentUser.id) {
+                // a target of an account shown before, which the system keeps cached: shared with that account
+                val share = Intent(intent)
+                lifecycleScope.launch {
+                    if (userManager.getUserWithInternalId(target.first) != null) {
+                        relaunchForAccount(target.first, share)
                     }
                 }
-
-                is ConversationsListViewModel.GetFederationInvitationsErrorState -> {
-                    Snackbar.make(binding.root, R.string.get_invitations_error, Snackbar.LENGTH_LONG).show()
-                }
-
-                else -> {}
+            } else if (target != null) {
+                pendingShortcutToken = target.second
             }
+            // preselected once, like the conversation of a shortcut above
+            intent.removeExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
         }
+    }
 
-        conversationsListViewModel.showBadgeViewState.observe(this) { state ->
+    override fun onStop() {
+        super.onStop()
+        // checked when the list is shown again, unless onNewIntent() gets an intent, which chooses its account itself
+        isDefaultAccountCheckDue = true
+        // The conversation of a shortcut that isn't in the list yet isn't opened anymore once the list is left. Not
+        // when it is only paused, e.g. below the request for the notification permission.
+        if (!isCoveredByLockScreen && !isChangingConfigurations) pendingShortcutToken = null
+    }
+
+    override fun onPause() {
+        super.onPause()
+        conversationListLazyListState?.let { state ->
+            val firstOffset = state.layoutInfo.visibleItemsInfo.firstOrNull()?.offset ?: 0
+            appPreferences.setConversationListPositionAndOffset(state.firstVisibleItemIndex, firstOffset)
+        }
+        appPreferences.setConversationListLastUserId(currentUser.id ?: -1L)
+    }
+
+    @Suppress("LongMethod", "CyclomaticComplexMethod")
+    private fun initObservers() {
+        conversationsListViewModel.getRoomsViewState.observe(this) { state ->
             when (state) {
-                is ConversationsListViewModel.ShowBadgeStartState -> {
-                    showAccountIconBadge(false)
-                }
-
-                is ConversationsListViewModel.ShowBadgeSuccessState -> {
-                    showAccountIconBadge(state.showBadge)
-                }
-
-                is ConversationsListViewModel.ShowBadgeErrorState -> {
-                    Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
+                is ConversationsListViewModel.GetRoomsErrorState -> {
+                    isRefreshingState.value = false
+                    handleHttpExceptions(state.throwable)
                 }
 
                 else -> {}
             }
         }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.isLoadingRooms.collect { isLoading ->
+                if (!isLoading) {
+                    isRefreshingState.value = false
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.getRoomsFlow
+                .onEach { list ->
+                    // Add app shortcut for note to self
+                    val noteToSelf = list
+                        .firstOrNull { ConversationUtils.isNoteToSelfConversation(it) }
+                    val isNoteToSelfAvailable = noteToSelf != null
+                    handleNoteToSelfShortcut(isNoteToSelfAvailable, noteToSelf?.token ?: "")
+
+                    // Update Direct Share targets
+                    lifecycleScope.launch {
+                        DirectShareHelper.publishShareTargetShortcuts(this@ConversationsListActivity, currentUser, list)
+                    }
+
+                    // Update dynamic shortcuts for frequent/favorite conversations
+                    ShortcutManagerHelper.updateDynamicShortcuts(context, list, currentUser)
+
+                    if (!scrollPositionRestored) {
+                        scrollPositionRestored = true
+                        val pair = appPreferences.conversationListPositionAndOffset
+                        lifecycleScope.launch {
+                            conversationListLazyListState?.scrollToItem(pair.first, pair.second)
+                        }
+                    }
+                }.collect()
+        }
+
+        // Direct Share: the conversation of a share sheet or home screen shortcut, also after unlocking, as soon as the
+        // list has it. One that isn't stored yet, e.g. a new one, opens once the sync has added it, at the latest when
+        // the sync ends, see openConversationOfShortcutAfter. The shared room list isn't queried again on every resume.
+        collectWhileUnlocked(conversationsListViewModel.getRoomsStateFlow) { list ->
+            val token = pendingShortcutToken
+            val conversation = list.firstOrNull { it.token == token }
+            if (conversation != null) {
+                pendingShortcutToken = null
+                handleConversation(conversation)
+            }
+        }
+
+        // the conversation of a shortcut doesn't open over a search the user started meanwhile
+        lifecycleScope.launch {
+            conversationsListViewModel.isSearchActiveFlow.collect { isSearchActive ->
+                if (isSearchActive) pendingShortcutToken = null
+            }
+        }
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                contactsViewModel.roomViewState.collect { state ->
+                    if (state is ContactsViewModel.RoomUiState.Success) {
+                        state.conversation?.token?.let { token ->
+                            val chatIntent = ChatActivity.createIntent(context, state.userId, token)
+                            chatIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                            startActivity(chatIntent)
+                        }
+                        contactsViewModel.clearRoomState()
+                    }
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.filterStateFlow.collect { filterState ->
+                if (filterState[ARCHIVE] == true) showUnreadBubbleState.value = false
+            }
+        }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.readUnreadState.collect { state ->
+                when (state) {
+                    is ConversationsListViewModel.ConversationReadUnreadUiState.Success -> {
+                        conversationsListViewModel.resetReadUnreadState()
+                    }
+                    is ConversationsListViewModel.ConversationReadUnreadUiState.Error -> {
+                        logger.e(TAG, "Failed to mark conversation as read/unread")
+                        showSnackbar(resources.getString(R.string.nc_common_error_sorry))
+                        conversationsListViewModel.resetReadUnreadState()
+                    }
+                    ConversationsListViewModel.ConversationReadUnreadUiState.None -> { /* no-op */ }
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.favoriteState.collect { state ->
+                when (state) {
+                    is ConversationsListViewModel.FavoriteUiState.Success -> {
+                        conversationsListViewModel.resetFavoriteState()
+                    }
+                    is ConversationsListViewModel.FavoriteUiState.Error -> {
+                        logger.e(TAG, "Failed to toggle conversation favorite state")
+                        showSnackbar(resources.getString(R.string.nc_common_error_sorry))
+                        conversationsListViewModel.resetFavoriteState()
+                    }
+                    ConversationsListViewModel.FavoriteUiState.None -> { /* no-op */ }
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            conversationsListViewModel.archiveState.collect { state ->
+                when (state) {
+                    is ConversationsListViewModel.ArchiveUiState.Success -> {
+                        val messageRes = if (state.archived) {
+                            R.string.archived_conversation
+                        } else {
+                            R.string.unarchived_conversation
+                        }
+                        showSnackbar(String.format(resources.getString(messageRes), state.conversationDisplayName))
+                        conversationsListViewModel.resetArchiveState()
+                    }
+                    is ConversationsListViewModel.ArchiveUiState.Error -> {
+                        logger.e(TAG, "Failed to toggle conversation archive state")
+                        showSnackbar(resources.getString(R.string.nc_common_error_sorry))
+                        conversationsListViewModel.resetArchiveState()
+                    }
+                    ConversationsListViewModel.ArchiveUiState.None -> { /* no-op */ }
+                }
+            }
+        }
+    }
+
+    private fun handleNoteToSelfShortcut(noteToSelfAvailable: Boolean, noteToSelfToken: String) {
+        if (noteToSelfAvailable) {
+            // through the list like the other conversation shortcuts, so the chat opens in the task of the app
+            val intent = ShortcutManagerHelper.createConversationIntent(context, noteToSelfToken, currentUser) ?: return
+            val openNotesString = resources.getString(R.string.open_notes)
+
+            val shortcut = ShortcutInfoCompat.Builder(context, NOTE_TO_SELF_SHORTCUT_ID)
+                .setShortLabel(openNotesString)
+                .setLongLabel(openNotesString)
+                .setIcon(IconCompat.createWithResource(context, R.drawable.ic_pencil_grey600_24dp))
+                .setIntent(intent)
+                .build()
+
+            ShortcutManagerCompat.pushDynamicShortcut(context, shortcut)
+        } else {
+            ShortcutManagerCompat.removeDynamicShortcuts(context, listOf(NOTE_TO_SELF_SHORTCUT_ID))
+        }
+    }
+
+    fun showOnlyNearFutureEvents() {
+        // Reset all filters so the ViewModel's default view (non-archived, non-future-events) is shown
+        conversationsListViewModel.applyFilter(
+            mapOf(
+                MENTION to false,
+                UNREAD to false,
+                ARCHIVE to false,
+                FilterConversationFragment.DEFAULT to true
+            )
+        )
+    }
+
+    private fun handleConversationLongClick(model: ConversationModel) {
+        if (!showShareToScreen && networkMonitor.isOnline.value) {
+            conversationsListViewModel.setSelectedConversationForOps(model)
+        }
+    }
+
+    private fun showContextChatForMessage(result: SearchMessageEntry) {
+        val messageId = result.messageId?.toLongOrNull()?.takeIf { it > 0L }
+        if (messageId == null) {
+            logger.e(TAG, "message id could not be parsed from search result")
+            showSnackbar(getString(R.string.nc_common_error_sorry))
+            return
+        }
+        val threadId = result.threadId?.toLongOrNull()?.takeIf { it > 0L }
+        val intent = ChatActivity.createIntent(context, currentUser.id!!, result.conversationToken).apply {
+            putExtra(BundleKeys.KEY_MESSAGE_ID, messageId)
+            putExtra(BundleKeys.KEY_SEARCH_QUERY, result.searchTerm)
+            threadId?.let { putExtra(BundleKeys.KEY_THREAD_ID, it) }
+        }
+        startActivity(intent)
+    }
+
+    /**
+     * Opens the chat of an audio message at the message, in its thread if it has one, also of another account: its
+     * conversation list follows on back.
+     */
+    private fun openAudioMessage(key: ChatAudioKey, threadId: Long?) {
+        startActivity(key.openMessageIntent(this, threadId))
     }
 
     fun filterConversation() {
-        val accountId = UserIdUtils.getIdForUser(userManager.currentUser.blockingGet())
-        filterState[FilterConversationFragment.UNREAD] = (
-            arbitraryStorageManager.getStorageSetting(
-                accountId,
-                FilterConversationFragment.UNREAD,
-                ""
-            ).blockingGet()?.value ?: ""
-            ) == "true"
+        conversationsListViewModel.reloadFilterFromStorage(UserIdUtils.getIdForUser(currentUser))
+    }
 
-        filterState[FilterConversationFragment.MENTION] = (
-            arbitraryStorageManager.getStorageSetting(
-                accountId,
-                FilterConversationFragment.MENTION,
-                ""
-            ).blockingGet()?.value ?: ""
-            ) == "true"
+    private fun showChooseAccountDialog() {
+        showAccountDialogState.value = true
+    }
 
-        val newItems: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-        if (filterState[FilterConversationFragment.UNREAD] == false &&
-            filterState[FilterConversationFragment.MENTION] == false
-        ) {
-            adapter!!.updateDataSet(conversationItems, true)
-        } else {
-            val items = conversationItems
-            for (i in items) {
-                val conversation = (i as ConversationItem).model
-                if (filter(conversation)) {
-                    newItems.add(i)
-                }
-            }
-            adapter!!.updateDataSet(newItems, true)
-            setFilterableItems(newItems)
+    /**
+     * Replaces this list by a new one for the account with the internal id [userId], e.g. for an intent for another
+     * account or to continue a pending share with another account.
+     *
+     * The list is bound to its account, so it is not recreated, which would keep the account and its view models.
+     * The new list gets the action, data and extras of [source], including shared content and the read access to
+     * shared files, which ends with this activity. The activity is exported, so [source] can come from another app:
+     * the new intent only targets this activity and takes over no other flags.
+     */
+    fun relaunchForAccount(userId: Long, source: Intent = intent) {
+        if (isRelaunching) return
+        isRelaunching = true
+        val accountIntent = createIntent(this).apply {
+            action = source.action
+            setDataAndType(source.data, source.type)
+            source.extras?.let { putExtras(it) }
+            clipData = source.clipData
+            putExtra(KEY_INTERNAL_USER_ID, userId)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            // a share stays out of the recents, see ShareActivity
+            addFlags(source.flags and Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
         }
-
-        updateFilterConversationButtonColor()
-    }
-
-    private fun filter(conversation: Conversation): Boolean {
-        var result = true
-        for ((k, v) in filterState) {
-            if (v) {
-                when (k) {
-                    FilterConversationFragment.MENTION -> result = (result && conversation.unreadMention) ||
-                        (
-                            result &&
-                                (
-                                    conversation.type == Conversation.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL ||
-                                        conversation.type == Conversation.ConversationType.FORMER_ONE_TO_ONE
-                                    ) &&
-                                (conversation.unreadMessages > 0)
-                            )
-
-                    FilterConversationFragment.UNREAD -> result = result && (conversation.unreadMessages > 0)
-                }
-            }
-        }
-
-        return result
-    }
-
-    private fun setupActionBar() {
-        setSupportActionBar(binding.conversationListToolbar)
-        binding.conversationListToolbar.setNavigationOnClickListener {
-            onBackPressedDispatcher.onBackPressed()
-        }
-        supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        supportActionBar?.setDisplayShowHomeEnabled(true)
-        supportActionBar?.setIcon(ColorDrawable(resources!!.getColor(R.color.transparent, null)))
-        supportActionBar?.title = resources!!.getString(R.string.nc_app_product_name)
-        viewThemeUtils.material.themeToolbar(binding.conversationListToolbar)
-    }
-
-    private fun loadUserAvatar(target: Target) {
-        if (currentUser != null) {
-            val url = ApiUtils.getUrlForAvatar(
-                currentUser!!.baseUrl!!,
-                currentUser!!.userId,
-                true
-            )
-
-            val credentials = ApiUtils.getCredentials(currentUser!!.username, currentUser!!.token)
-
-            context.imageLoader.enqueue(
-                ImageRequest.Builder(context)
-                    .data(url)
-                    .addHeader("Authorization", credentials!!)
-                    .placeholder(R.drawable.ic_user)
-                    .transformations(CircleCropTransformation())
-                    .crossfade(true)
-                    .target(target)
-                    .build()
-            )
-        } else {
-            Log.e(TAG, "currentUser was null in loadUserAvatar")
-            Snackbar.make(binding.root, R.string.nc_common_error_sorry, Snackbar.LENGTH_LONG).show()
-        }
-    }
-
-    private fun loadUserAvatar(button: MaterialButton) {
-        val target = object : Target {
-            override fun onStart(placeholder: Drawable?) {
-                button.icon = placeholder
-            }
-
-            override fun onSuccess(result: Drawable) {
-                button.icon = result
-            }
-        }
-
-        loadUserAvatar(target)
-    }
-
-    private fun loadUserAvatar(menuItem: MenuItem) {
-        val target = object : Target {
-            override fun onStart(placeholder: Drawable?) {
-                menuItem.icon = placeholder
-            }
-
-            override fun onSuccess(result: Drawable) {
-                menuItem.icon = result
-            }
-        }
-        loadUserAvatar(target)
-    }
-
-    private fun initSearchView() {
-        val searchManager = getSystemService(Context.SEARCH_SERVICE) as SearchManager?
-        if (searchItem != null) {
-            searchView = MenuItemCompat.getActionView(searchItem) as SearchView
-            viewThemeUtils.talk.themeSearchView(searchView!!)
-            searchView!!.maxWidth = Int.MAX_VALUE
-            searchView!!.inputType = InputType.TYPE_TEXT_VARIATION_FILTER
-            var imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_FULLSCREEN
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && appPreferences.isKeyboardIncognito) {
-                imeOptions = imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
-            }
-            searchView!!.imeOptions = imeOptions
-            searchView!!.queryHint = getString(R.string.appbar_search_in, getString(R.string.nc_app_product_name))
-            if (searchManager != null) {
-                searchView!!.setSearchableInfo(searchManager.getSearchableInfo(componentName))
-            }
-            searchViewDisposable = observeSearchView(searchView!!)
-                .debounce { query: String? ->
-                    if (TextUtils.isEmpty(query)) {
-                        return@debounce Observable.empty<Long>()
-                    } else {
-                        return@debounce Observable.timer(
-                            SEARCH_DEBOUNCE_INTERVAL_MS.toLong(),
-                            TimeUnit.MILLISECONDS
-                        )
-                    }
-                }
-                .distinctUntilChanged()
-                .subscribeOn(Schedulers.io())
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe { newText: String? -> onQueryTextChange(newText) }
-        }
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        super.onCreateOptionsMenu(menu)
-
-        menuInflater.inflate(R.menu.menu_conversation_plus_filter, menu)
-        searchItem = menu.findItem(R.id.action_search)
-        chooseAccountItem = menu.findItem(R.id.action_choose_account)
-        loadUserAvatar(chooseAccountItem!!)
-
-        chooseAccountItem?.setOnMenuItemClickListener {
-            if (resources != null && resources!!.getBoolean(R.bool.multiaccount_support)) {
-                val newFragment: DialogFragment = ChooseAccountShareToDialogFragment.newInstance()
-                newFragment.show(
-                    supportFragmentManager,
-                    ChooseAccountShareToDialogFragment.TAG
-                )
-            }
-            true
-        }
-        initSearchView()
-        return true
-    }
-
-    @OptIn(ExperimentalBadgeUtils::class)
-    fun showAccountIconBadge(showBadge: Boolean) {
-        if (!::accountIconBadge.isInitialized) {
-            accountIconBadge = BadgeDrawable.create(binding.switchAccountButton.context)
-            accountIconBadge.verticalOffset = BADGE_OFFSET
-            accountIconBadge.horizontalOffset = BADGE_OFFSET
-            accountIconBadge.backgroundColor = resources.getColor(R.color.badge_color, null)
-        }
-
-        if (showBadge) {
-            BadgeUtils.attachBadgeDrawable(accountIconBadge, binding.switchAccountButton)
-        } else {
-            BadgeUtils.detachBadgeDrawable(accountIconBadge, binding.switchAccountButton)
-        }
-    }
-
-    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
-        super.onPrepareOptionsMenu(menu)
-
-        searchView = MenuItemCompat.getActionView(searchItem) as SearchView
-
-        val moreAccountsAvailable = userManager.users.blockingGet().size > 1
-        menu.findItem(R.id.action_choose_account).isVisible = showShareToScreen && moreAccountsAvailable
-
-        if (showShareToScreen) {
-            hideSearchBar()
-            supportActionBar?.setTitle(R.string.send_to_three_dots)
-        } else if (forwardMessage) {
-            hideSearchBar()
-            supportActionBar?.setTitle(R.string.nc_forward_to_three_dots)
-        } else {
-            searchItem!!.isVisible = conversationItems.size > 0
-            if (adapter!!.hasFilter()) {
-                showSearchView(searchView, searchItem)
-                searchView!!.setQuery(adapter!!.getFilter(String::class.java), false)
-            }
-            binding.searchText.setOnClickListener {
-                showSearchView(searchView, searchItem)
-                viewThemeUtils.platform.themeStatusBar(this)
-            }
-            searchView!!.setOnCloseListener {
-                if (TextUtils.isEmpty(searchView!!.query.toString())) {
-                    searchView!!.onActionViewCollapsed()
-                    viewThemeUtils.platform.resetStatusBar(this)
-                } else {
-                    searchView!!.post { searchView!!.setQuery(TAG, true) }
-                }
-                true
-            }
-            searchItem!!.setOnActionExpandListener(object : MenuItem.OnActionExpandListener {
-                override fun onMenuItemActionExpand(item: MenuItem): Boolean {
-                    adapter!!.setHeadersShown(true)
-                    if (!filterState.containsValue(true)) filterableConversationItems = searchableConversationItems
-                    adapter!!.updateDataSet(filterableConversationItems, false)
-                    adapter!!.showAllHeaders()
-                    binding?.swipeRefreshLayoutView?.isEnabled = false
-                    searchBehaviorSubject.onNext(true)
-                    return true
-                }
-
-                override fun onMenuItemActionCollapse(item: MenuItem): Boolean {
-                    adapter!!.setHeadersShown(false)
-                    if (!filterState.containsValue(true)) filterableConversationItems = conversationItemsWithHeader
-                    adapter!!.updateDataSet(filterableConversationItems, false)
-                    adapter!!.hideAllHeaders()
-                    if (searchHelper != null) {
-                        // cancel any pending searches
-                        searchHelper!!.cancelSearch()
-                        binding?.swipeRefreshLayoutView?.isRefreshing = false
-                        searchBehaviorSubject.onNext(false)
-                    }
-                    binding?.swipeRefreshLayoutView?.isEnabled = true
-                    searchView!!.onActionViewCollapsed()
-
-                    binding.conversationListAppbar.stateListAnimator = AnimatorInflater.loadStateListAnimator(
-                        binding.conversationListAppbar.context,
-                        R.animator.appbar_elevation_off
-                    )
-                    binding.conversationListToolbar.visibility = View.GONE
-                    binding.searchToolbar.visibility = View.VISIBLE
-                    if (resources != null) {
-                        viewThemeUtils.platform.resetStatusBar(this@ConversationsListActivity)
-                    }
-
-                    val layoutManager = binding?.recyclerView?.layoutManager as SmoothScrollLinearLayoutManager?
-                    layoutManager?.scrollToPositionWithOffset(0, 0)
-                    return true
-                }
-            })
-        }
-        return true
-    }
-
-    private fun showSearchOrToolbar() {
-        if (TextUtils.isEmpty(searchQuery)) {
-            if (appBarLayoutType == AppBarLayoutType.SEARCH_BAR) {
-                showSearchBar()
-            } else {
-                showToolbar()
-            }
-            colorizeStatusBar()
-            colorizeNavigationBar()
-        }
-    }
-
-    private fun showSearchBar() {
-        val layoutParams = binding.searchToolbar.layoutParams as AppBarLayout.LayoutParams
-        binding.searchToolbar.visibility = View.VISIBLE
-        binding.searchText.hint = getString(R.string.appbar_search_in, getString(R.string.nc_app_product_name))
-        binding.conversationListToolbar.visibility = View.GONE
-        // layoutParams.setScrollFlags(AppBarLayout.LayoutParams.SCROLL_FLAG_SCROLL | AppBarLayout
-        // .LayoutParams.SCROLL_FLAG_SNAP | AppBarLayout.LayoutParams.SCROLL_FLAG_ENTER_ALWAYS);
-        layoutParams.scrollFlags = 0
-        binding.conversationListAppbar.stateListAnimator = AnimatorInflater.loadStateListAnimator(
-            binding.conversationListAppbar.context,
-            R.animator.appbar_elevation_off
-        )
-        binding.searchToolbar.layoutParams = layoutParams
-    }
-
-    private fun showToolbar() {
-        val layoutParams = binding.searchToolbar.layoutParams as AppBarLayout.LayoutParams
-        binding.searchToolbar.visibility = View.GONE
-        binding.conversationListToolbar.visibility = View.VISIBLE
-        viewThemeUtils.material.colorToolbarOverflowIcon(binding.conversationListToolbar)
-        layoutParams.scrollFlags = 0
-        binding.conversationListAppbar.stateListAnimator = AnimatorInflater.loadStateListAnimator(
-            binding.conversationListAppbar.context,
-            R.animator.appbar_elevation_on
-        )
-        binding.conversationListToolbar.layoutParams = layoutParams
-    }
-
-    private fun hideSearchBar() {
-        val layoutParams = binding.searchToolbar.layoutParams as AppBarLayout.LayoutParams
-        binding.searchToolbar.visibility = View.GONE
-        binding.conversationListToolbar.visibility = View.VISIBLE
-        layoutParams.scrollFlags = 0
-        binding.conversationListAppbar.stateListAnimator = AnimatorInflater.loadStateListAnimator(
-            binding.conversationListAppbar.context,
-            R.animator.appbar_elevation_on
-        )
-    }
-
-    private fun hasActivityActionSendIntent(): Boolean {
-        return Intent.ACTION_SEND == intent.action || Intent.ACTION_SEND_MULTIPLE == intent.action
-    }
-
-    private fun showSearchView(searchView: SearchView?, searchItem: MenuItem?) {
-        binding.conversationListAppbar.stateListAnimator = AnimatorInflater.loadStateListAnimator(
-            binding.conversationListAppbar.context,
-            R.animator.appbar_elevation_on
-        )
-        binding.conversationListToolbar.visibility = View.VISIBLE
-        binding.searchToolbar.visibility = View.GONE
-        searchItem!!.expandActionView()
+        startActivity(accountIntent)
+        finish()
     }
 
     fun showSnackbar(text: String) {
-        Snackbar.make(binding.root, text, Snackbar.LENGTH_LONG).show()
+        lifecycleScope.launch { snackbarHostState.showSnackbar(text) }
     }
 
-    fun fetchRooms() {
-        val includeStatus = isUserStatusAvailable(userManager.currentUser.blockingGet())
-
-        // checks internet connection before fetching rooms
-        if (isNetworkAvailable(context)) {
-            Log.d(TAG, "Internet connection available")
-            dispose(null)
-            isRefreshing = true
-            conversationItems = ArrayList()
-            conversationItemsWithHeader = ArrayList()
-            val apiVersion = ApiUtils.getConversationApiVersion(
-                currentUser!!,
-                intArrayOf(ApiUtils.API_V4, ApiUtils.API_V3, 1)
-            )
-            val startNanoTime = System.nanoTime()
-            Log.d(TAG, "fetchData - getRooms - calling: $startNanoTime")
-            roomsQueryDisposable = ncApi.getRooms(
-                credentials,
-                ApiUtils.getUrlForRooms(
-                    apiVersion,
-                    currentUser!!.baseUrl
-                ),
-                includeStatus
-            )
-                .subscribeOn(Schedulers.io())
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe({ (ocs): RoomsOverall ->
-                    Log.d(TAG, "fetchData - getRooms - got response: $startNanoTime")
-
-                    // This is invoked asynchronously, when server returns a response the view might have been
-                    // unbound in the meantime. Check if the view is still there.
-                    // FIXME - does it make sense to update internal data structures even when view has been unbound?
-                    // if (view == null) {
-                    //     Log.d(TAG, "fetchData - getRooms - view is not bound: $startNanoTime")
-                    //     return@subscribe
-                    // }
-
-                    if (adapterWasNull) {
-                        adapterWasNull = false
-                        binding?.loadingContent?.visibility = View.GONE
-                    }
-                    initOverallLayout(ocs!!.data!!.isNotEmpty())
-                    for (conversation in ocs.data!!) {
-                        addToConversationItems(conversation)
-                    }
-                    sortConversations(conversationItems)
-                    sortConversations(conversationItemsWithHeader)
-                    if (!filterState.containsValue(true)) filterableConversationItems = conversationItems
-                    filterConversation()
-                    adapter!!.updateDataSet(filterableConversationItems, false)
-                    Handler().postDelayed({ checkToShowUnreadBubble() }, UNREAD_BUBBLE_DELAY.toLong())
-                    fetchOpenConversations(apiVersion)
-                    binding?.swipeRefreshLayoutView?.isRefreshing = false
-                }, { throwable: Throwable ->
-                    handleHttpExceptions(throwable)
-                    binding?.swipeRefreshLayoutView?.isRefreshing = false
-                    dispose(roomsQueryDisposable)
-                }) {
-                    dispose(roomsQueryDisposable)
-                    binding?.swipeRefreshLayoutView?.isRefreshing = false
-                    isRefreshing = false
+    /**
+     * Starts a loop that refreshes the conversation list every
+     * [FOREGROUND_REFRESH_INTERVAL_MILLIS] milliseconds while this screen is resumed, waiting one
+     * interval before the first refresh.
+     */
+    private fun startForegroundRefreshLoop() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (isActive) {
+                    delay(FOREGROUND_REFRESH_INTERVAL_MILLIS)
+                    currentUser?.let { conversationsListViewModel.refreshRoomsIfIdle(it) }
                 }
-        } else {
-            Log.d(TAG, "No internet connection detected")
-            showNetworkErrorDialog()
+            }
+        }
+    }
+
+    fun fetchRooms(forceFullSync: Boolean = false): Job =
+        conversationsListViewModel.getRooms(currentUser, forceFullSync)
+
+    /**
+     * Opens the conversation of the pending shortcut once [sync] stored the conversations, if the list didn't show it
+     * before, or tells that it wasn't found. While the lock screen covers the list, it waits for the resume after
+     * unlocking, which waits for a sync of its own.
+     */
+    private fun openConversationOfShortcutAfter(sync: Job) {
+        val token = pendingShortcutToken ?: return
+        lifecycleScope.launch {
+            sync.join()
+            // also one the list doesn't show yet
+            val conversation = conversationsListViewModel.storedRooms().firstOrNull { it.token == token }
+            withResumed {
+                if (pendingShortcutToken == token && !isCoveredByLockScreen) {
+                    pendingShortcutToken = null
+                    if (conversation != null) {
+                        handleConversation(conversation)
+                    } else {
+                        showSnackbar(getString(R.string.nc_shortcut_conversation_not_found))
+                    }
+                }
+            }
         }
     }
 
     private fun fetchPendingInvitations() {
-        if (hasSpreedFeatureCapability(currentUser!!.capabilities!!.spreedCapability!!, SpreedFeatures.FEDERATION_V1)) {
-            binding.conversationListHintInclude.conversationListHintLayout.setOnClickListener {
-                val intent = Intent(this, InvitationsActivity::class.java)
-                startActivity(intent)
-            }
+        if (hasSpreedFeatureCapability(currentUser.capabilities?.spreedCapability, SpreedFeatures.FEDERATION_V1)) {
             conversationsListViewModel.getFederationInvitations()
         }
     }
 
-    private fun initOverallLayout(isConversationListNotEmpty: Boolean) {
-        if (isConversationListNotEmpty) {
-            if (binding?.emptyLayout?.visibility != View.GONE) {
-                binding?.emptyLayout?.visibility = View.GONE
-            }
-            if (binding?.swipeRefreshLayoutView?.visibility != View.VISIBLE) {
-                binding?.swipeRefreshLayoutView?.visibility = View.VISIBLE
-            }
-        } else {
-            if (binding?.emptyLayout?.visibility != View.VISIBLE) {
-                binding?.emptyLayout?.visibility = View.VISIBLE
-            }
-            if (binding?.swipeRefreshLayoutView?.visibility != View.GONE) {
-                binding?.swipeRefreshLayoutView?.visibility = View.GONE
-            }
-        }
-    }
-
-    private fun addToConversationItems(conversation: Conversation) {
-        if (intent.getStringExtra(KEY_FORWARD_HIDE_SOURCE_ROOM) != null &&
-            intent.getStringExtra(KEY_FORWARD_HIDE_SOURCE_ROOM) == conversation.roomId
-        ) {
-            return
-        }
-
-        if (conversation.objectType == Conversation.ObjectType.ROOM &&
-            conversation.lobbyState == Conversation.LobbyState.LOBBY_STATE_MODERATORS_ONLY
-        ) {
-            return
-        }
-
-        val headerTitle: String = resources!!.getString(R.string.conversations)
-        val genericTextHeaderItem: GenericTextHeaderItem
-        if (!callHeaderItems.containsKey(headerTitle)) {
-            genericTextHeaderItem = GenericTextHeaderItem(headerTitle, viewThemeUtils)
-            callHeaderItems[headerTitle] = genericTextHeaderItem
-        }
-
-        val conversationItem = ConversationItem(
-            conversation,
-            currentUser!!,
-            this,
-            viewThemeUtils
-        )
-        conversationItems.add(conversationItem)
-        val conversationItemWithHeader = ConversationItem(
-            conversation,
-            currentUser!!,
-            this,
-            callHeaderItems[headerTitle],
-            viewThemeUtils
-        )
-        conversationItemsWithHeader.add(conversationItemWithHeader)
-    }
-
-    private fun showErrorDialog() {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_baseline_error_outline_24dp
-                    )
-                )
-                .setTitle(R.string.error_loading_chats)
-                .setCancelable(false)
-                .setNegativeButton(R.string.close, null)
-
-            if (resources!!.getBoolean(R.bool.multiaccount_support) && userManager.users.blockingGet().size > 1) {
-                dialogBuilder.setPositiveButton(R.string.nc_switch_account) { _, _ ->
-                    val newFragment: DialogFragment = ChooseAccountDialogFragment.newInstance()
-                    newFragment.show(supportFragmentManager, ChooseAccountDialogFragment.TAG)
-                }
-            }
-
-            if (resources!!.getBoolean(R.bool.multiaccount_support)) {
-                dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
-                    val intent = Intent(this, ServerSelectionActivity::class.java)
-                    intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
-                    startActivity(intent)
-                }
-            }
-
-            viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-            )
-        }
-    }
-
-    private fun showNetworkErrorDialog() {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_baseline_error_outline_24dp
-                    )
-                )
-                .setTitle(R.string.nc_check_your_internet)
-                .setCancelable(false)
-                .setNegativeButton(R.string.close, null)
-                .setNeutralButton(R.string.nc_refresh) { _, _ ->
-                    fetchRooms()
-                    fetchPendingInvitations()
-                }
-
-            viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-            )
-        }
-    }
-
-    @Suppress("ReturnCount")
-    private fun isNetworkAvailable(context: Context): Boolean {
-        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
-            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-    }
-
-    private fun sortConversations(conversationItems: MutableList<AbstractFlexibleItem<*>>) {
-        conversationItems.sortWith { o1: AbstractFlexibleItem<*>, o2: AbstractFlexibleItem<*> ->
-            val conversation1 = (o1 as ConversationItem).model
-            val conversation2 = (o2 as ConversationItem).model
-            CompareToBuilder()
-                .append(conversation2.favorite, conversation1.favorite)
-                .append(conversation2.lastActivity, conversation1.lastActivity)
-                .toComparison()
-        }
-    }
-
-    private fun fetchOpenConversations(apiVersion: Int) {
-        searchableConversationItems.clear()
-        searchableConversationItems.addAll(conversationItemsWithHeader)
-        if (hasSpreedFeatureCapability(
-                currentUser!!.capabilities!!.spreedCapability!!,
-                SpreedFeatures.LISTABLE_ROOMS
-            )
-        ) {
-            val openConversationItems: MutableList<AbstractFlexibleItem<*>> = ArrayList()
-            openConversationsQueryDisposable = ncApi.getOpenConversations(
-                credentials,
-                ApiUtils.getUrlForOpenConversations(apiVersion, currentUser!!.baseUrl!!)
-            )
-                .subscribeOn(Schedulers.io())
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe({ (ocs): RoomsOverall ->
-                    for (conversation in ocs!!.data!!) {
-                        val headerTitle = resources!!.getString(R.string.openConversations)
-                        var genericTextHeaderItem: GenericTextHeaderItem
-                        if (!callHeaderItems.containsKey(headerTitle)) {
-                            genericTextHeaderItem = GenericTextHeaderItem(headerTitle, viewThemeUtils)
-                            callHeaderItems[headerTitle] = genericTextHeaderItem
-                        }
-                        val conversationItem = ConversationItem(
-                            conversation,
-                            currentUser!!,
-                            this,
-                            callHeaderItems[headerTitle],
-                            viewThemeUtils
-                        )
-                        openConversationItems.add(conversationItem)
-                    }
-                    searchableConversationItems.addAll(openConversationItems)
-                }, { throwable: Throwable ->
-                    Log.e(TAG, "fetchData - getRooms - ERROR", throwable)
-                    handleHttpExceptions(throwable)
-                    dispose(openConversationsQueryDisposable)
-                }) { dispose(openConversationsQueryDisposable) }
-        } else {
-            Log.d(TAG, "no open conversations fetched because of missing capability")
-        }
-    }
-
     private fun handleHttpExceptions(throwable: Throwable) {
+        if (!networkMonitor.isOnline.value) return
+
         if (throwable is HttpException) {
             when (throwable.code()) {
-                HTTP_UNAUTHORIZED -> showUnauthorizedDialog()
+                HTTP_UNAUTHORIZED -> handleUnauthorized()
                 HTTP_CLIENT_UPGRADE_REQUIRED -> showOutdatedClientDialog()
                 HTTP_SERVICE_UNAVAILABLE -> showServiceUnavailableDialog(throwable)
                 else -> {
@@ -957,257 +1051,108 @@ class ConversationsListActivity :
         }
     }
 
-    @SuppressLint("ClickableViewAccessibility")
-    private fun prepareViews() {
-        layoutManager = SmoothScrollLinearLayoutManager(this)
-        binding.recyclerView.layoutManager = layoutManager
-        binding.recyclerView.setHasFixedSize(true)
-        binding.recyclerView.adapter = adapter
-        binding.recyclerView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
-            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
-                super.onScrollStateChanged(recyclerView, newState)
-                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
-                    val isSearchActive = searchBehaviorSubject.value
-                    if (!isSearchActive!!) {
-                        checkToShowUnreadBubble()
-                    }
-                }
-            }
-        })
-        binding?.recyclerView?.setOnTouchListener { v: View, _: MotionEvent? ->
-            if (!isDestroyed) {
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.hideSoftInputFromWindow(v.windowToken, 0)
-            }
-            false
-        }
-        binding?.swipeRefreshLayoutView?.setOnRefreshListener {
-            fetchRooms()
-            fetchPendingInvitations()
-        }
-        binding?.swipeRefreshLayoutView?.let { viewThemeUtils.androidx.themeSwipeRefreshLayout(it) }
-        binding?.emptyLayout?.setOnClickListener { showNewConversationsScreen() }
-        binding?.floatingActionButton?.setOnClickListener {
-            run(context)
-            showNewConversationsScreen()
-        }
-        binding?.floatingActionButton?.let { viewThemeUtils.material.themeFAB(it) }
+    private fun showErrorDialog() {
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(
+                viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
+                    context,
+                    R.drawable.ic_baseline_error_outline_24dp
+                )
+            )
+            .setTitle(R.string.error_loading_chats)
+            .setCancelable(false)
+            .setNegativeButton(R.string.close, null)
 
-        binding.switchAccountButton.setOnClickListener {
-            if (resources != null && resources!!.getBoolean(R.bool.multiaccount_support)) {
-                val newFragment: DialogFragment = ChooseAccountDialogFragment.newInstance()
-                newFragment.show(supportFragmentManager, ChooseAccountDialogFragment.TAG)
-            } else {
-                val intent = Intent(context, SettingsActivity::class.java)
+        if (resources!!.getBoolean(R.bool.multiaccount_support) && runBlocking { userManager.getUsers() }.size > 1) {
+            dialogBuilder.setPositiveButton(R.string.nc_switch_account) { _, _ ->
+                showChooseAccountDialog()
+            }
+        }
+
+        if (resources!!.getBoolean(R.bool.multiaccount_support)) {
+            dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
+                val intent = Intent(this, ServerSelectionActivity::class.java)
+                intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
                 startActivity(intent)
             }
         }
 
-        updateFilterConversationButtonColor()
-
-        binding.filterConversationsButton.setOnClickListener {
-            val newFragment = FilterConversationFragment.newInstance(filterState)
-            newFragment.show(supportFragmentManager, FilterConversationFragment.TAG)
-        }
-
-        binding?.newMentionPopupBubble?.hide()
-        binding?.newMentionPopupBubble?.setPopupBubbleListener {
-            binding?.recyclerView?.smoothScrollToPosition(
-                nextUnreadConversationScrollPosition
-            )
-        }
-        binding?.newMentionPopupBubble?.let { viewThemeUtils.material.colorMaterialButtonPrimaryFilled(it) }
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        )
     }
 
-    @SuppressLint("CheckResult")
     @Suppress("Detekt.TooGenericExceptionCaught")
-    private fun checkToShowUnreadBubble() {
-        searchBehaviorSubject.subscribe { value ->
-            if (value) {
-                nextUnreadConversationScrollPosition = 0
-                binding.newMentionPopupBubble.hide()
+    private fun checkToShowUnreadBubble(lastVisibleIndex: Int) {
+        if (conversationsListViewModel.isSearchActiveFlow.value) {
+            nextUnreadConversationScrollPosition = 0
+            showUnreadBubbleState.value = false
+            return
+        }
+        try {
+            val entries = conversationsListViewModel.conversationListEntriesFlow.value
+            val firstUnreadPosition = findFirstOffscreenUnreadPosition(entries, lastVisibleIndex)
+            if (firstUnreadPosition != null) {
+                nextUnreadConversationScrollPosition = firstUnreadPosition
+                showUnreadBubbleState.value = true
             } else {
-                try {
-                    val lastVisibleItem = layoutManager!!.findLastCompletelyVisibleItemPosition()
-                    for (flexItem in conversationItems) {
-                        val conversation: Conversation = (flexItem as ConversationItem).model
-                        val position = adapter!!.getGlobalPositionOf(flexItem)
-                        if (hasUnreadItems(conversation) && position > lastVisibleItem) {
-                            nextUnreadConversationScrollPosition = position
-                            if (!binding?.newMentionPopupBubble?.isShown!!) {
-                                binding?.newMentionPopupBubble?.show()
-                            }
-                            return@subscribe
-                        }
-                        nextUnreadConversationScrollPosition = 0
-                        binding?.newMentionPopupBubble?.hide()
-                    }
-                } catch (e: NullPointerException) {
-                    Log.d(
-                        TAG,
-                        "A NPE was caught when trying to show the unread popup bubble. This might happen when the " +
-                            "user already left the conversations-list screen so the popup bubble is not available " +
-                            "anymore.",
-                        e
-                    )
+                nextUnreadConversationScrollPosition = 0
+                showUnreadBubbleState.value = false
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Exception in checkToShowUnreadBubble", e)
+        }
+    }
+
+    private fun findFirstOffscreenUnreadPosition(
+        entries: List<com.nextcloud.talk.conversationlist.ui.ConversationListEntry>,
+        lastVisibleIndex: Int
+    ): Int? {
+        entries.forEachIndexed { index, entry ->
+            if (index > lastVisibleIndex &&
+                entry is com.nextcloud.talk.conversationlist.ui.ConversationListEntry.ConversationEntry
+            ) {
+                val model = entry.model
+                if (model.unreadMention ||
+                    (
+                        model.unreadMessages > 0 &&
+                            model.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+                        )
+                ) {
+                    return index
                 }
             }
         }
+        return null
     }
-
-    private fun hasUnreadItems(conversation: Conversation) =
-        conversation.unreadMention ||
-            conversation.unreadMessages > 0 &&
-            conversation.type === Conversation.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
 
     private fun showNewConversationsScreen() {
         val intent = Intent(context, ContactsActivity::class.java)
-        intent.putExtra(KEY_NEW_CONVERSATION, true)
+        intent.putExtra(KEY_INTERNAL_USER_ID, currentUser.id)
         startActivity(intent)
-    }
-
-    private fun dispose(disposable: Disposable?) {
-        if (disposable != null && !disposable.isDisposed) {
-            disposable.dispose()
-        } else if (disposable == null && roomsQueryDisposable != null && !roomsQueryDisposable!!.isDisposed) {
-            roomsQueryDisposable!!.dispose()
-            roomsQueryDisposable = null
-        } else if (disposable == null &&
-            openConversationsQueryDisposable != null &&
-            !openConversationsQueryDisposable!!.isDisposed
-        ) {
-            openConversationsQueryDisposable!!.dispose()
-            openConversationsQueryDisposable = null
-        }
-    }
-
-    override fun onSaveInstanceState(bundle: Bundle) {
-        super.onSaveInstanceState(bundle)
-
-        if (searchView != null && !TextUtils.isEmpty(searchView!!.query)) {
-            bundle.putString(KEY_SEARCH_QUERY, searchView!!.query.toString())
-        }
-    }
-
-    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
-        super.onRestoreInstanceState(savedInstanceState)
-
-        if (savedInstanceState.containsKey(KEY_SEARCH_QUERY)) {
-            searchQuery = savedInstanceState.getString(KEY_SEARCH_QUERY, "")
-        }
     }
 
     public override fun onDestroy() {
         super.onDestroy()
-        dispose(null)
-        if (searchViewDisposable != null && !searchViewDisposable!!.isDisposed) {
-            searchViewDisposable!!.dispose()
-        }
-    }
-
-    private fun onQueryTextChange(newText: String?) {
-        if (!TextUtils.isEmpty(searchQuery)) {
-            val filter = searchQuery
-            searchQuery = ""
-            performFilterAndSearch(filter)
-        } else if (adapter!!.hasNewFilter(newText)) {
-            performFilterAndSearch(newText)
-        }
-    }
-
-    private fun performFilterAndSearch(filter: String?) {
-        if (filter!!.length >= SEARCH_MIN_CHARS) {
-            clearMessageSearchResults()
-            adapter!!.setFilter(filter)
-            adapter!!.filterItems()
-            if (isUnifiedSearchAvailable(currentUser!!.capabilities!!.spreedCapability!!)) {
-                startMessageSearch(filter)
-            }
-        } else {
-            resetSearchResults()
-        }
-    }
-
-    private fun resetSearchResults() {
-        clearMessageSearchResults()
-        adapter!!.setFilter("")
-        adapter!!.filterItems()
-    }
-
-    private fun clearMessageSearchResults() {
-        val firstHeader = adapter!!.getSectionHeader(0)
-        if (firstHeader != null && firstHeader.itemViewType == MessagesTextHeaderItem.VIEW_TYPE) {
-            adapter!!.removeSection(firstHeader)
-        } else {
-            adapter!!.removeItemsOfType(MessageResultItem.VIEW_TYPE)
-        }
-        adapter!!.removeItemsOfType(LoadMoreResultsItem.VIEW_TYPE)
-    }
-
-    @SuppressLint("CheckResult") // handled by helper
-    private fun startMessageSearch(search: String?) {
-        binding?.swipeRefreshLayoutView?.isRefreshing = true
-        searchHelper?.startMessageSearch(search!!)
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe({ results: MessageSearchResults -> onMessageSearchResult(results) }) { throwable: Throwable ->
-                onMessageSearchError(
-                    throwable
-                )
-            }
-    }
-
-    @SuppressLint("CheckResult") // handled by helper
-    private fun loadMoreMessages() {
-        binding.swipeRefreshLayoutView.isRefreshing = true
-        val observable = searchHelper!!.loadMore()
-        observable?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe({ results: MessageSearchResults -> onMessageSearchResult(results) }) { throwable: Throwable ->
-                onMessageSearchError(
-                    throwable
-                )
-            }
-    }
-
-    override fun onItemClick(view: View, position: Int): Boolean {
-        val item = adapter!!.getItem(position)
-        if (item != null) {
-            when (item.itemViewType) {
-                MessageResultItem.VIEW_TYPE -> {
-                    val messageItem: MessageResultItem = item as MessageResultItem
-                    val conversationToken = messageItem.messageEntry.conversationToken
-                    selectedMessageId = messageItem.messageEntry.messageId
-                    showConversationByToken(conversationToken)
-                }
-
-                LoadMoreResultsItem.VIEW_TYPE -> {
-                    loadMoreMessages()
-                }
-
-                ConversationItem.VIEW_TYPE -> {
-                    handleConversation((Objects.requireNonNull(item) as ConversationItem).model)
-                }
-            }
-        }
-        return true
-    }
-
-    private fun showConversationByToken(conversationToken: String) {
-        for (absItem in conversationItems) {
-            val conversationItem = absItem as ConversationItem
-            if (conversationItem.model.token == conversationToken) {
-                val conversation = conversationItem.model
-                handleConversation(conversation)
-            }
+        // a share left in the list removes its copies, unless they were passed on to the chat or the list of another
+        // account, see SharedFileCopies
+        // only a share of ShareActivity, not one of another app that the list only passed on to it
+        val isShareOfApp = isShare(intent) && !isShareOfOtherApp(intent)
+        if (isFinishing && isShareOfApp && !isSharePassedOn && !isRelaunching) {
+            SharedFileCopies.removeSharesLater(ShareListIntentFactory.sharedUrisOf(intent))
         }
     }
 
     @Suppress("Detekt.ComplexMethod")
-    private fun handleConversation(conversation: Conversation?) {
+    private fun handleConversation(conversation: ConversationModel?) {
         selectedConversation = conversation
         if (selectedConversation != null) {
             val hasChatPermission = ParticipantPermissions(
-                currentUser!!.capabilities!!.spreedCapability!!,
+                currentUser.capabilities?.spreedCapability,
                 selectedConversation!!
             )
                 .hasChatPermission()
@@ -1218,90 +1163,48 @@ class ConversationsListActivity :
                 ) {
                     handleSharedData()
                 } else {
-                    Snackbar.make(binding.root, R.string.send_to_forbidden, Snackbar.LENGTH_LONG).show()
+                    showSnackbar(getString(R.string.send_to_forbidden))
                 }
             } else if (forwardMessage) {
                 if (hasChatPermission && !isReadOnlyConversation(selectedConversation!!)) {
                     openConversation(intent.getStringExtra(KEY_FORWARD_MSG_TEXT))
-                    forwardMessage = false
+                    forwardMessageState.value = false
                 } else {
-                    Snackbar.make(binding.root, R.string.send_to_forbidden, Snackbar.LENGTH_LONG).show()
+                    showSnackbar(getString(R.string.send_to_forbidden))
                 }
+            } else if (conversation.checkIfVoiceRoom()) {
+                showStartCallDialog()
             } else {
                 openConversation()
             }
         }
     }
 
-    private fun shouldShowLobby(conversation: Conversation): Boolean {
+    private fun shouldShowLobby(conversation: ConversationModel): Boolean {
         val participantPermissions = ParticipantPermissions(
-            currentUser!!.capabilities?.spreedCapability!!,
-            conversation
+            currentUser.capabilities?.spreedCapability,
+            selectedConversation!!
         )
-        return conversation.lobbyState == Conversation.LobbyState.LOBBY_STATE_MODERATORS_ONLY &&
-            !conversation.canModerate(currentUser!!) &&
+        return conversation.lobbyState == ConversationEnums.LobbyState.LOBBY_STATE_MODERATORS_ONLY &&
+            !ConversationUtils.canModerate(conversation, currentUser.capabilities?.spreedCapability) &&
             !participantPermissions.canIgnoreLobby()
     }
 
-    private fun isReadOnlyConversation(conversation: Conversation): Boolean {
-        return conversation.conversationReadOnlyState ===
-            Conversation.ConversationReadOnlyState.CONVERSATION_READ_ONLY
-    }
+    private fun isReadOnlyConversation(conversation: ConversationModel): Boolean =
+        conversation.conversationReadOnlyState ===
+            ConversationEnums.ConversationReadOnlyState.CONVERSATION_READ_ONLY
 
     private fun handleSharedData() {
         collectDataFromIntent()
         if (textToPaste!!.isNotEmpty()) {
             openConversation(textToPaste)
         } else if (filesToShare != null && filesToShare!!.isNotEmpty()) {
-            showSendFilesConfirmDialog()
+            // the attachment preview of the chat shows the files and asks before uploading them; they are copies in
+            // the app (see SharedFileCopies), so reading them needs no permission
+            openConversation()
         } else {
-            Snackbar
-                .make(binding.root, context.resources.getString(R.string.nc_common_error_sorry), Snackbar.LENGTH_LONG)
-                .show()
-        }
-    }
-
-    private fun showSendFilesConfirmDialog() {
-        if (platformPermissionUtil.isFilesPermissionGranted()) {
-            val fileNamesWithLineBreaks = StringBuilder("\n")
-            for (file in filesToShare!!) {
-                val filename = FileUtils.getFileName(Uri.parse(file), context)
-                fileNamesWithLineBreaks.append(filename).append("\n")
-            }
-            val confirmationQuestion: String = if (filesToShare!!.size == 1) {
-                String.format(
-                    resources!!.getString(R.string.nc_upload_confirm_send_single),
-                    selectedConversation!!.displayName
-                )
-            } else {
-                String.format(
-                    resources!!.getString(R.string.nc_upload_confirm_send_multiple),
-                    selectedConversation!!.displayName
-                )
-            }
-            binding.floatingActionButton.let {
-                val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                    .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.upload))
-                    .setTitle(confirmationQuestion)
-                    .setMessage(fileNamesWithLineBreaks.toString())
-                    .setPositiveButton(R.string.nc_yes) { _, _ ->
-                        upload()
-                        openConversation()
-                    }
-                    .setNegativeButton(R.string.nc_no) { _, _ ->
-                        Log.d(TAG, "sharing files aborted, going back to share-to screen")
-                    }
-
-                viewThemeUtils.dialog
-                    .colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-                val dialog = dialogBuilder.show()
-                viewThemeUtils.platform.colorTextButtons(
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
-                )
-            }
-        } else {
-            UploadAndShareFilesWorker.requestStoragePermission(this)
+            logger.e(TAG, "no text or files to share")
+            showSnackbar(context.resources.getString(R.string.nc_common_error_sorry))
         }
     }
 
@@ -1309,96 +1212,51 @@ class ConversationsListActivity :
         intent.action = ""
     }
 
-    override fun onItemLongClick(position: Int) {
-        if (showShareToScreen) {
-            Log.d(TAG, "sharing to multiple rooms not yet implemented. onItemLongClick is ignored.")
-        } else {
-            val clickedItem: Any? = adapter!!.getItem(position)
-            if (clickedItem != null && clickedItem is ConversationItem) {
-                val conversation = clickedItem.model
-                conversationsListBottomDialog = ConversationsListBottomDialog(
-                    this,
-                    userManager.currentUser.blockingGet(),
-                    conversation
-                )
-                conversationsListBottomDialog!!.show()
-            }
-        }
-    }
-
     @Suppress("Detekt.TooGenericExceptionCaught")
     private fun collectDataFromIntent() {
         filesToShare = ArrayList()
-        if (intent != null) {
-            if (Intent.ACTION_SEND == intent.action || Intent.ACTION_SEND_MULTIPLE == intent.action) {
-                try {
-                    val mimeType = intent.type
-                    if (Mimetype.TEXT_PLAIN == mimeType && intent.getStringExtra(Intent.EXTRA_TEXT) != null) {
-                        // Share from Google Chrome sets text/plain MIME type, but also provides a content:// URI
-                        // with a *screenshot* of the current page in getClipData().
-                        // Here we assume that when sharing a web page the user would prefer to send the URL
-                        // of the current page rather than a screenshot.
-                        textToPaste = intent.getStringExtra(Intent.EXTRA_TEXT)
-                    } else {
-                        if (intent.clipData != null) {
-                            for (i in 0 until intent.clipData!!.itemCount) {
-                                val item = intent.clipData!!.getItemAt(i)
-                                if (item.uri != null) {
-                                    filesToShare!!.add(item.uri.toString())
-                                } else if (item.text != null) {
-                                    textToPaste = item.text.toString()
-                                    break
-                                } else {
-                                    Log.w(TAG, "datatype not yet implemented for share-to")
-                                }
-                            }
-                        } else {
-                            filesToShare!!.add(intent.data.toString())
-                        }
-                    }
-                    if (filesToShare!!.isEmpty() && textToPaste!!.isEmpty()) {
-                        Snackbar.make(
-                            binding.root,
-                            context.resources.getString(R.string.nc_common_error_sorry),
-                            Snackbar.LENGTH_LONG
-                        ).show()
-                        Log.e(TAG, "failed to get data from intent")
-                    }
-                } catch (e: Exception) {
-                    Snackbar.make(
-                        binding.root,
-                        context.resources.getString(R.string.nc_common_error_sorry),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                    Log.e(TAG, "Something went wrong when extracting data from intent")
-                }
+        textToPaste = ""
+        if (!isShare(intent)) return
+        try {
+            // ShareActivity only passes the text of a shared text on, without its files, see ShareListIntentFactory
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+            if (sharedText != null) {
+                textToPaste = sharedText
+            } else {
+                extractFilesFromClipData()
             }
+            if (filesToShare!!.isEmpty() && textToPaste!!.isEmpty()) {
+                logger.e(TAG, "failed to get data from intent")
+                showSnackbar(context.resources.getString(R.string.nc_common_error_sorry))
+            }
+        } catch (e: Exception) {
+            logger.e(TAG, "Something went wrong when extracting data from intent", e)
+            showSnackbar(context.resources.getString(R.string.nc_common_error_sorry))
         }
     }
 
-    private fun upload() {
-        if (selectedConversation == null) {
-            Snackbar.make(
-                binding.root,
-                context.resources.getString(R.string.nc_common_error_sorry),
-                Snackbar.LENGTH_LONG
-            ).show()
-            Log.e(TAG, "not able to upload any files because conversation was null.")
-            return
-        }
-        try {
-            filesToShare?.forEach {
-                UploadAndShareFilesWorker.upload(
-                    it,
-                    selectedConversation!!.token!!,
-                    selectedConversation!!.displayName!!,
-                    null
-                )
+    private fun extractFilesFromClipData() {
+        val clipData = intent.clipData
+        if (clipData != null) {
+            for (i in 0 until clipData.itemCount) {
+                val item = clipData.getItemAt(i)
+                // all files, so none of the copies ShareActivity made is left behind, and the first text
+                when {
+                    item.uri != null -> addFileToShareIfTrusted(item.uri)
+                    item.text != null -> if (textToPaste!!.isEmpty()) textToPaste = item.text.toString()
+                    else -> Log.w(TAG, "datatype not yet implemented for share-to")
+                }
             }
-        } catch (e: IllegalArgumentException) {
-            Snackbar.make(binding.root, context.resources.getString(R.string.nc_upload_failed), Snackbar.LENGTH_LONG)
-                .show()
-            Log.e(TAG, "Something went wrong when trying to upload file", e)
+        } else {
+            addFileToShareIfTrusted(intent.data)
+        }
+    }
+
+    private fun addFileToShareIfTrusted(uri: Uri?) {
+        if (FileUtils.isTrustedShareUri(uri, this)) {
+            filesToShare!!.add(uri.toString())
+        } else {
+            Log.w(TAG, "Rejecting untrusted uri from share intent.")
         }
     }
 
@@ -1406,22 +1264,10 @@ class ConversationsListActivity :
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
         when (requestCode) {
-            UploadAndShareFilesWorker.REQUEST_PERMISSION -> {
-                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    Log.d(TAG, "upload starting after permissions were granted")
-                    showSendFilesConfirmDialog()
-                } else {
-                    Snackbar.make(
-                        binding.root,
-                        context.getString(R.string.read_storage_no_permission),
-                        Snackbar.LENGTH_LONG
-                    ).show()
-                }
-            }
-
             REQUEST_POST_NOTIFICATIONS_PERMISSION -> {
-                // whenever user allowed notifications, also check to ignore battery optimization
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    Log.d(TAG, "Notification permission was granted")
+
                     if (!PowerManagerUtils().isIgnoringBatteryOptimizations() &&
                         ClosedInterfaceImpl().isGooglePlayServicesAvailable
                     ) {
@@ -1453,43 +1299,172 @@ class ConversationsListActivity :
                             "Or permission is already denied and android decided to not offer the dialog."
                     )
                 }
+                checkLocalNetworkPermission()
+            }
+        }
+    }
+
+    private fun shouldShowNotificationWarning(): Boolean {
+        fun shouldShowWarningIfDateTooOld(date1: Long): Boolean {
+            val currentTimeMillis = System.currentTimeMillis()
+            val differenceMillis = currentTimeMillis - date1
+            val daysForWarningInMillis = TimeUnit.DAYS.toMillis(DAYS_FOR_NOTIFICATION_WARNING)
+            return differenceMillis > daysForWarningInMillis
+        }
+
+        fun shouldShowNotificationWarningByUserChoice(): Boolean {
+            if (appPreferences.showRegularNotificationWarning) {
+                val lastWarningDate = appPreferences.getNotificationWarningLastPostponedDate()
+                return if (lastWarningDate == NOTIFICATION_WARNING_DATE_NOT_SET) {
+                    true
+                } else {
+                    shouldShowWarningIfDateTooOld(lastWarningDate)
+                }
+            } else {
+                return false
+            }
+        }
+
+        val notificationPermissionNotGranted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !platformPermissionUtil.isPostNotificationsPermissionGranted()
+        val batteryOptimizationNotIgnored = !PowerManagerUtils().isIgnoringBatteryOptimizations()
+        val fullScreenIntentNotGranted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            !getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
+
+        val messagesChannelNotEnabled = !NotificationUtils.isMessagesNotificationChannelEnabled(this)
+        val callsChannelNotEnabled = !NotificationUtils.isCallsNotificationChannelEnabled(this)
+
+        val serverNotificationAppInstalled =
+            currentUser.capabilities?.notificationsCapability?.features?.isNotEmpty() == true
+
+        val settingsOfUserAreWrong = notificationPermissionNotGranted ||
+            batteryOptimizationNotIgnored ||
+            fullScreenIntentNotGranted ||
+            messagesChannelNotEnabled ||
+            callsChannelNotEnabled ||
+            !serverNotificationAppInstalled
+
+        return settingsOfUserAreWrong &&
+            shouldShowNotificationWarningByUserChoice() &&
+            ClosedInterfaceImpl().isGooglePlayServicesAvailable
+    }
+
+    fun isOneToOneConversation() =
+        selectedConversation != null &&
+            selectedConversation?.type != null &&
+            selectedConversation?.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+
+    private fun getIntentForCall(isVoiceOnlyCall: Boolean, callWithoutNotification: Boolean): Intent? {
+        selectedConversation?.let {
+            val pp = ParticipantPermissions(currentUser.capabilities?.spreedCapability, it)
+
+            val bundle = Bundle()
+            bundle.putString(KEY_ROOM_TOKEN, it.token)
+            bundle.putLong(KEY_INTERNAL_USER_ID, currentUser.id!!)
+            bundle.putString(BundleKeys.KEY_CONVERSATION_PASSWORD, "")
+            bundle.putString(BundleKeys.KEY_MODIFIED_BASE_URL, currentUser.baseUrl!!)
+            bundle.putString(KEY_CONVERSATION_NAME, it.displayName)
+            bundle.putInt(KEY_RECORDING_STATE, it.callRecording)
+            bundle.putBoolean(KEY_IS_MODERATOR, ConversationUtils.isParticipantOwnerOrModerator(it))
+            bundle.putBoolean(
+                BundleKeys.KEY_PARTICIPANT_PERMISSION_CAN_PUBLISH_AUDIO,
+                pp.canPublishAudio()
+            )
+            bundle.putBoolean(BundleKeys.KEY_ROOM_ONE_TO_ONE, isOneToOneConversation())
+            bundle.putBoolean(
+                BundleKeys.KEY_PARTICIPANT_PERMISSION_CAN_PUBLISH_VIDEO,
+                pp.canPublishVideo()
+            )
+
+            if (isVoiceOnlyCall) {
+                bundle.putBoolean(KEY_CALL_VOICE_ONLY, true)
+            }
+            if (callWithoutNotification) {
+                bundle.putBoolean(BundleKeys.KEY_CALL_WITHOUT_NOTIFICATION, true)
+            }
+
+            if (it.objectType == ConversationEnums.ObjectType.ROOM) {
+                bundle.putBoolean(KEY_IS_BREAKOUT_ROOM, true)
+            }
+
+            val callIntent = Intent(this, CallActivity::class.java)
+            callIntent.putExtras(bundle)
+            return callIntent
+        }
+
+        return null
+    }
+
+    private fun startACall(isVoiceOnlyCall: Boolean, callWithoutNotification: Boolean) {
+        selectedConversation?.let {
+            val bundle = Bundle()
+            bundle.putString(KEY_SHARED_TEXT, textToPaste)
+            if (selectedMessageId != null) {
+                bundle.putString(BundleKeys.KEY_MESSAGE_ID, selectedMessageId)
+                selectedMessageId = null
+            }
+
+            val chatIntent = ChatActivity.createIntent(context, currentUser.id!!, it.token, bundle)
+
+            val pp = ParticipantPermissions(currentUser.capabilities?.spreedCapability, it)
+            if (!pp.canStartCall() && selectedConversation?.hasCall == false) {
+                Log.e(TAG, "Error starting call from conversations list: call is forbidden")
+            } else {
+                ApplicationWideCurrentRoomHolder.getInstance().isDialing = true
+                val callIntent = getIntentForCall(isVoiceOnlyCall, callWithoutNotification)
+                if (callIntent != null) {
+                    startActivities(arrayOf(chatIntent, callIntent))
+                }
             }
         }
     }
 
     private fun openConversation(textToPaste: String? = "") {
         if (CallActivity.active &&
-            selectedConversation!!.token != ApplicationWideCurrentRoomHolder.getInstance().currentRoomToken
+            !ApplicationWideCurrentRoomHolder.getInstance().isCurrentRoom(selectedConversation!!.token, currentUser.id)
         ) {
-            Snackbar.make(
-                binding.root,
-                context.getString(R.string.restrict_join_other_room_while_call),
-                Snackbar.LENGTH_LONG
-            ).show()
+            showSnackbar(context.getString(R.string.restrict_join_other_room_while_call))
             return
         }
 
         val bundle = Bundle()
-        bundle.putString(KEY_ROOM_TOKEN, selectedConversation!!.token)
-        bundle.putString(KEY_ROOM_ID, selectedConversation!!.roomId)
         bundle.putString(KEY_SHARED_TEXT, textToPaste)
+        if (!filesToShare.isNullOrEmpty()) {
+            bundle.putStringArrayList(BundleKeys.KEY_SHARED_FILE_PATHS, filesToShare)
+        }
         if (selectedMessageId != null) {
             bundle.putString(BundleKeys.KEY_MESSAGE_ID, selectedMessageId)
             selectedMessageId = null
         }
 
-        val intent = Intent(context, ChatActivity::class.java)
-        intent.putExtras(bundle)
-        startActivity(intent)
+        if (isShare(intent)) {
+            openSharedConversationInAppTask(bundle)
+        } else {
+            startActivity(ChatActivity.createIntent(context, currentUser.id!!, selectedConversation!!.token, bundle))
+        }
 
         clearIntentAction()
     }
 
+    /**
+     * Opens the chat with the content shared by another app, given in [extras], in the task of the app, and closes
+     * this list. Back from the chat opens the list of its account, see ChatActivity.
+     *
+     * The share sheet starts a share in a task of its own (see [ShareActivity]), which is removed then.
+     */
+    private fun openSharedConversationInAppTask(extras: Bundle) {
+        val chatIntent = ChatActivity.createIntent(context, currentUser.id!!, selectedConversation!!.token, extras)
+        // in the task of the app: a plain start could land in the task of this share instead
+        AppTasks.openChatInAppTask(this, chatIntent)
+        isSharePassedOn = true
+        if (isTaskRoot) finishAndRemoveTask() else finish()
+    }
+
     @Subscribe(sticky = true, threadMode = ThreadMode.BACKGROUND)
     fun onMessageEvent(eventStatus: EventStatus) {
-        if (currentUser != null && eventStatus.userId == currentUser!!.id) {
+        if (eventStatus.userId == currentUser.id) {
             when (eventStatus.eventType) {
-                EventStatus.EventType.CONVERSATION_UPDATE -> if (eventStatus.isAllGood && !isRefreshing) {
+                EventStatus.EventType.CONVERSATION_UPDATE -> if (eventStatus.isAllGood && !isRefreshingState.value) {
                     fetchRooms()
                 }
 
@@ -1501,345 +1476,582 @@ class ConversationsListActivity :
     @Subscribe(threadMode = ThreadMode.MAIN)
     fun onMessageEvent(conversationsListFetchDataEvent: ConversationsListFetchDataEvent?) {
         fetchRooms()
-        Handler().postDelayed({
-            if (conversationsListBottomDialog!!.isShowing) {
-                conversationsListBottomDialog!!.dismiss()
-            }
-        }, BOTTOM_SHEET_DELAY)
+        conversationsListViewModel.clearSelectedConversationForOpsWithDelay(BOTTOM_SHEET_DELAY)
     }
 
-    fun showDeleteConversationDialog(conversation: Conversation) {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog
-                        .colorMaterialAlertDialogIcon(context, R.drawable.ic_delete_black_24dp)
-                )
-                .setTitle(R.string.nc_delete_call)
-                .setMessage(R.string.nc_delete_conversation_more)
-                .setPositiveButton(R.string.nc_delete) { _, _ ->
-                    deleteConversation(conversation)
-                }
-                .setNegativeButton(R.string.nc_cancel) { _, _ ->
-                }
-
-            viewThemeUtils.dialog
-                .colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+    private fun handleConversationOpsAction(action: ConversationOpsAction, conversation: ConversationModel) {
+        when (action) {
+            is ConversationOpsAction.AddToFavorites -> addConversationToFavorites(conversation)
+            is ConversationOpsAction.RemoveFromFavorites -> removeConversationFromFavorites(conversation)
+            is ConversationOpsAction.MarkAsRead -> markConversationAsRead(conversation)
+            is ConversationOpsAction.MarkAsUnread -> markConversationAsUnread(conversation)
+            is ConversationOpsAction.ShareLink -> shareConversationLink(conversation)
+            is ConversationOpsAction.Rename -> renameConversation(conversation)
+            is ConversationOpsAction.ToggleArchive -> handleArchiving(conversation)
+            is ConversationOpsAction.AddToHomeScreen -> addConversationToHomeScreen(conversation)
+            is ConversationOpsAction.Leave -> showLeaveConversationSnackbar(conversation)
+            is ConversationOpsAction.Delete -> showDeleteConversationDialog(conversation)
+            is ConversationOpsAction.ManageTags -> conversationTagsViewModel.setConversationForTagAssignment(
+                conversation
             )
+        }
+    }
+
+    private fun shareConversationLink(conversation: ConversationModel) {
+        val canGeneratePrettyURL = CapabilitiesUtil.canGeneratePrettyURL(currentUser)
+        ShareUtils.shareConversationLink(
+            this,
+            currentUser.baseUrl,
+            conversation.token,
+            canGeneratePrettyURL
+        )
+    }
+
+    private fun addConversationToHomeScreen(conversation: ConversationModel) {
+        val success = ShortcutManagerHelper.requestPinShortcut(this, conversation, currentUser)
+        if (success) {
+            showSnackbar(resources.getString(R.string.nc_shortcut_created))
+        } else {
+            logger.e(TAG, "failed to pin conversation shortcut to home screen")
+            showSnackbar(resources.getString(R.string.nc_common_error_sorry))
+        }
+    }
+
+    @Suppress("Detekt.TooGenericExceptionCaught", "TooGenericExceptionCaught")
+    private fun handleArchiving(conversation: ConversationModel) {
+        conversationsListViewModel.toggleConversationArchive(conversation)
+    }
+    private fun addConversationToFavorites(conversation: ConversationModel) {
+        conversationsListViewModel.addConversationToFavorites(conversation)
+    }
+
+    private fun removeConversationFromFavorites(conversation: ConversationModel) {
+        conversationsListViewModel.removeConversationFromFavorites(conversation)
+    }
+
+    private fun markConversationAsUnread(conversation: ConversationModel) {
+        conversationsListViewModel.markConversationAsUnread(conversation)
+    }
+
+    private fun markConversationAsRead(conversation: ConversationModel) {
+        conversationsListViewModel.markConversationAsRead(conversation)
+    }
+
+    private fun renameConversation(conversation: ConversationModel) {
+        if (!TextUtils.isEmpty(conversation.token)) {
+            RenameConversationDialogFragment
+                .newInstance(currentUser, conversation.token!!, conversation.displayName!!)
+                .show(supportFragmentManager, RenameConversationDialogFragment::class.simpleName)
+        }
+    }
+
+    /**
+     * Rather than blocking with a confirmation dialog, hide the conversation immediately and offer
+     * an "Undo" snackbar. The actual leave-conversation network call is deferred until the snackbar
+     * goes away without being undone, so a room only needs to be rejoined if the user missed the
+     * undo window.
+     */
+    @SuppressLint("StringFormatInvalid")
+    private fun showLeaveConversationSnackbar(conversation: ConversationModel) {
+        val token = conversation.token ?: return
+        conversationsListViewModel.markConversationPendingRemoval(token)
+        lifecycleScope.launch {
+            val result = snackbarHostState.showSnackbar(
+                message = String.format(resources.getString(R.string.left_conversation), conversation.displayName),
+                actionLabel = getString(R.string.nc_undo),
+                duration = SnackbarDuration.Long
+            )
+            when (result) {
+                SnackbarResult.ActionPerformed -> conversationsListViewModel.clearConversationPendingRemoval(token)
+                SnackbarResult.Dismissed -> leaveConversation(conversation)
+            }
+        }
+    }
+
+    private fun leaveConversation(conversation: ConversationModel) {
+        val token = conversation.token ?: return
+        val data = Data.Builder()
+            .putString(KEY_ROOM_TOKEN, token)
+            .putLong(KEY_INTERNAL_USER_ID, currentUser.id!!)
+            .build()
+        val worker = OneTimeWorkRequest.Builder(LeaveConversationWorker::class.java)
+            .setInputData(data)
+            .setExpeditedIfSupported()
+            .build()
+        WorkManager.getInstance().enqueue(worker)
+        WorkManager.getInstance(this).getWorkInfoByIdLiveData(worker.id).observeForever { workInfo ->
+            when (workInfo?.state) {
+                WorkInfo.State.SUCCEEDED -> {
+                    currentUser.id?.let { userId ->
+                        ShortcutManagerHelper.disableConversationShortcut(
+                            this,
+                            token,
+                            userId,
+                            resources.getString(R.string.nc_shortcut_conversation_deleted)
+                        )
+                    }
+                    conversationsListViewModel.onConversationRemoved(currentUser, token)
+                }
+                WorkInfo.State.FAILED -> {
+                    logger.e(TAG, "LeaveConversationWorker failed for token $token")
+                    conversationsListViewModel.clearConversationPendingRemoval(token)
+                    showSnackbar(resources.getString(R.string.nc_common_error_sorry))
+                }
+                else -> {}
+            }
+        }
+    }
+
+    fun showDeleteConversationDialog(conversation: ConversationModel) {
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(
+                viewThemeUtils.dialog
+                    .colorMaterialAlertDialogIcon(context, R.drawable.ic_delete_black_24dp)
+            )
+            .setTitle(R.string.nc_delete_call)
+            .setMessage(R.string.nc_delete_conversation_more)
+            .setPositiveButton(R.string.nc_delete) { _, _ ->
+                conversation.token?.let { conversationsListViewModel.markConversationPendingRemoval(it) }
+                deleteConversation(conversation)
+            }
+            .setNegativeButton(R.string.nc_cancel) { _, _ ->
+            }
+
+        viewThemeUtils.dialog
+            .colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        )
+    }
+
+    fun showStartCallDialog() {
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.ic_call_black_24dp))
+            .setTitle(R.string.join_call)
+            .setPositiveButton(R.string.video_call) { _, _ ->
+                startACall(isVoiceOnlyCall = false, callWithoutNotification = false)
+            }
+            .setNegativeButton(R.string.audio_call) { _, _ ->
+                startACall(isVoiceOnlyCall = true, callWithoutNotification = false)
+            }
+            .setNeutralButton(R.string.nc_cancel) { _, _ -> }
+
+        viewThemeUtils.dialog
+            .colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        )
+    }
+
+    /**
+     * The server rejected the credentials of the account, which it also does once it requested a wipe of it. So the
+     * account is wiped if so, and otherwise the user can reauthorize or remove it.
+     */
+    private fun handleUnauthorized() {
+        if (isRemovingAccount || unauthorizedHandling?.isActive == true || unauthorizedDialog?.isShowing == true) {
+            return
+        }
+
+        unauthorizedHandling = lifecycleScope.launch {
+            val isWipeRequested = !isWipeChecked && remoteWipeHandler.isWipeRequested(currentUser)
+            isWipeChecked = true
+            if (isWipeRequested) {
+                removeAccountAndRestartApp(wipeToken = currentUser.token)
+            } else {
+                showUnauthorizedDialog()
+            }
         }
     }
 
     private fun showUnauthorizedDialog() {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_delete_black_24dp
-                    )
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(
+                viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
+                    context,
+                    R.drawable.ic_delete_black_24dp
                 )
-                .setTitle(R.string.nc_dialog_invalid_password)
-                .setMessage(R.string.nc_dialog_reauth_or_delete)
-                .setCancelable(false)
-                .setPositiveButton(R.string.nc_settings_remove_account) { _, _ ->
-                    deleteUserAndRestartApp()
-                }
-                .setNegativeButton(R.string.nc_settings_reauthorize) { _, _ ->
-                    val intent = Intent(context, WebViewLoginActivity::class.java)
-                    val bundle = Bundle()
-                    bundle.putString(BundleKeys.KEY_BASE_URL, currentUser!!.baseUrl!!)
-                    bundle.putBoolean(BundleKeys.KEY_REAUTHORIZE_ACCOUNT, true)
-                    intent.putExtras(bundle)
-                    startActivity(intent)
-                }
-
-            viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
             )
+            .setTitle(R.string.nc_dialog_invalid_password)
+            .setMessage(R.string.nc_dialog_reauth_or_delete)
+            .setCancelable(false)
+            .setPositiveButton(R.string.nc_settings_remove_account) { _, _ ->
+                removeAccountAndRestartApp()
+            }
+            .setNegativeButton(R.string.nc_settings_reauthorize) { _, _ ->
+                val intent = Intent(context, BrowserLoginActivity::class.java)
+                val bundle = Bundle()
+                bundle.putString(BundleKeys.KEY_BASE_URL, currentUser.baseUrl!!)
+                bundle.putBoolean(BundleKeys.KEY_REAUTHORIZE_ACCOUNT, true)
+                bundle.putLong(KEY_INTERNAL_USER_ID, currentUser.id!!)
+                intent.putExtras(bundle)
+                startActivity(intent)
+            }
+
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        unauthorizedDialog = dialog
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        )
+    }
+
+    /**
+     * Removes the account of this list and restarts the app once it is removed. With [wipeToken], the account is
+     * removed because its server requested a wipe, which is reported to the server with that token afterwards.
+     */
+    private fun removeAccountAndRestartApp(wipeToken: String? = null) {
+        isRemovingAccount = true
+        lifecycleScope.launch {
+            val accountRemovalWork = OneTimeWorkRequest.Builder(AccountRemovalWorker::class.java)
+                .setExpeditedIfSupported()
+                .build()
+            try {
+                userManager.scheduleUserForDeletionWithId(currentUser.id!!)
+                val removal = WorkManager.getInstance(applicationContext).beginWith(accountRemovalWork)
+                if (wipeToken == null) {
+                    removal.enqueue()
+                } else {
+                    removal.then(RemoteWipeSuccessWorker.workRequest(currentUser.baseUrl!!, wipeToken)).enqueue()
+                }
+            } catch (e: SQLException) {
+                showAccountRemovalFailed(e)
+                return@launch
+            } catch (e: IllegalStateException) {
+                showAccountRemovalFailed(e)
+                return@launch
+            }
+
+            WorkManager.getInstance(context).getWorkInfoByIdLiveData(accountRemovalWork.id)
+                .observeForever { workInfo: WorkInfo? ->
+
+                    when (workInfo?.state) {
+                        WorkInfo.State.SUCCEEDED -> {
+                            val text = if (wipeToken == null) {
+                                String.format(
+                                    context.resources.getString(R.string.nc_deleted_user),
+                                    currentUser.displayName
+                                )
+                            } else {
+                                context.resources.getString(R.string.nc_remote_wipe_logged_out)
+                            }
+                            Toast.makeText(context, text, Toast.LENGTH_LONG).show()
+                            restartApp()
+                        }
+
+                        WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
+                            isRemovingAccount = false
+                            logger.e(TAG, "something went wrong when deleting user with id " + currentUser.userId)
+
+                            Toast.makeText(
+                                context,
+                                context.resources.getString(R.string.nc_common_error_sorry),
+                                Toast.LENGTH_LONG
+                            ).show()
+                            restartApp()
+                        }
+
+                        else -> {}
+                    }
+                }
         }
     }
 
-    @SuppressLint("CheckResult")
-    private fun deleteUserAndRestartApp() {
-        userManager.scheduleUserForDeletionWithId(currentUser!!.id!!).blockingGet()
-        val accountRemovalWork = OneTimeWorkRequest.Builder(AccountRemovalWorker::class.java).build()
-        WorkManager.getInstance(applicationContext).enqueue(accountRemovalWork)
-
-        WorkManager.getInstance(context).getWorkInfoByIdLiveData(accountRemovalWork.id)
-            .observeForever { workInfo: WorkInfo ->
-
-                when (workInfo.state) {
-                    WorkInfo.State.SUCCEEDED -> {
-                        val text = String.format(
-                            context.resources.getString(R.string.nc_deleted_user),
-                            currentUser!!.displayName
-                        )
-                        Toast.makeText(
-                            context,
-                            text,
-                            Toast.LENGTH_LONG
-                        ).show()
-                        restartApp()
-                    }
-
-                    WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
-                        Toast.makeText(
-                            context,
-                            context.resources.getString(R.string.nc_common_error_sorry),
-                            Toast.LENGTH_LONG
-                        ).show()
-                        Log.e(TAG, "something went wrong when deleting user with id " + currentUser!!.userId)
-                        restartApp()
-                    }
-
-                    else -> {}
-                }
-            }
+    private fun showAccountRemovalFailed(e: Exception) {
+        isRemovingAccount = false
+        logger.e(TAG, "Failed to remove user with id " + currentUser.userId, e)
+        Toast.makeText(context, R.string.nc_common_error_sorry, Toast.LENGTH_LONG).show()
     }
 
     private fun restartApp() {
-        val intent = Intent(context, MainActivity::class.java)
-        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        startActivity(intent)
+        startActivity(AppTasks.createRestartIntent(context))
     }
 
     private fun showOutdatedClientDialog() {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(
-                    viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                        context,
-                        R.drawable.ic_info_white_24dp
-                    )
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(
+                viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
+                    context,
+                    R.drawable.ic_info_white_24dp
                 )
-                .setTitle(R.string.nc_dialog_outdated_client)
-                .setMessage(R.string.nc_dialog_outdated_client_description)
-                .setCancelable(false)
-                .setPositiveButton(R.string.nc_dialog_outdated_client_option_update) { _, _ ->
-                    try {
-                        startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(CLIENT_UPGRADE_MARKET_LINK + packageName))
-                        )
-                    } catch (e: ActivityNotFoundException) {
-                        startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(CLIENT_UPGRADE_GPLAY_LINK + packageName))
-                        )
-                    }
-                }
-
-            if (resources!!.getBoolean(R.bool.multiaccount_support) && userManager.users.blockingGet().size > 1) {
-                dialogBuilder.setNegativeButton(R.string.nc_switch_account) { _, _ ->
-                    val newFragment: DialogFragment = ChooseAccountDialogFragment.newInstance()
-                    newFragment.show(supportFragmentManager, ChooseAccountDialogFragment.TAG)
-                }
-            }
-
-            if (resources!!.getBoolean(R.bool.multiaccount_support)) {
-                dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
-                    val intent = Intent(this, ServerSelectionActivity::class.java)
-                    intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
-                    startActivity(intent)
-                }
-            }
-
-            viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
             )
+            .setTitle(R.string.nc_dialog_outdated_client)
+            .setMessage(R.string.nc_dialog_outdated_client_description)
+            .setCancelable(false)
+            .setPositiveButton(R.string.nc_dialog_outdated_client_option_update) { _, _ ->
+                try {
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW, (CLIENT_UPGRADE_MARKET_LINK + packageName).toUri())
+                    )
+                } catch (e: ActivityNotFoundException) {
+                    logger.w(TAG, "Play Store app not found, falling back to browser link", e)
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW, (CLIENT_UPGRADE_GPLAY_LINK + packageName).toUri())
+                    )
+                }
+            }
+
+        if (resources!!.getBoolean(R.bool.multiaccount_support) && runBlocking { userManager.getUsers() }.size > 1) {
+            dialogBuilder.setNegativeButton(R.string.nc_switch_account) { _, _ ->
+                showChooseAccountDialog()
+            }
         }
+
+        if (resources!!.getBoolean(R.bool.multiaccount_support)) {
+            dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
+                val intent = Intent(this, ServerSelectionActivity::class.java)
+                intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
+                startActivity(intent)
+            }
+        }
+
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        )
     }
 
     private fun showServiceUnavailableDialog(httpException: HttpException) {
         if (httpException.response()?.headers()?.get(MAINTENANCE_MODE_HEADER_KEY) == "1") {
-            binding.floatingActionButton.let {
-                val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                    .setIcon(
-                        viewThemeUtils.dialog.colorMaterialAlertDialogIcon(
-                            context,
-                            R.drawable.ic_info_white_24dp
-                        )
-                    )
-                    .setTitle(R.string.nc_dialog_maintenance_mode)
-                    .setMessage(R.string.nc_dialog_maintenance_mode_description)
-                    .setCancelable(false)
-                    .setNegativeButton(R.string.nc_settings_remove_account) { _, _ ->
-                        deleteUserAndRestartApp()
-                    }
-
-                if (resources!!.getBoolean(R.bool.multiaccount_support) && userManager.users.blockingGet().size > 1) {
-                    dialogBuilder.setPositiveButton(R.string.nc_switch_account) { _, _ ->
-                        val newFragment: DialogFragment = ChooseAccountDialogFragment.newInstance()
-                        newFragment.show(supportFragmentManager, ChooseAccountDialogFragment.TAG)
-                    }
-                }
-
-                if (resources!!.getBoolean(R.bool.multiaccount_support)) {
-                    dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
-                        val intent = Intent(this, ServerSelectionActivity::class.java)
-                        intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
-                        startActivity(intent)
-                    }
-                }
-
-                viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-                val dialog = dialogBuilder.show()
-                viewThemeUtils.platform.colorTextButtons(
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
-                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-                )
-            }
+            isMaintenanceModeState.value = true
         } else {
             showErrorDialog()
         }
     }
 
     private fun showServerEOLDialog() {
-        binding.floatingActionButton.let {
-            val dialogBuilder = MaterialAlertDialogBuilder(it.context)
-                .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.ic_warning_white))
-                .setTitle(R.string.nc_settings_server_eol_title)
-                .setMessage(R.string.nc_settings_server_eol)
-                .setCancelable(false)
-                .setPositiveButton(R.string.nc_settings_remove_account) { _, _ ->
-                    deleteUserAndRestartApp()
-                }
-
-            if (resources!!.getBoolean(R.bool.multiaccount_support) && userManager.users.blockingGet().size > 1) {
-                dialogBuilder.setNegativeButton(R.string.nc_switch_account) { _, _ ->
-                    val newFragment: DialogFragment = ChooseAccountDialogFragment.newInstance()
-                    newFragment.show(supportFragmentManager, ChooseAccountDialogFragment.TAG)
-                }
+        val dialogBuilder = MaterialAlertDialogBuilder(this)
+            .setIcon(viewThemeUtils.dialog.colorMaterialAlertDialogIcon(context, R.drawable.ic_warning_white))
+            .setTitle(R.string.nc_settings_server_eol_title)
+            .setMessage(R.string.nc_settings_server_eol)
+            .setCancelable(false)
+            .setPositiveButton(R.string.nc_settings_remove_account) { _, _ ->
+                removeAccountAndRestartApp()
             }
 
-            if (resources!!.getBoolean(R.bool.multiaccount_support)) {
-                dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
-                    val intent = Intent(this, ServerSelectionActivity::class.java)
-                    intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
-                    startActivity(intent)
-                }
+        if (resources!!.getBoolean(R.bool.multiaccount_support) && runBlocking { userManager.getUsers() }.size > 1) {
+            dialogBuilder.setNegativeButton(R.string.nc_switch_account) { _, _ ->
+                showChooseAccountDialog()
             }
-
-            viewThemeUtils.dialog.colorMaterialAlertDialogBackground(it.context, dialogBuilder)
-            val dialog = dialogBuilder.show()
-            viewThemeUtils.platform.colorTextButtons(
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-            )
         }
+
+        if (resources!!.getBoolean(R.bool.multiaccount_support)) {
+            dialogBuilder.setNeutralButton(R.string.nc_account_chooser_add_account) { _, _ ->
+                val intent = Intent(this, ServerSelectionActivity::class.java)
+                intent.putExtra(ADD_ADDITIONAL_ACCOUNT, true)
+                startActivity(intent)
+            }
+        }
+
+        viewThemeUtils.dialog.colorMaterialAlertDialogBackground(this, dialogBuilder)
+        val dialog = dialogBuilder.show()
+        viewThemeUtils.platform.colorTextButtons(
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE),
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        )
     }
 
-    private fun deleteConversation(conversation: Conversation) {
+    private fun deleteConversation(conversation: ConversationModel) {
         val data = Data.Builder()
         data.putLong(
             KEY_INTERNAL_USER_ID,
-            currentUser?.id!!
+            currentUser.id!!
         )
         data.putString(KEY_ROOM_TOKEN, conversation.token)
 
         val deleteConversationWorker =
-            OneTimeWorkRequest.Builder(DeleteConversationWorker::class.java).setInputData(data.build()).build()
+            OneTimeWorkRequest.Builder(DeleteConversationWorker::class.java)
+                .setInputData(data.build())
+                .setExpeditedIfSupported()
+                .build()
         WorkManager.getInstance().enqueue(deleteConversationWorker)
 
         WorkManager.getInstance(context).getWorkInfoByIdLiveData(deleteConversationWorker.id)
             .observeForever { workInfo: WorkInfo? ->
-                if (workInfo != null) {
-                    when (workInfo.state) {
-                        WorkInfo.State.SUCCEEDED -> {
-                            showSnackbar(
-                                String.format(
-                                    context.resources.getString(R.string.deleted_conversation),
-                                    conversation.displayName
-                                )
+                when (workInfo?.state) {
+                    WorkInfo.State.SUCCEEDED -> {
+                        currentUser.id?.let { userId ->
+                            ShortcutManagerHelper.disableConversationShortcut(
+                                context,
+                                conversation.token,
+                                userId,
+                                context.resources.getString(R.string.nc_shortcut_conversation_deleted)
                             )
                         }
+                        // the worker only deletes the room on the server, so the entry has to stay
+                        // hidden until the full sync that drops it locally has landed
+                        conversation.token?.let { conversationsListViewModel.onConversationRemoved(currentUser, it) }
+                        showSnackbar(
+                            String.format(
+                                context.resources.getString(R.string.deleted_conversation),
+                                conversation.displayName
+                            )
+                        )
+                    }
 
-                        WorkInfo.State.FAILED -> {
-                            showSnackbar(context.resources.getString(R.string.nc_common_error_sorry))
-                        }
+                    WorkInfo.State.FAILED -> {
+                        logger.e(TAG, "DeleteConversationWorker failed for token ${conversation.token}")
+                        conversation.token?.let { conversationsListViewModel.clearConversationPendingRemoval(it) }
+                        showSnackbar(context.resources.getString(R.string.nc_common_error_sorry))
+                    }
 
-                        else -> {
-                        }
+                    WorkInfo.State.CANCELLED -> {
+                        // nothing was deleted, so the entry must not stay hidden
+                        conversation.token?.let { conversationsListViewModel.clearConversationPendingRemoval(it) }
+                    }
+
+                    else -> {
                     }
                 }
             }
     }
 
-    private fun onMessageSearchResult(results: MessageSearchResults) {
-        if (searchView!!.query.isNotEmpty()) {
-            clearMessageSearchResults()
-            val entries = results.messages
-            if (entries.isNotEmpty()) {
-                val adapterItems: MutableList<AbstractFlexibleItem<*>> = ArrayList(entries.size + 1)
-                for (i in entries.indices) {
-                    val showHeader = i == 0
-                    adapterItems.add(
-                        MessageResultItem(
-                            context,
-                            currentUser!!,
-                            entries[i],
-                            showHeader,
-                            viewThemeUtils
-                        )
-                    )
-                }
-                if (results.hasMore) {
-                    adapterItems.add(LoadMoreResultsItem)
-                }
-                // add unified search result at the end of the list
-                adapter!!.addItems(adapter!!.mainItemCount + adapter!!.scrollableHeaders.size, adapterItems)
-                binding?.recyclerView?.scrollToPosition(0)
-            }
-        }
-        binding?.swipeRefreshLayoutView?.isRefreshing = false
-    }
+    fun openFollowedThreadsOverview() {
+        val threadsUrl = ApiUtils.getUrlForSubscribedThreads(
+            version = 1,
+            baseUrl = currentUser.baseUrl
+        )
 
-    private fun onMessageSearchError(throwable: Throwable) {
-        handleHttpExceptions(throwable)
-        binding?.swipeRefreshLayoutView?.isRefreshing = false
-        showErrorDialog()
-    }
-
-    fun updateFilterState(mention: Boolean, unread: Boolean) {
-        filterState[FilterConversationFragment.MENTION] = mention
-        filterState[FilterConversationFragment.UNREAD] = unread
-    }
-
-    fun setFilterableItems(items: MutableList<AbstractFlexibleItem<*>>) {
-        filterableConversationItems = items
-    }
-
-    fun updateFilterConversationButtonColor() {
-        if (filterState.containsValue(true)) {
-            binding.filterConversationsButton.let { viewThemeUtils.platform.colorImageView(it, ColorRole.PRIMARY) }
-        } else {
-            binding.filterConversationsButton.let {
-                viewThemeUtils.platform.colorImageView(
-                    it,
-                    ColorRole.ON_SURFACE_VARIANT
-                )
-            }
-        }
+        val bundle = Bundle()
+        bundle.putString(ThreadsOverviewActivity.KEY_APPBAR_TITLE, getString(R.string.threads))
+        bundle.putString(ThreadsOverviewActivity.KEY_THREADS_SOURCE_URL, threadsUrl)
+        val threadsOverviewIntent = Intent(context, ThreadsOverviewActivity::class.java)
+        threadsOverviewIntent.putExtras(bundle)
+        threadsOverviewIntent.putExtra(KEY_INTERNAL_USER_ID, currentUser.id)
+        startActivity(threadsOverviewIntent)
     }
 
     companion object {
         private val TAG = ConversationsListActivity::class.java.simpleName
-        const val UNREAD_BUBBLE_DELAY = 2500
+
+        // once per process, after they could be updated: the shortcuts of earlier versions don't change while the app
+        // runs
+        private var areShortcutsOfEarlierVersionsUpdated = false
+
+        // once per process, not per list: the app starts lists also in further tasks, e.g. for a notification, a
+        // share or another account
+        private var isAppStartSetUpDone = false
+
+        /**
+         * Creates an intent for this activity through its non-exported alias, so that it takes the account
+         * [BundleKeys.KEY_INTERNAL_USER_ID] and the conversation [BundleKeys.KEY_ROOM_TOKEN] from it.
+         */
+        fun createIntent(context: Context): Intent =
+            InternalEntryPoint.createIntent(context, ConversationsListActivity::class.java)
+
+        /**
+         * Creates an intent that shows the conversation list of the account with the internal id [userId].
+         * A conversation list already in the task is recreated for that account and all screens above it are
+         * closed, so no screen of a previously shown account stays in the back stack.
+         *
+         * FLAG_ACTIVITY_NEW_TASK must not be used here: activities have an empty task affinity, so it would start
+         * a second task instead of reusing the current one.
+         */
+        fun createAccountSwitchIntent(context: Context, userId: Long): Intent =
+            createIntent(context).apply {
+                putExtra(KEY_INTERNAL_USER_ID, userId)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+
+        /**
+         * Creates an intent that switches the conversation list in the task, shown or below the screen that starts
+         * it, to the account [userId]: the list closes the screens above it and starts the list of that account in
+         * its place, see [relaunchForAccount]. Unlike [createAccountSwitchIntent], the list at the root of the task
+         * isn't replaced by a new one, which Android shows with the color of the splash screen.
+         */
+        fun createInPlaceAccountSwitchIntent(context: Context, userId: Long): Intent =
+            createAccountSwitchIntent(context, userId).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+
+        /**
+         * The intents that open [screen] of the account [userId] from outside the app, e.g. from a notification, as a
+         * new back stack in the task of the app, with the conversation list of the account below [screen]. Only
+         * [screen] is created, and the list when going back, so [screen] removes the tasks of the app that are only
+         * left in the recents, see [BundleKeys.KEY_TOP_OF_NEW_BACK_STACK].
+         */
+        fun createBackStack(context: Context, userId: Long, screen: Intent): Array<Intent> =
+            arrayOf(
+                createAccountSwitchIntent(context, userId),
+                screen.putExtra(BundleKeys.KEY_TOP_OF_NEW_BACK_STACK, true)
+            )
+
+        /** Like [createBackStack], for the chat [roomToken] of [userId] with [extras]. */
+        fun createChatBackStack(
+            context: Context,
+            userId: Long,
+            roomToken: String,
+            extras: Bundle? = null
+        ): Array<Intent> {
+            val chatIntent = ChatActivity.createIntent(context, userId, roomToken, extras)
+            return createBackStack(context, userId, chatIntent)
+        }
+
+        /**
+         * Removes the extras that only the app itself may set, the account, the conversation to open and a message to
+         * forward with the conversation it came from, from an intent that was not started through its
+         * [InternalEntryPoint]. The activity is exported, so it could come from any app.
+         */
+        @VisibleForTesting
+        internal fun removeExtrasOfApp(intent: Intent) {
+            if (!InternalEntryPoint.isStartedThrough(intent, ConversationsListActivity::class.java)) {
+                intent.removeExtra(KEY_INTERNAL_USER_ID)
+                intent.removeExtra(KEY_ROOM_TOKEN)
+                intent.removeExtra(KEY_FORWARD_MSG_FLAG)
+                intent.removeExtra(KEY_FORWARD_MSG_TEXT)
+                intent.removeExtra(KEY_FORWARD_HIDE_SOURCE_ROOM)
+            }
+        }
+
+        /**
+         * The new [intent], whose extras of the app were removed, as the app itself started it for the account
+         * [userId]: kept for a recreation of the activity, which would otherwise remove the account again. The uri of
+         * a VIEW intent of another app is removed, as the list would take it as a deep link of the app: one that is
+         * shown is a task relaunched from the recents, whose link was taken already, see [isViewOfOtherApp].
+         */
+        @VisibleForTesting
+        internal fun intentOfAccount(context: Context, intent: Intent, userId: Long?): Intent {
+            val isOfOtherApp = !InternalEntryPoint.isStartedThrough(intent, ConversationsListActivity::class.java)
+            return Intent(intent)
+                .setClassName(context, InternalEntryPoint.nameOf(ConversationsListActivity::class.java))
+                .apply {
+                    if (isOfOtherApp && action == Intent.ACTION_VIEW) setDataAndType(null, type)
+                    userId?.let { putExtra(KEY_INTERNAL_USER_ID, it) }
+                }
+        }
+
+        /**
+         * Whether [intent] is a VIEW intent of another app with a uri, e.g. of a pinned shortcut that targets the
+         * launcher activity, which is taken through [DeepLinkActivity]. Not when a task is relaunched from the recents
+         * with the intent it was started with, whose link was taken already: before Android 10, that intent names the
+         * target of the alias it was started through, so a task of a deep link that DeepLinkActivity passed on would
+         * look like one of another app, and passing it on again would route its link again.
+         */
+        @VisibleForTesting
+        internal fun isViewOfOtherApp(intent: Intent): Boolean =
+            !InternalEntryPoint.isStartedThrough(intent, ConversationsListActivity::class.java) &&
+                intent.action == Intent.ACTION_VIEW &&
+                intent.data != null &&
+                !AppTasks.isRelaunchedFromRecents(intent)
+
+        /** Whether [intent] shares content of another app, which is taken through [ShareActivity]. */
+        @VisibleForTesting
+        internal fun isShareOfOtherApp(intent: Intent): Boolean =
+            !InternalEntryPoint.isStartedThrough(intent, ConversationsListActivity::class.java) && isShare(intent)
+
+        private fun isShare(intent: Intent): Boolean =
+            Intent.ACTION_SEND == intent.action || Intent.ACTION_SEND_MULTIPLE == intent.action
+
+        private const val FOREGROUND_REFRESH_INTERVAL_MILLIS = 30_000L
         const val BOTTOM_SHEET_DELAY: Long = 2500
-        private const val KEY_SEARCH_QUERY = "ConversationsListActivity.searchQuery"
         const val SEARCH_DEBOUNCE_INTERVAL_MS = 300
-        const val SEARCH_MIN_CHARS = 2
         const val HTTP_UNAUTHORIZED = 401
         const val HTTP_CLIENT_UPGRADE_REQUIRED = 426
         const val CLIENT_UPGRADE_MARKET_LINK = "market://details?id="
@@ -1847,6 +2059,11 @@ class ConversationsListActivity :
         const val HTTP_SERVICE_UNAVAILABLE = 503
         const val MAINTENANCE_MODE_HEADER_KEY = "X-Nextcloud-Maintenance-Mode"
         const val REQUEST_POST_NOTIFICATIONS_PERMISSION = 111
-        const val BADGE_OFFSET = 35
+        const val DAYS_FOR_NOTIFICATION_WARNING = 5L
+        const val NOTIFICATION_WARNING_DATE_NOT_SET = 0L
+        const val ROOM_TYPE_ONE_ONE = "1"
+        private const val NOTE_TO_SELF_SHORTCUT_ID = "NOTE_TO_SELF_SHORTCUT_ID"
+        private const val KEY_ACCOUNT_DIALOG_VISIBLE = "account_dialog_visible"
+        private const val KEY_PENDING_SHORTCUT_TOKEN = "pending_shortcut_token"
     }
 }

@@ -21,9 +21,9 @@ import android.widget.TextView
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
+import androidx.emoji2.widget.EmojiTextView
 import com.nextcloud.talk.R
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
-import com.vanniktech.emoji.EmojiTextView
 
 class ReactionAnimator(
     val context: Context,
@@ -163,7 +163,4 @@ class ReactionAnimator(
         private const val BOTTOM_MARGIN: Int = 5
     }
 }
-data class CallReaction(
-    var emoji: String,
-    var userName: String
-)
+data class CallReaction(var emoji: String, var userName: String)

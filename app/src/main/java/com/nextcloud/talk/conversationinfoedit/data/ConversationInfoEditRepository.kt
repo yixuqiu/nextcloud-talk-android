@@ -8,12 +8,29 @@ package com.nextcloud.talk.conversationinfoedit.data
 
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.models.domain.ConversationModel
-import io.reactivex.Observable
+import com.nextcloud.talk.models.json.generic.GenericOverall
 import java.io.File
 
 interface ConversationInfoEditRepository {
 
-    fun uploadConversationAvatar(user: User, file: File, roomToken: String): Observable<ConversationModel>
+    suspend fun getRoom(user: User, roomToken: String): ConversationInfoEditRoomData
 
-    fun deleteConversationAvatar(user: User, roomToken: String): Observable<ConversationModel>
+    suspend fun uploadConversationAvatar(user: User, roomToken: String, file: File): ConversationModel
+
+    suspend fun deleteConversationAvatar(user: User, roomToken: String): ConversationModel
+
+    suspend fun setConversationEmojiAvatar(
+        user: User,
+        roomToken: String,
+        emoji: String,
+        color: String?
+    ): ConversationModel
+
+    suspend fun renameConversation(user: User, roomToken: String, newRoomName: String): GenericOverall
+
+    suspend fun setConversationDescription(
+        user: User,
+        roomToken: String,
+        conversationDescription: String?
+    ): GenericOverall
 }

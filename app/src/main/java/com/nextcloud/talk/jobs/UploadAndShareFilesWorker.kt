@@ -8,55 +8,85 @@
 package com.nextcloud.talk.jobs
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.Build
-import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.net.toUri
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
 import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import autodagger.AutoInjector
 import com.nextcloud.talk.R
-import com.nextcloud.talk.activities.MainActivity
 import com.nextcloud.talk.api.NcApi
+import com.nextcloud.talk.api.NcApiCoroutines
 import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.data.database.dao.ChatMessagesDao
+import com.nextcloud.talk.data.database.model.SendStatus
 import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.chatpostattachment.PostConversationAttachmentRequestDto
+import com.nextcloud.talk.models.json.chatprobeattachmentfolder.ChatProbeAttachmentDataDto
+import com.nextcloud.talk.models.json.chatprobeattachmentfolder.ProbeConversationAttachmentRequestDto
 import com.nextcloud.talk.upload.chunked.ChunkedFileUploader
 import com.nextcloud.talk.upload.chunked.OnDataTransferProgressListener
 import com.nextcloud.talk.upload.normal.FileUploader
 import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.CapabilitiesUtil
 import com.nextcloud.talk.utils.FileUtils
+import com.nextcloud.talk.utils.ImageCompressor
 import com.nextcloud.talk.utils.NotificationUtils
 import com.nextcloud.talk.utils.RemoteFileUtils
+import com.nextcloud.talk.utils.SharedFileCopies
+import com.nextcloud.talk.utils.UploadSourceGrants
+import com.nextcloud.talk.utils.VideoCompressor
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_INTERNAL_USER_ID
-import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
 import com.nextcloud.talk.utils.permissions.PlatformPermissionUtil
 import com.nextcloud.talk.utils.preferences.AppPreferences
+import io.reactivex.Observable
+import io.reactivex.disposables.Disposable
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import retrofit2.HttpException
 import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.util.Collections
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
 class UploadAndShareFilesWorker(val context: Context, workerParameters: WorkerParameters) :
-    Worker(context, workerParameters), OnDataTransferProgressListener {
+    Worker(context, workerParameters),
+    OnDataTransferProgressListener {
 
     @Inject
     lateinit var ncApi: NcApi
 
     @Inject
     lateinit var userManager: UserManager
+
+    @Inject
+    lateinit var ncApiCoroutines: NcApiCoroutines
 
     @Inject
     lateinit var appPreferences: AppPreferences
@@ -67,250 +97,391 @@ class UploadAndShareFilesWorker(val context: Context, workerParameters: WorkerPa
     @Inject
     lateinit var platformPermissionUtil: PlatformPermissionUtil
 
+    @Inject
+    lateinit var chatDao: ChatMessagesDao
+
     lateinit var fileName: String
 
-    private var mNotifyManager: NotificationManager? = null
-    private var mBuilder: NotificationCompat.Builder? = null
-    private var notificationId: Int = 0
+    private val notificationManager by lazy {
+        context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    }
 
     lateinit var roomToken: String
     lateinit var conversationName: String
     lateinit var currentUser: User
     private var isChunkedUploading = false
+
+    // true when the upload itself shared the file, i.e. via postConversationAttachment
+    private var isSharedByUpload = false
     private var file: File? = null
     private var chunkedFileUploader: ChunkedFileUploader? = null
+    private var referenceId: String? = null
+    private var internalConversationId: String? = null
+    private var uploadDisposable: Disposable? = null
+    private var uploadLatch: CountDownLatch? = null
 
-    @Suppress("Detekt.TooGenericExceptionCaught")
+    /**
+     * WorkManager's own `isStopped`/`onStopped()` only becomes true/fires after
+     * cancelUniqueWork() round-trips through WorkManager's internal executor and Room DB - for a
+     * small/compressed image the whole upload+share can finish faster than that round-trip, so
+     * isStopped alone arrives too late. [cancelledReferenceIds] is set synchronously by the UI
+     * before cancelUniqueWork() is even called, so it's visible to doWork() immediately.
+     */
+    private fun isCancelled(): Boolean = referenceId?.let { cancelledReferenceIds.contains(it) } == true
+
     override fun doWork(): Result {
-        NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
-
-        if (!platformPermissionUtil.isFilesPermissionGranted()) {
-            Log.w(
-                TAG,
-                "Storage permission is not granted. As a developer please make sure you check for" +
-                    "permissions via UploadAndShareFilesWorker.isStoragePermissionGranted() and " +
-                    "UploadAndShareFilesWorker.requestStoragePermission() beforehand. If you already " +
-                    "did but end up with this warning, the user most likely revoked the permission"
-            )
+        // Invariant: dependencies that are already set (a test worker factory) are not overwritten.
+        if (!::chatDao.isInitialized) {
+            NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
         }
 
+        try {
+            return doUpload().also { result ->
+                // not for a retry, which reads the file again
+                val sourceFile = inputData.getString(DEVICE_SOURCE_FILE)
+                if (result != Result.retry() && sourceFile != null) UploadSourceGrants.release(context, sourceFile, id)
+            }
+        } finally {
+            referenceId?.let { cancelledReferenceIds.remove(it) }
+        }
+    }
+
+    @Suppress(
+        "Detekt.TooGenericExceptionCaught",
+        "Detekt.LongMethod",
+        "Detekt.CyclomaticComplexMethod",
+        "Detekt.ReturnCount"
+    )
+    private fun doUpload(): Result {
         return try {
-            currentUser = userManager.currentUser.blockingGet()
+            // Read first, so a failure below can still mark the placeholder message as failed.
+            referenceId = inputData.getString(KEY_REFERENCE_ID)
+            internalConversationId = inputData.getString(KEY_INTERNAL_CONVERSATION_ID)
+
+            val userId = inputData.getLong(KEY_INTERNAL_USER_ID, 0L)
+            currentUser = runBlocking { userManager.getUserWithId(userId) } ?: run {
+                // E.g. the account was removed while the upload waited for a retry.
+                Log.e(TAG, "No user found for id $userId")
+                return failUpload()
+            }
             val sourceFile = inputData.getString(DEVICE_SOURCE_FILE)
             roomToken = inputData.getString(ROOM_TOKEN)!!
             conversationName = inputData.getString(CONVERSATION_NAME)!!
             val metaData = inputData.getString(META_DATA)
 
-            checkNotNull(currentUser)
             checkNotNull(sourceFile)
             require(sourceFile.isNotEmpty())
             checkNotNull(roomToken)
 
-            val sourceFileUri = Uri.parse(sourceFile)
+            var sourceFileUri = sourceFile.toUri()
             fileName = FileUtils.getFileName(sourceFileUri, context)
             file = FileUtils.getFileFromUri(context, sourceFileUri)
+
+            if (inputData.getBoolean(COMPRESS_IMAGES, false)) {
+                sourceFileUri = compressMediaIfPossible(sourceFileUri)
+            }
+
             val remotePath = getRemotePath(currentUser)
-            val uploadSuccess: Boolean
 
-            initNotificationSetup()
+            val useConversationSubfolders = CapabilitiesUtil.hasConversationSubfoldersForAttachments(
+                currentUser.capabilities!!.spreedCapability!!
+            )
+            val allowUpdate = inputData.getBoolean(ALLOW_UPDATE, false)
             file?.let { isChunkedUploading = it.length() > CHUNK_UPLOAD_THRESHOLD_SIZE }
-            if (file == null) {
-                uploadSuccess = false
-            } else if (isChunkedUploading) {
-                Log.d(TAG, "starting chunked upload because size is " + file!!.length())
+            val uploadSuccess: Boolean = uploadFile(
+                sourceFileUri = sourceFileUri,
+                metaData = metaData,
+                remotePath = remotePath,
+                useConversationSubfolders = useConversationSubfolders,
+                allowUpdate = allowUpdate
+            )
 
-                initNotificationWithPercentage()
-                val mimeType = context.contentResolver.getType(sourceFileUri)?.toMediaTypeOrNull()
-
-                chunkedFileUploader = ChunkedFileUploader(
-                    okHttpClient,
-                    currentUser,
-                    roomToken,
-                    metaData,
-                    this
-                )
-
-                uploadSuccess = chunkedFileUploader!!.upload(
-                    file!!,
-                    mimeType,
-                    remotePath
-                )
-            } else {
-                Log.d(TAG, "starting normal upload (not chunked) of $fileName")
-
-                uploadSuccess = FileUploader(
-                    context,
-                    currentUser,
-                    roomToken,
-                    ncApi
-                ).upload(
-                    sourceFileUri,
-                    fileName,
-                    remotePath,
-                    metaData
-                ).blockingFirst()
+            if (uploadSuccess && (isStopped || isCancelled())) {
+                // Cancelled right as the upload finished - don't share a cancelled upload.
+                return Result.failure()
             }
 
             if (uploadSuccess) {
-                cancelNotification()
-                return Result.success()
-            } else if (isStopped) {
+                // The conversation subfolder upload already shares via postConversationAttachment,
+                // so only share explicitly for an upload into the attachment folder.
+                val shareSuccess = isSharedByUpload ||
+                    shareFile(remotePath, metaData, sharePermissions(useConversationSubfolders, allowUpdate))
+                if (shareSuccess) {
+                    updatePlaceholderStatus(SendStatus.SENT_PENDING_ACK)
+                    _uploadCompletedFlow.tryEmit(roomToken)
+                    return Result.success()
+                }
+                Log.e(TAG, "Share operation failed after upload")
+                return failUpload()
+            } else if (isStopped || isCancelled()) {
                 // since work is cancelled the result would be ignored anyways
                 return Result.failure()
             }
 
             Log.e(TAG, "Something went wrong when trying to upload file")
-            showFailedToUploadNotification()
-            return Result.failure()
+            failUpload()
+        } catch (e: IOException) {
+            // Transient network failures (connection reset, timeout, dropped Wi-Fi, ...) shouldn't
+            // require the user to manually resend - retry a few times with backoff instead, and only
+            // give up once we've exhausted the allowed attempts.
+            Log.w(
+                TAG,
+                "Network error while uploading file (attempt ${runAttemptCount + 1}/$MAX_UPLOAD_ATTEMPTS)",
+                e
+            )
+            if (isStopped || isCancelled()) {
+                Result.failure()
+            } else if (runAttemptCount < MAX_UPLOAD_ATTEMPTS - 1) {
+                Result.retry()
+            } else {
+                failUpload()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Something went wrong when trying to upload file", e)
-            showFailedToUploadNotification()
-            return Result.failure()
+            failUpload()
         }
     }
 
+    // Result.success(), not failure(): the failure is recorded on the placeholder row, and a failed work
+    // request would cascade to every upload already queued behind it in the conversation.
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private fun failUpload(): Result {
+        updatePlaceholderStatus(SendStatus.FAILED)
+        try {
+            showFailedToUploadNotification()
+        } catch (e: Exception) {
+            // The failure is recorded already; an exception here must not end the work as failed.
+            Log.e(TAG, "Could not show the upload failed notification", e)
+        }
+        return Result.success()
+    }
+
+    /**
+     * Replaces [file] and [fileName] with a compressed copy if [sourceFileUri] points to a
+     * compressible image or video, returning the [Uri] that should be uploaded.
+     */
+    @Suppress("ReturnCount")
+    private fun compressMediaIfPossible(sourceFileUri: Uri): Uri {
+        val originalFile = file ?: return sourceFileUri
+        val mimeType = FileUtils.resolveMimeType(context, sourceFileUri)
+
+        val compressedFile = when {
+            ImageCompressor.isCompressible(mimeType) -> ImageCompressor.compress(context, originalFile)
+            VideoCompressor.isCompressible(mimeType) -> VideoCompressor.compress(context, originalFile)
+            else -> null
+        } ?: return sourceFileUri
+
+        file = compressedFile
+        fileName = compressedFile.name
+        return Uri.fromFile(compressedFile)
+    }
+
+    private fun uploadFile(
+        sourceFileUri: Uri,
+        metaData: String?,
+        remotePath: String,
+        useConversationSubfolders: Boolean,
+        allowUpdate: Boolean
+    ): Boolean {
+        val trySubfolders = file != null && useConversationSubfolders
+        val subfolderUploadSuccess = if (trySubfolders) {
+            uploadUsingConversationSubfolders(sourceFileUri, metaData, allowUpdate)
+        } else {
+            null
+        }
+        isSharedByUpload = subfolderUploadSuccess != null
+        if (trySubfolders && subfolderUploadSuccess == null) {
+            // The server answered 501 despite the capability, e.g. because the conversation has message
+            // expiration enabled. Upload to the attachment folder and share the file from there instead.
+            Log.i(TAG, "Conversation subfolders not available, using the attachment folder")
+        }
+
+        return if (file == null) {
+            false
+        } else if (subfolderUploadSuccess != null) {
+            subfolderUploadSuccess
+        } else if (isChunkedUploading) {
+            Log.d(TAG, "starting chunked upload because size is " + file!!.length())
+            val mimeType = context.contentResolver.getType(sourceFileUri)?.toMediaTypeOrNull()
+            chunkedFileUploader = ChunkedFileUploader(
+                okHttpClient,
+                currentUser,
+                this,
+                ncApiCoroutines
+            )
+            chunkedFileUploader!!.upload(file!!, mimeType, remotePath)
+        } else {
+            Log.d(TAG, "starting normal upload (not chunked) of $fileName")
+            val observable = FileUploader(
+                okHttpClient,
+                context,
+                currentUser,
+                roomToken,
+                ncApi,
+                file!!,
+                ncApiCoroutines
+            )
+                .upload(sourceFileUri, fileName, remotePath, null)
+            blockingUpload(observable)
+        }
+    }
+
+    // unlike .blockingFirst(), keeps a Disposable so onStopped() can cancel the underlying OkHttp call
+    private fun blockingUpload(observable: Observable<Boolean>): Boolean {
+        val latch = CountDownLatch(1)
+        uploadLatch = latch
+        var result = false
+        var error: Throwable? = null
+        uploadDisposable = observable.subscribe(
+            { success ->
+                result = success
+                latch.countDown()
+            },
+            { throwable ->
+                error = throwable
+                latch.countDown()
+            },
+            { latch.countDown() }
+        )
+        latch.await()
+        uploadDisposable = null
+        uploadLatch = null
+
+        if (isStopped || isCancelled()) {
+            return false
+        }
+        error?.let { throw it }
+        return result
+    }
+
+    /**
+     * Uploads into the conversation's Draft folder and shares the file via postConversationAttachment.
+     *
+     * @return null when the server answers the probe with 501 despite the capability, the
+     * attachment folder has to be used then.
+     */
+    private fun uploadUsingConversationSubfolders(
+        sourceFileUri: Uri,
+        metaData: String?,
+        allowUpdate: Boolean
+    ): Boolean? =
+        runBlocking {
+            val credentials = ApiUtils.getCredentials(
+                currentUser.username,
+                currentUser.token
+            ) ?: return@runBlocking false
+            val uploadId = UUID.randomUUID().toString()
+            val fileNames = ProbeConversationAttachmentRequestDto().apply {
+                fileNames = listOf(fileName)
+                this.allowUpdate = allowUpdate
+            }
+
+            val probeResponse = nullIfNotImplemented {
+                ncApiCoroutines.probeConversationAttachmentFolder(
+                    credentials,
+                    ApiUtils.getUrlForChatAttachmentFolder(ApiUtils.API_V1, currentUser.baseUrl, roomToken),
+                    fileNames
+                )
+            } ?: return@runBlocking null
+
+            val draftFolderPath = probeResponse.ocs?.data?.folder
+            if (draftFolderPath.isNullOrEmpty()) {
+                Log.e(TAG, "Draft folder path missing in probe response")
+                return@runBlocking false
+            }
+            val predictedName = resolveFinalFileName(fileName, probeResponse.ocs?.data!!)
+            val tempRemotePath = "/$draftFolderPath/$uploadId-$fileName"
+
+            val uploadSuccess = if (isChunkedUploading) {
+                val mimeType = context.contentResolver.getType(sourceFileUri)?.toMediaTypeOrNull()
+                chunkedFileUploader = ChunkedFileUploader(
+                    okHttpClient,
+                    currentUser,
+                    this@UploadAndShareFilesWorker,
+                    ncApiCoroutines
+                )
+                chunkedFileUploader!!.upload(file!!, mimeType, tempRemotePath)
+            } else {
+                FileUploader(okHttpClient, context, currentUser, roomToken, ncApi, file!!, ncApiCoroutines)
+                    .uploadToConversationSubfolder(sourceFileUri, tempRemotePath)
+            }
+
+            if (!uploadSuccess || isStopped || isCancelled()) {
+                return@runBlocking false
+            }
+
+            val params = PostConversationAttachmentRequestDto().apply {
+                filePath = tempRemotePath
+                referenceId = this@UploadAndShareFilesWorker.referenceId.orEmpty()
+                talkMetaData = metaData
+                fileName = predictedName
+                this.allowUpdate = allowUpdate
+            }
+
+            runCatching {
+                ncApiCoroutines.postConversationAttachment(
+                    credentials,
+                    ApiUtils.getUrlForChatAttachment(ApiUtils.API_V1, currentUser.baseUrl, roomToken),
+                    params
+                )
+            }
+                .onFailure { Log.e(TAG, "Failed to finalize uploaded attachment", it) }
+                .isSuccess
+        }
+
+    @SuppressLint("CheckResult")
+    private fun shareFile(remotePath: String, metaData: String?, permissions: Int?): Boolean =
+        try {
+            ncApi.createRemoteShare(
+                ApiUtils.getCredentials(currentUser.username, currentUser.token),
+                ApiUtils.getSharingUrl(currentUser.baseUrl!!),
+                remotePath,
+                roomToken,
+                "10",
+                metaData,
+                referenceId.orEmpty(),
+                permissions
+            ).blockingFirst()
+            true
+        } catch (e: NoSuchElementException) {
+            Log.e(TAG, "Failed to share file to room", e)
+            false
+        }
+
+    private fun resolveFinalFileName(originalName: String, probeData: ChatProbeAttachmentDataDto): String =
+        probeData.renames?.get(originalName) ?: originalName
+
     private fun getRemotePath(currentUser: User): String {
-        var remotePath = CapabilitiesUtil.getAttachmentFolder(
+        val remotePath = CapabilitiesUtil.getAttachmentFolder(
             currentUser.capabilities!!.spreedCapability!!
         ) + "/" + fileName
-        remotePath = RemoteFileUtils.getNewPathIfFileExists(
-            ncApi,
-            currentUser,
-            remotePath
-        )
-        return remotePath
+        return RemoteFileUtils.getNewPathIfFileExists(ncApi, currentUser, remotePath)
     }
 
     override fun onTransferProgress(percentage: Int) {
-        val progressUpdateNotification = mBuilder!!
-            .setProgress(HUNDRED_PERCENT, percentage, false)
-            .setContentText(getNotificationContentText(percentage))
-            .build()
+        setProgressAsync(Data.Builder().putInt(PROGRESS_KEY, percentage).build())
+    }
 
-        mNotifyManager!!.notify(notificationId, progressUpdateNotification)
+    private fun updatePlaceholderStatus(status: SendStatus) {
+        val refId = referenceId ?: return
+        val convId = internalConversationId ?: return
+        chatDao.updateTempMessageSendStatus(convId, refId, status)
     }
 
     override fun onStopped() {
         if (file != null && isChunkedUploading) {
-            chunkedFileUploader?.abortUpload {
-                mNotifyManager?.cancel(notificationId)
-            }
+            chunkedFileUploader?.abortUpload {}
         }
+        uploadDisposable?.dispose()
+        uploadLatch?.countDown()
         super.onStopped()
-    }
-
-    private fun initNotificationSetup() {
-        mNotifyManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mBuilder = NotificationCompat.Builder(
-            context,
-            NotificationUtils.NotificationChannels
-                .NOTIFICATION_CHANNEL_UPLOADS.name
-        )
-    }
-
-    private fun initNotificationWithPercentage() {
-        val initNotification = mBuilder!!
-            .setContentTitle(context.resources.getString(R.string.nc_upload_in_progess))
-            .setContentText(getNotificationContentText(ZERO_PERCENT))
-            .setSmallIcon(R.drawable.upload_white)
-            .setOngoing(true)
-            .setProgress(HUNDRED_PERCENT, ZERO_PERCENT, false)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setGroup(NotificationUtils.KEY_UPLOAD_GROUP)
-            .setContentIntent(getIntentToOpenConversation())
-            .addAction(
-                R.drawable.ic_cancel_white_24dp,
-                getResourceString(context, R.string.nc_cancel),
-                getCancelUploadIntent()
-            )
-            .build()
-
-        notificationId = SystemClock.uptimeMillis().toInt()
-        mNotifyManager!!.notify(notificationId, initNotification)
-        // only need one summary notification but multiple upload worker can call it more than once but it is safe
-        // because of the same notification object config and id.
-        makeSummaryNotification()
-    }
-
-    private fun makeSummaryNotification() {
-        // summary notification encapsulating the group of notifications
-        val summaryNotification = NotificationCompat.Builder(
-            context,
-            NotificationUtils.NotificationChannels
-                .NOTIFICATION_CHANNEL_UPLOADS.name
-        ).setSmallIcon(R.drawable.upload_white)
-            .setGroup(NotificationUtils.KEY_UPLOAD_GROUP)
-            .setGroupSummary(true)
-            .build()
-
-        mNotifyManager?.notify(NotificationUtils.GROUP_SUMMARY_NOTIFICATION_ID, summaryNotification)
-    }
-
-    private fun getActiveUploadNotifications(): Int? {
-        // filter out active notifications that are upload notifications using group
-        return mNotifyManager?.activeNotifications?.filter {
-            it.notification.group == NotificationUtils
-                .KEY_UPLOAD_GROUP
-        }?.size
-    }
-
-    private fun cancelNotification() {
-        mNotifyManager?.cancel(notificationId)
-        // summary notification would not get dismissed automatically
-        // if child notifications are cancelled programmatically
-        // so check if only 1 notification left if yes
-        // then cancel it (which is summary notification)
-        if (getActiveUploadNotifications() == 1) {
-            mNotifyManager?.cancel(NotificationUtils.GROUP_SUMMARY_NOTIFICATION_ID)
-        }
-    }
-
-    private fun getNotificationContentText(percentage: Int): String {
-        return String.format(
-            getResourceString(context, R.string.nc_upload_notification_text),
-            getShortenedFileName(),
-            conversationName,
-            percentage
-        )
-    }
-
-    private fun getShortenedFileName(): String {
-        return if (fileName.length > NOTIFICATION_FILE_NAME_MAX_LENGTH) {
-            THREE_DOTS + fileName.takeLast(NOTIFICATION_FILE_NAME_MAX_LENGTH)
-        } else {
-            fileName
-        }
-    }
-
-    private fun getCancelUploadIntent(): PendingIntent {
-        return WorkManager.getInstance(applicationContext)
-            .createCancelPendingIntent(id)
-    }
-
-    private fun getIntentToOpenConversation(): PendingIntent? {
-        val bundle = Bundle()
-        val intent = Intent(context, MainActivity::class.java)
-        intent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-
-        bundle.putString(KEY_ROOM_TOKEN, roomToken)
-        bundle.putLong(KEY_INTERNAL_USER_ID, currentUser.id!!)
-
-        intent.putExtras(bundle)
-
-        val requestCode = System.currentTimeMillis().toInt()
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE
-        } else {
-            0
-        }
-        return PendingIntent.getActivity(context, requestCode, intent, intentFlag)
     }
 
     private fun showFailedToUploadNotification() {
         val failureTitle = getResourceString(context, R.string.nc_upload_failed_notification_title)
         val failureText = String.format(
             getResourceString(context, R.string.nc_upload_failed_notification_text),
-            fileName
+            failedFileName()
         )
         val failureNotification = NotificationCompat.Builder(
             context,
@@ -324,14 +495,18 @@ class UploadAndShareFilesWorker(val context: Context, workerParameters: WorkerPa
             .setOngoing(false)
             .build()
 
-        mNotifyManager?.cancel(notificationId)
-        // update current notification with failure info
-        mNotifyManager!!.notify(SystemClock.uptimeMillis().toInt(), failureNotification)
+        notificationManager.notify(SystemClock.uptimeMillis().toInt(), failureNotification)
     }
 
-    private fun getResourceString(context: Context, resourceId: Int): String {
-        return context.resources.getString(resourceId)
-    }
+    // The upload can fail before the file name is known, e.g. when its account does not exist anymore.
+    private fun failedFileName(): String =
+        if (::fileName.isInitialized) {
+            fileName
+        } else {
+            inputData.getString(DEVICE_SOURCE_FILE)?.toUri()?.lastPathSegment.orEmpty()
+        }
+
+    private fun getResourceString(context: Context, resourceId: Int): String = context.resources.getString(resourceId)
 
     companion object {
         private val TAG = UploadAndShareFilesWorker::class.simpleName
@@ -339,12 +514,62 @@ class UploadAndShareFilesWorker(val context: Context, workerParameters: WorkerPa
         private const val ROOM_TOKEN = "ROOM_TOKEN"
         private const val CONVERSATION_NAME = "CONVERSATION_NAME"
         private const val META_DATA = "META_DATA"
-        private const val CHUNK_UPLOAD_THRESHOLD_SIZE: Long = 1024000
-        private const val NOTIFICATION_FILE_NAME_MAX_LENGTH = 20
-        private const val THREE_DOTS = "…"
-        private const val HUNDRED_PERCENT = 100
-        private const val ZERO_PERCENT = 0
+        const val KEY_REFERENCE_ID = "REFERENCE_ID"
+        const val KEY_INTERNAL_CONVERSATION_ID = "INTERNAL_CONVERSATION_ID"
+        const val PROGRESS_KEY = "UPLOAD_PROGRESS"
+        private const val COMPRESS_IMAGES = "COMPRESS_IMAGES"
+        private const val ALLOW_UPDATE = "ALLOW_UPDATE"
+        private const val CHUNK_UPLOAD_THRESHOLD_SIZE: Long = 1024 * 1024
+        private const val SHARE_PERMISSION_READ = 1
+        private const val SHARE_PERMISSION_UPDATE = 2
+        private const val SHARE_PERMISSION_SHARE = 16
+
+        // Total attempts allowed for a single upload (1 initial run + retries) before giving up on a
+        // transient network failure and marking the placeholder FAILED.
+        private const val MAX_UPLOAD_ATTEMPTS = 4
         const val REQUEST_PERMISSION = 3123
+
+        // referenceIds the user cancelled - set synchronously here, before cancelUniqueWork() is
+        // even called, so doWork() can see it immediately instead of waiting for isStopped, which
+        // only becomes true once WorkManager's own async cancellation dispatch completes.
+        private val cancelledReferenceIds: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
+
+        private val _uploadCompletedFlow: MutableSharedFlow<String> = MutableSharedFlow(
+            replay = 1,
+            extraBufferCapacity = 1
+        )
+        val uploadCompletedFlow: SharedFlow<String> = _uploadCompletedFlow
+
+        /**
+         * The user only picks view only or editable when the conversation subfolder capability is present,
+         * so only an attachment folder fallback after a 501 sends permissions. Otherwise the server applies
+         * its default share permissions.
+         */
+        internal fun sharePermissions(hasConversationSubfolders: Boolean, allowUpdate: Boolean): Int? =
+            when {
+                !hasConversationSubfolders -> null
+                allowUpdate -> SHARE_PERMISSION_READ or SHARE_PERMISSION_UPDATE or SHARE_PERMISSION_SHARE
+                else -> SHARE_PERMISSION_READ or SHARE_PERMISSION_SHARE
+            }
+
+        /**
+         * Returns null when the server answers 501, which the conversation subfolder endpoints do despite
+         * the capability when the conversation can not use them, e.g. because of message expiration.
+         */
+        internal suspend fun <T> nullIfNotImplemented(request: suspend () -> T): T? =
+            try {
+                request()
+            } catch (e: HttpException) {
+                if (e.code() != HttpURLConnection.HTTP_NOT_IMPLEMENTED) {
+                    throw e
+                }
+                null
+            }
+
+        @OptIn(ExperimentalCoroutinesApi::class)
+        fun clearUploadCompletedReplay() {
+            _uploadCompletedFlow.resetReplayCache()
+        }
 
         fun requestStoragePermission(activity: Activity) {
             when {
@@ -380,17 +605,73 @@ class UploadAndShareFilesWorker(val context: Context, workerParameters: WorkerPa
             }
         }
 
-        fun upload(fileUri: String, roomToken: String, conversationName: String, metaData: String?) {
+        @Suppress("LongParameterList")
+        fun upload(
+            userId: Long,
+            fileUri: String,
+            roomToken: String,
+            conversationName: String,
+            metaData: String?,
+            referenceId: String = "",
+            internalConversationId: String = "",
+            compressImages: Boolean = false,
+            allowUpdate: Boolean = false
+        ): UUID {
             val data: Data = Data.Builder()
+                .putLong(KEY_INTERNAL_USER_ID, userId)
                 .putString(DEVICE_SOURCE_FILE, fileUri)
                 .putString(ROOM_TOKEN, roomToken)
                 .putString(CONVERSATION_NAME, conversationName)
                 .putString(META_DATA, metaData)
+                .putString(KEY_REFERENCE_ID, referenceId)
+                .putString(KEY_INTERNAL_CONVERSATION_ID, internalConversationId)
+                .putBoolean(COMPRESS_IMAGES, compressImages)
+                .putBoolean(ALLOW_UPDATE, allowUpdate)
                 .build()
             val uploadWorker: OneTimeWorkRequest = OneTimeWorkRequest.Builder(UploadAndShareFilesWorker::class.java)
                 .setInputData(data)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .setBackoffCriteria(
+                    BackoffPolicy.EXPONENTIAL,
+                    WorkRequest.MIN_BACKOFF_MILLIS,
+                    TimeUnit.MILLISECONDS
+                )
+                // keeps a copy of a shared file until its upload is done
+                .apply { SharedFileCopies.uploadTagOf(fileUri)?.let { addTag(it) } }
+                // keeps the read access to a picked file until its upload is done
+                .apply { UploadSourceGrants.uploadTagOf(fileUri)?.let { addTag(it) } }
                 .build()
-            WorkManager.getInstance().enqueueUniqueWork(fileUri, ExistingWorkPolicy.KEEP, uploadWorker)
+            // Chained per conversation (not enqueueUniqueWork(fileUri, ...), which ran every upload
+            // fully independently) so multiple files - whether from one multi-file share or several
+            // sends in a row - actually upload and share to the server in the order they were sent,
+            // instead of each finishing (and so appearing in chat) whenever its own network calls
+            // happen to complete. APPEND_OR_REPLACE rather than APPEND: if the chain already ended in a
+            // failed or cancelled request, this starts a fresh chain. It does not protect requests that
+            // are already appended behind a request that fails later; that is why a failed upload is
+            // recorded on its row and finishes with Result.success(). Cancelling by id still cancels the
+            // requests behind it.
+            WorkManager.getInstance().enqueueUniqueWork(
+                uploadQueueName(internalConversationId),
+                ExistingWorkPolicy.APPEND_OR_REPLACE,
+                uploadWorker
+            )
+            return uploadWorker.id
+        }
+
+        private fun uploadQueueName(internalConversationId: String) = "upload_queue_$internalConversationId"
+
+        // Cancellation is by the WorkRequest's own id (not enqueueUniqueWork's name) since that name
+        // is now shared by every file queued in the same conversation - cancelling by name would
+        // cancel the whole queue instead of just this one upload.
+        fun cancelUpload(referenceId: String, workerId: UUID, fileUri: String?) {
+            cancelledReferenceIds.add(referenceId)
+            WorkManager.getInstance().cancelWorkById(workerId)
+            // an upload that didn't start doesn't release the read access to its file itself
+            fileUri?.let { UploadSourceGrants.releaseLater(it, exceptWorkId = workerId) }
         }
     }
 }

@@ -9,74 +9,86 @@
 package com.nextcloud.talk.models.json.converters
 
 import com.bluelinelabs.logansquare.typeconverters.StringBasedTypeConverter
-import com.nextcloud.talk.models.json.chat.ChatMessage
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.AUDIO_RECORDING_STARTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.AUDIO_RECORDING_STOPPED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.AVATAR_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.AVATAR_SET
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.BREAKOUT_ROOMS_STARTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.BREAKOUT_ROOMS_STOPPED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_ENDED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_ENDED_EVERYONE
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_JOINED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_LEFT
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_MISSED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_STARTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CALL_TRIED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CIRCLE_ADDED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CIRCLE_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CLEARED_CHAT
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CONVERSATION_CREATED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.CONVERSATION_RENAMED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.DESCRIPTION_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.DESCRIPTION_SET
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.DUMMY
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.FILE_SHARED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GROUP_ADDED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GROUP_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GUESTS_ALLOWED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GUESTS_DISALLOWED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GUEST_MODERATOR_DEMOTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.GUEST_MODERATOR_PROMOTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LISTABLE_ALL
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LISTABLE_NONE
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LISTABLE_USERS
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LOBBY_NONE
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LOBBY_NON_MODERATORS
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.LOBBY_OPEN_TO_EVERYONE
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_ADDED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_DISABLED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_EDITED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_ENABLED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MESSAGE_DELETED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MESSAGE_EXPIRATION_DISABLED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MESSAGE_EXPIRATION_ENABLED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MODERATOR_DEMOTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.MODERATOR_PROMOTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.OBJECT_SHARED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.PASSWORD_REMOVED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.PASSWORD_SET
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.POLL_CLOSED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.POLL_VOTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.REACTION
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.REACTION_DELETED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.REACTION_REVOKED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.READ_ONLY
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.READ_ONLY_OFF
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.RECORDING_FAILED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.RECORDING_STARTED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.RECORDING_STOPPED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.USER_ADDED
-import com.nextcloud.talk.models.json.chat.ChatMessage.SystemMessageType.USER_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.AUDIO_RECORDING_STARTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.AUDIO_RECORDING_STOPPED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.AVATAR_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.AVATAR_SET
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.BREAKOUT_ROOMS_STARTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.BREAKOUT_ROOMS_STOPPED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_ENDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_ENDED_EVERYONE
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_JOINED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_LEFT
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_MISSED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_STARTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CALL_TRIED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CIRCLE_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CIRCLE_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CLEARED_CHAT
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CONVERSATION_CREATED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.CONVERSATION_RENAMED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.DESCRIPTION_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.DESCRIPTION_SET
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.DUMMY
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.FEDERATED_USER_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.FEDERATED_USER_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.FILE_SHARED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GROUP_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GROUP_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GUESTS_ALLOWED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GUESTS_DISALLOWED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GUEST_MODERATOR_DEMOTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.GUEST_MODERATOR_PROMOTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LISTABLE_ALL
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LISTABLE_NONE
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LISTABLE_USERS
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LOBBY_NONE
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LOBBY_NON_MODERATORS
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.LOBBY_OPEN_TO_EVERYONE
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_DISABLED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_EDITED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_ENABLED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MATTERBRIDGE_CONFIG_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MESSAGE_DELETED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MESSAGE_EXPIRATION_DISABLED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MESSAGE_EXPIRATION_ENABLED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MESSAGE_PINNED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MESSAGE_UNPINNED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MODERATOR_DEMOTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.MODERATOR_PROMOTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.OBJECT_SHARED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PASSWORD_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PASSWORD_SET
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PHONE_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PHONE_REMOVED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.POLL_CLOSED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.POLL_VOTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PRESERVE_CONVERSATION
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.PRESERVE_CONVERSATION_OFF
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.REACTION
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.REACTION_DELETED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.REACTION_REVOKED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.READ_ONLY
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.READ_ONLY_OFF
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.RECORDING_FAILED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.RECORDING_STARTED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.RECORDING_STOPPED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.THREAD_CREATED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.THREAD_RENAMED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.UNKNOWN
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.USER_ADDED
+import com.nextcloud.talk.chat.data.model.ChatMessage.SystemMessageType.USER_REMOVED
 
 /*
 * see https://nextcloud-talk.readthedocs.io/en/latest/chat/#system-messages
 *
 */
 class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.SystemMessageType>() {
-    override fun getFromString(string: String): ChatMessage.SystemMessageType {
-        return when (string) {
+    @Suppress("Detekt.LongMethod")
+    override fun getFromString(string: String?): ChatMessage.SystemMessageType =
+        when (string) {
             "conversation_created" -> CONVERSATION_CREATED
             "conversation_renamed" -> CONVERSATION_RENAMED
             "description_set" -> DESCRIPTION_SET
@@ -93,6 +105,8 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             "listable_none" -> LISTABLE_NONE
             "listable_users" -> LISTABLE_USERS
             "listable_all" -> LISTABLE_ALL
+            "preserve_conversation" -> PRESERVE_CONVERSATION
+            "preserve_conversation_off" -> PRESERVE_CONVERSATION_OFF
             "lobby_none" -> LOBBY_NONE
             "lobby_non_moderators" -> LOBBY_NON_MODERATORS
             "lobby_timer_reached" -> LOBBY_OPEN_TO_EVERYONE
@@ -106,6 +120,8 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             "group_removed" -> GROUP_REMOVED
             "circle_added" -> CIRCLE_ADDED
             "circle_removed" -> CIRCLE_REMOVED
+            "owner_promoted" -> ChatMessage.SystemMessageType.OWNER_PROMOTED
+            "owner_demoted" -> ChatMessage.SystemMessageType.OWNER_DEMOTED
             "moderator_promoted" -> MODERATOR_PROMOTED
             "moderator_demoted" -> MODERATOR_DEMOTED
             "guest_moderator_promoted" -> GUEST_MODERATOR_PROMOTED
@@ -136,13 +152,23 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             "breakout_rooms_stopped" -> BREAKOUT_ROOMS_STOPPED
             "avatar_set" -> AVATAR_SET
             "avatar_removed" -> AVATAR_REMOVED
-            else -> DUMMY
+            "federated_user_added" -> FEDERATED_USER_ADDED
+            "federated_user_removed" -> FEDERATED_USER_REMOVED
+            "phone_added" -> PHONE_ADDED
+            "phone_removed" -> PHONE_REMOVED
+            "thread_created" -> THREAD_CREATED
+            "thread_renamed" -> THREAD_RENAMED
+            "message_pinned" -> MESSAGE_PINNED
+            "message_unpinned" -> MESSAGE_UNPINNED
+            null, "" -> DUMMY
+            // An identifier added by a newer server is still a system message. Its text is rendered from
+            // the server, so it must not fall back to DUMMY, which marks a regular chat message.
+            else -> UNKNOWN
         }
-    }
 
-    @Suppress("Detekt.ComplexMethod")
-    override fun convertToString(`object`: ChatMessage.SystemMessageType?): String {
-        return when (`object`) {
+    @Suppress("Detekt.ComplexMethod", "Detekt.LongMethod")
+    override fun convertToString(`object`: ChatMessage.SystemMessageType?): String =
+        when (`object`) {
             null -> ""
             CONVERSATION_CREATED -> "conversation_created"
             CONVERSATION_RENAMED -> "conversation_renamed"
@@ -160,6 +186,8 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             LISTABLE_NONE -> "listable_none"
             LISTABLE_USERS -> "listable_users"
             LISTABLE_ALL -> "listable_all"
+            PRESERVE_CONVERSATION -> "preserve_conversation"
+            PRESERVE_CONVERSATION_OFF -> "preserve_conversation_off"
             LOBBY_NONE -> "lobby_none"
             LOBBY_NON_MODERATORS -> "lobby_non_moderators"
             LOBBY_OPEN_TO_EVERYONE -> "lobby_timer_reached"
@@ -173,6 +201,8 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             GROUP_REMOVED -> "group_removed"
             CIRCLE_ADDED -> "circle_added"
             CIRCLE_REMOVED -> "circle_removed"
+            ChatMessage.SystemMessageType.OWNER_PROMOTED -> "owner_promoted"
+            ChatMessage.SystemMessageType.OWNER_DEMOTED -> "owner_demoted"
             MODERATOR_PROMOTED -> "moderator_promoted"
             MODERATOR_DEMOTED -> "moderator_demoted"
             GUEST_MODERATOR_PROMOTED -> "guest_moderator_promoted"
@@ -186,7 +216,7 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             MATTERBRIDGE_CONFIG_REMOVED -> "matterbridge_config_removed"
             MATTERBRIDGE_CONFIG_ENABLED -> "matterbridge_config_enabled"
             MATTERBRIDGE_CONFIG_DISABLED -> "matterbridge_config_disabled"
-            CLEARED_CHAT -> "clear_history"
+            CLEARED_CHAT -> "history_cleared"
             REACTION -> "reaction"
             REACTION_DELETED -> "reaction_deleted"
             REACTION_REVOKED -> "reaction_revoked"
@@ -203,7 +233,19 @@ class EnumSystemMessageTypeConverter : StringBasedTypeConverter<ChatMessage.Syst
             BREAKOUT_ROOMS_STOPPED -> "breakout_rooms_stopped"
             AVATAR_SET -> "avatar_set"
             AVATAR_REMOVED -> "avatar_removed"
+            FEDERATED_USER_ADDED -> "federated_user_added"
+            FEDERATED_USER_REMOVED -> "federated_user_removed"
+            PHONE_ADDED -> "phone_added"
+            PHONE_REMOVED -> "phone_removed"
+            THREAD_CREATED -> "thread_created"
+            THREAD_RENAMED -> "thread_renamed"
+            MESSAGE_PINNED -> "message_pinned"
+            MESSAGE_UNPINNED -> "message_unpinned"
+            UNKNOWN -> UNKNOWN_IDENTIFIER
             else -> ""
         }
+
+    companion object {
+        private const val UNKNOWN_IDENTIFIER = "unknown_system_message"
     }
 }

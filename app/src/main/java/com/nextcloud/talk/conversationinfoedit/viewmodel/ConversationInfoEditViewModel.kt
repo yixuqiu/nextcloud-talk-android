@@ -7,121 +7,240 @@
 package com.nextcloud.talk.conversationinfoedit.viewmodel
 
 import android.util.Log
-import androidx.lifecycle.LiveData
-import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
-import com.nextcloud.talk.chat.data.ChatRepository
+import androidx.lifecycle.viewModelScope
+import com.nextcloud.talk.R
 import com.nextcloud.talk.conversationinfoedit.data.ConversationInfoEditRepository
 import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.logger.Logger
 import com.nextcloud.talk.models.domain.ConversationModel
-import io.reactivex.Observer
-import io.reactivex.android.schedulers.AndroidSchedulers
-import io.reactivex.disposables.Disposable
-import io.reactivex.schedulers.Schedulers
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
+import com.nextcloud.talk.utils.ApiUtils
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
 
 class ConversationInfoEditViewModel @Inject constructor(
-    private val repository: ChatRepository,
-    private val conversationInfoEditRepository: ConversationInfoEditRepository
+    private val conversationInfoEditRepository: ConversationInfoEditRepository,
+    private val logger: Logger
 ) : ViewModel() {
 
-    sealed interface ViewState
+    private val _uiState = MutableStateFlow(ConversationInfoEditUiState())
+    val uiState: StateFlow<ConversationInfoEditUiState> = _uiState.asStateFlow()
 
-    object GetRoomStartState : ViewState
-    object GetRoomErrorState : ViewState
-    open class GetRoomSuccessState(val conversationModel: ConversationModel) : ViewState
+    private var roomToken: String = ""
+    private var initialized = false
+    private var currentUser: User? = null
 
-    object UploadAvatarErrorState : ViewState
-    open class UploadAvatarSuccessState(val conversationModel: ConversationModel) : ViewState
-
-    object DeleteAvatarErrorState : ViewState
-    open class DeleteAvatarSuccessState(val conversationModel: ConversationModel) : ViewState
-
-    private val _viewState: MutableLiveData<ViewState> = MutableLiveData(GetRoomStartState)
-    val viewState: LiveData<ViewState>
-        get() = _viewState
-
-    fun getRoom(user: User, token: String) {
-        _viewState.value = GetRoomStartState
-        repository.getRoom(user, token)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(GetRoomObserver())
+    fun initialize(user: User, token: String) {
+        if (initialized) return
+        initialized = true
+        currentUser = user
+        roomToken = token
+        loadRoom()
     }
 
-    fun uploadConversationAvatar(user: User, file: File, roomToken: String) {
-        conversationInfoEditRepository.uploadConversationAvatar(user, file, roomToken)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(UploadConversationAvatarObserver())
+    fun updateConversationName(name: String) {
+        _uiState.update { it.copy(conversationName = name) }
     }
 
-    fun deleteConversationAvatar(user: User, roomToken: String) {
-        conversationInfoEditRepository.deleteConversationAvatar(user, roomToken)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(DeleteConversationAvatarObserver())
+    fun updateConversationDescription(description: String) {
+        _uiState.update { it.copy(conversationDescription = description) }
     }
 
-    inner class GetRoomObserver : Observer<ConversationModel> {
-        override fun onSubscribe(d: Disposable) {
-            // unused atm
-        }
-
-        override fun onNext(conversationModel: ConversationModel) {
-            _viewState.value = GetRoomSuccessState(conversationModel)
-        }
-
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when fetching room")
-            _viewState.value = GetRoomErrorState
-        }
-
-        override fun onComplete() {
-            // unused atm
-        }
+    fun messageShown() {
+        _uiState.update { it.copy(userMessage = null) }
     }
 
-    inner class UploadConversationAvatarObserver : Observer<ConversationModel> {
-        override fun onSubscribe(d: Disposable) {
-            // unused atm
-        }
+    fun resetNavigateBack() {
+        _uiState.update { it.copy(navigateBack = false) }
+    }
 
-        override fun onNext(conversationModel: ConversationModel) {
-            _viewState.value = UploadAvatarSuccessState(conversationModel)
-        }
-
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when uploading avatar")
-            _viewState.value = UploadAvatarErrorState
-        }
-
-        override fun onComplete() {
-            // unused atm
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private fun loadRoom() {
+        _uiState.update { it.copy(isLoading = true) }
+        viewModelScope.launch {
+            try {
+                val user = checkNotNull(currentUser)
+                val roomData = conversationInfoEditRepository.getRoom(user, roomToken)
+                val conversationModel = roomData.conversation
+                val isEvent = conversationModel.objectType == ConversationEnums.ObjectType.EVENT
+                val userCredentials = ApiUtils.getCredentials(user.username, user.token) ?: ""
+                val (avatarUrlLight, avatarUrlDark) = buildAvatarUrls(user, conversationModel)
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        conversationName = conversationModel.displayName,
+                        conversationDescription = conversationModel.description
+                            .takeIf { desc -> desc.isNotEmpty() }.orEmpty(),
+                        conversation = conversationModel,
+                        conversationUser = user,
+                        avatarCredentials = userCredentials,
+                        avatarUrl = avatarUrlLight,
+                        avatarUrlDark = avatarUrlDark,
+                        nameEnabled = !isEvent,
+                        descriptionEnabled = roomData.descriptionEndpointAvailable && !isEvent,
+                        showSaveButton = !isEvent,
+                        avatarButtonsEnabled = true,
+                        descriptionMaxLength = roomData.descriptionMaxLength,
+                        isDescriptionEndpointAvailable = roomData.descriptionEndpointAvailable
+                    )
+                }
+            } catch (e: Exception) {
+                logger.e(TAG, "Error when fetching room", e)
+                _uiState.update { it.copy(isLoading = false, userMessage = R.string.nc_common_error_sorry) }
+            }
         }
     }
 
-    inner class DeleteConversationAvatarObserver : Observer<ConversationModel> {
-        override fun onSubscribe(d: Disposable) {
-            // unused atm
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun uploadAvatar(file: File) {
+        viewModelScope.launch {
+            try {
+                val user = currentUser ?: return@launch
+                val conversationModel = conversationInfoEditRepository.uploadConversationAvatar(user, roomToken, file)
+                val (avatarUrlLight, avatarUrlDark) = buildAvatarUrls(user, conversationModel)
+                _uiState.update {
+                    it.copy(
+                        conversation = conversationModel,
+                        avatarUrl = avatarUrlLight,
+                        avatarUrlDark = avatarUrlDark,
+                        avatarRefreshKey = it.avatarRefreshKey + 1,
+                        selectedEmoji = null,
+                        selectedEmojiColor = null
+                    )
+                }
+            } catch (e: Exception) {
+                logger.e(TAG, "Error when uploading avatar", e)
+                _uiState.update { it.copy(userMessage = R.string.nc_common_error_sorry) }
+            }
         }
+    }
 
-        override fun onNext(conversationModel: ConversationModel) {
-            _viewState.value = DeleteAvatarSuccessState(conversationModel)
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun deleteAvatar() {
+        viewModelScope.launch {
+            try {
+                val user = currentUser ?: return@launch
+                val conversationModel = conversationInfoEditRepository.deleteConversationAvatar(user, roomToken)
+                val (avatarUrlLight, avatarUrlDark) = buildAvatarUrls(user, conversationModel)
+                _uiState.update {
+                    it.copy(
+                        conversation = conversationModel,
+                        avatarUrl = avatarUrlLight,
+                        avatarUrlDark = avatarUrlDark,
+                        avatarRefreshKey = it.avatarRefreshKey + 1,
+                        selectedEmoji = null,
+                        selectedEmojiColor = null
+                    )
+                }
+            } catch (e: Exception) {
+                logger.e(TAG, "Error when deleting avatar", e)
+                _uiState.update { it.copy(userMessage = R.string.nc_common_error_sorry) }
+            }
         }
+    }
 
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when deleting avatar")
-            _viewState.value = DeleteAvatarErrorState
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun onEmojiAvatarConfirmed(emoji: String, color: Int?) {
+        viewModelScope.launch {
+            try {
+                val user = currentUser ?: return@launch
+                val colorHex = color?.let { "%06X".format(COLOR_HEX_MASK and it) }
+                val conversationModel = conversationInfoEditRepository.setConversationEmojiAvatar(
+                    user,
+                    roomToken,
+                    emoji,
+                    colorHex
+                )
+                val (avatarUrlLight, avatarUrlDark) = buildAvatarUrls(user, conversationModel)
+                _uiState.update {
+                    it.copy(
+                        conversation = conversationModel,
+                        avatarUrl = avatarUrlLight,
+                        avatarUrlDark = avatarUrlDark,
+                        avatarRefreshKey = it.avatarRefreshKey + 1,
+                        selectedEmoji = emoji,
+                        selectedEmojiColor = color
+                    )
+                }
+            } catch (e: Exception) {
+                logger.e(TAG, "Error when setting emoji avatar", e)
+                _uiState.update { it.copy(userMessage = R.string.nc_common_error_sorry) }
+            }
         }
+    }
 
-        override fun onComplete() {
-            // unused atm
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun renameRoom(user: User, token: String, newName: String) {
+        viewModelScope.launch {
+            try {
+                conversationInfoEditRepository.renameConversation(user, token, newName)
+                _uiState.update { it.copy(navigateBack = true) }
+            } catch (exception: Exception) {
+                Log.e(TAG, "Error while renaming conversation", exception)
+                _uiState.update { it.copy(userMessage = R.string.default_error_msg) }
+            }
+        }
+    }
+
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun saveNameAndDescription() {
+        val roomToken = _uiState.value.conversation?.token ?: return
+        val newRoomName = _uiState.value.conversationName
+        viewModelScope.launch {
+            try {
+                val user = currentUser ?: return@launch
+                conversationInfoEditRepository.renameConversation(user, roomToken, newRoomName)
+                if (_uiState.value.isDescriptionEndpointAvailable) {
+                    conversationInfoEditRepository.setConversationDescription(
+                        user,
+                        roomToken,
+                        _uiState.value.conversationDescription
+                    )
+                }
+                _uiState.update { it.copy(navigateBack = true) }
+            } catch (exception: Exception) {
+                Log.e(TAG, "Error while saving conversation", exception)
+                _uiState.update { it.copy(userMessage = R.string.default_error_msg) }
+            }
         }
     }
 
     companion object {
-        private val TAG = ConversationInfoEditViewModel::class.simpleName
+        private val TAG = ConversationInfoEditViewModel::class.java.simpleName
+        private const val COLOR_HEX_MASK = 0xFFFFFF
+    }
+
+    private fun buildAvatarUrls(user: User, conversationModel: ConversationModel): Pair<String, String> {
+        val avatarVersion = conversationModel.avatarVersion.takeIf { it.isNotEmpty() }
+        return when (conversationModel.type) {
+            ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL -> Pair(
+                ApiUtils.getUrlForAvatar(user.baseUrl, conversationModel.displayName, true, false),
+                ApiUtils.getUrlForAvatar(user.baseUrl, conversationModel.displayName, true, true)
+            )
+            ConversationEnums.ConversationType.ROOM_GROUP_CALL,
+            ConversationEnums.ConversationType.ROOM_PUBLIC_CALL -> Pair(
+                ApiUtils.getUrlForConversationAvatarWithVersion(
+                    version = 1,
+                    baseUrl = user.baseUrl,
+                    token = conversationModel.token,
+                    isDark = false,
+                    avatarVersion = avatarVersion
+                ),
+                ApiUtils.getUrlForConversationAvatarWithVersion(
+                    version = 1,
+                    baseUrl = user.baseUrl,
+                    token = conversationModel.token,
+                    isDark = true,
+                    avatarVersion = avatarVersion
+                )
+            )
+            else -> Pair("", "")
+        }
     }
 }

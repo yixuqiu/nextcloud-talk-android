@@ -10,9 +10,11 @@ import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.polls.adapters.PollCreateOptionItem
 import com.nextcloud.talk.polls.model.Poll
 import com.nextcloud.talk.polls.repositories.PollRepository
+import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -27,6 +29,8 @@ class PollCreateViewModel @Inject constructor(private val repository: PollReposi
     open class PollCreationState(val enableAddOptionButton: Boolean, val enableCreatePollButton: Boolean) : ViewState
     object PollCreatedState : ViewState
     object PollCreationFailedState : ViewState
+
+    private lateinit var currentUser: User
 
     private val _viewState: MutableLiveData<ViewState> = MutableLiveData(
         PollCreationState(
@@ -61,13 +65,13 @@ class PollCreateViewModel @Inject constructor(private val repository: PollReposi
         addOption()
     }
 
-    fun setData(roomToken: String) {
+    fun setData(user: User, roomToken: String) {
+        this.currentUser = user
         this.roomToken = roomToken
         updateCreationState()
     }
 
     override fun onCleared() {
-        super.onCleared()
         disposable?.dispose()
     }
 
@@ -102,7 +106,15 @@ class PollCreateViewModel @Inject constructor(private val repository: PollReposi
         if (_question.isNotEmpty() && _options.value?.isNotEmpty() == true) {
             _viewState.value = PollCreationState(enableAddOptionButton = false, enableCreatePollButton = false)
 
+            val credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token)
+            val url = ApiUtils.getUrlForPoll(
+                currentUser.baseUrl!!,
+                roomToken
+            )
+
             repository.createPoll(
+                credentials,
+                url,
                 roomToken,
                 _question,
                 _options.value!!.map { it.pollOption },
@@ -137,9 +149,7 @@ class PollCreateViewModel @Inject constructor(private val repository: PollReposi
         _viewState.value = PollCreationState(enableAddOptionButton(), enableCreatePollButton())
     }
 
-    private fun enableCreatePollButton(): Boolean {
-        return _question.isNotEmpty() && atLeastTwoOptionsAreFilled()
-    }
+    private fun enableCreatePollButton(): Boolean = _question.isNotEmpty() && atLeastTwoOptionsAreFilled()
 
     private fun atLeastTwoOptionsAreFilled(): Boolean {
         if (_options.value != null) {

@@ -6,10 +6,24 @@
  */
 package com.nextcloud.talk.models.json.status
 
+import android.content.Context
+import com.nextcloud.talk.R
+
 enum class StatusType(val string: String) {
     ONLINE("online"),
     OFFLINE("offline"),
     DND("dnd"),
     AWAY("away"),
-    INVISIBLE("invisible")
+    BUSY("busy"),
+    INVISIBLE("invisible");
+
+    companion object {
+        fun getDescription(value: String?, context: Context): String =
+            when (value) {
+                DND.string -> context.getString(R.string.dnd)
+                BUSY.string -> context.getString(R.string.busy)
+                AWAY.string -> context.getString(R.string.away)
+                else -> ""
+            }
+    }
 }

@@ -11,19 +11,23 @@ import android.util.Log;
 
 import com.nextcloud.talk.application.NextcloudTalkApplication;
 import com.nextcloud.talk.data.user.model.User;
-import com.nextcloud.talk.models.json.signaling.NCSignalingMessage;
-import com.nextcloud.talk.models.json.websocket.ActorWebSocketMessage;
-import com.nextcloud.talk.models.json.websocket.AuthParametersWebSocketMessage;
-import com.nextcloud.talk.models.json.websocket.AuthWebSocketMessage;
+import com.nextcloud.talk.models.json.signaling.NCSignalingMessageDto;
+import com.nextcloud.talk.models.json.signaling.settings.FederationSettingsDto;
+import com.nextcloud.talk.models.json.websocket.ActorWebSocketMessageDto;
+import com.nextcloud.talk.models.json.websocket.AuthParametersWebSocketMessageDto;
+import com.nextcloud.talk.models.json.websocket.AuthWebSocketMessageDto;
 import com.nextcloud.talk.models.json.websocket.CallOverallWebSocketMessage;
-import com.nextcloud.talk.models.json.websocket.CallWebSocketMessage;
+import com.nextcloud.talk.models.json.websocket.CallWebSocketMessageDto;
 import com.nextcloud.talk.models.json.websocket.HelloOverallWebSocketMessage;
-import com.nextcloud.talk.models.json.websocket.HelloWebSocketMessage;
+import com.nextcloud.talk.models.json.websocket.HelloWebSocketMessageDto;
+import com.nextcloud.talk.models.json.websocket.RoomFederationWebSocketMessageDto;
 import com.nextcloud.talk.models.json.websocket.RoomOverallWebSocketMessage;
-import com.nextcloud.talk.models.json.websocket.RoomWebSocketMessage;
+import com.nextcloud.talk.models.json.websocket.RoomWebSocketMessageDto;
 import com.nextcloud.talk.utils.ApiUtils;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import javax.inject.Inject;
@@ -73,17 +77,20 @@ public class WebSocketConnectionHelper {
 
         long userId = isGuest ? -1 : user.getId();
 
-        WebSocketInstance webSocketInstance = getWebSocketInstanceForUser(user);
-
-        if (userId != -1 && webSocketInstance != null && webSocketInstance.isConnected()) {
-            return webSocketInstance;
-        }
-
         if (userId == -1) {
             deleteExternalSignalingInstanceForUserEntity(userId);
+        } else {
+            WebSocketInstance webSocketInstance = getWebSocketInstanceForUser(user);
+            if (webSocketInstance != null) {
+                Log.d(TAG, "Reusing webSocketInstance " + webSocketInstance.hashCode() + " for userId " + userId);
+                webSocketInstance.refreshCallEncryptionPolicy(user);
+                return webSocketInstance;
+            }
         }
 
-        webSocketInstance = new WebSocketInstance(user, generatedURL, webSocketTicket);
+        Log.d(TAG, "Creating new webSocketInstance for userId " + userId);
+
+        WebSocketInstance webSocketInstance = new WebSocketInstance(user, generatedURL, webSocketTicket);
         webSocketInstanceMap.put(user.getId(), webSocketInstance);
         return webSocketInstance;
     }
@@ -98,53 +105,82 @@ public class WebSocketConnectionHelper {
         }
     }
 
-    HelloOverallWebSocketMessage getAssembledHelloModel(User user, String ticket) {
+    HelloOverallWebSocketMessage getAssembledHelloModel(User user, String ticket, boolean encryption) {
         int apiVersion = ApiUtils.getSignalingApiVersion(user, new int[]{ApiUtils.API_V3, 2, 1});
 
         HelloOverallWebSocketMessage helloOverallWebSocketMessage = new HelloOverallWebSocketMessage();
         helloOverallWebSocketMessage.setType("hello");
-        HelloWebSocketMessage helloWebSocketMessage = new HelloWebSocketMessage();
+        HelloWebSocketMessageDto helloWebSocketMessage = new HelloWebSocketMessageDto();
         helloWebSocketMessage.setVersion("1.0");
-        AuthWebSocketMessage authWebSocketMessage = new AuthWebSocketMessage();
+        AuthWebSocketMessageDto authWebSocketMessage = new AuthWebSocketMessageDto();
         authWebSocketMessage.setUrl(ApiUtils.getUrlForSignalingBackend(apiVersion, user.getBaseUrl()));
-        AuthParametersWebSocketMessage authParametersWebSocketMessage = new AuthParametersWebSocketMessage();
+        AuthParametersWebSocketMessageDto authParametersWebSocketMessage = new AuthParametersWebSocketMessageDto();
         authParametersWebSocketMessage.setTicket(ticket);
         if (!("?").equals(user.getUserId())) {
             authParametersWebSocketMessage.setUserid(user.getUserId());
         }
         authWebSocketMessage.setAuthParametersWebSocketMessage(authParametersWebSocketMessage);
         helloWebSocketMessage.setAuthWebSocketMessage(authWebSocketMessage);
+        helloWebSocketMessage.setFeatures(getClientFeatures(encryption));
+
         helloOverallWebSocketMessage.setHelloWebSocketMessage(helloWebSocketMessage);
         return helloOverallWebSocketMessage;
     }
 
-    HelloOverallWebSocketMessage getAssembledHelloModelForResume(String resumeId) {
+    HelloOverallWebSocketMessage getAssembledHelloModelForResume(String resumeId, boolean encryption) {
         HelloOverallWebSocketMessage helloOverallWebSocketMessage = new HelloOverallWebSocketMessage();
         helloOverallWebSocketMessage.setType("hello");
-        HelloWebSocketMessage helloWebSocketMessage = new HelloWebSocketMessage();
+        HelloWebSocketMessageDto helloWebSocketMessage = new HelloWebSocketMessageDto();
         helloWebSocketMessage.setVersion("1.0");
         helloWebSocketMessage.setResumeid(resumeId);
+        helloWebSocketMessage.setFeatures(getClientFeatures(encryption));
         helloOverallWebSocketMessage.setHelloWebSocketMessage(helloWebSocketMessage);
         return helloOverallWebSocketMessage;
     }
 
-    RoomOverallWebSocketMessage getAssembledJoinOrLeaveRoomModel(String roomId, String sessionId) {
+    /**
+     * The features announced to the signaling server; "encryption" tells it and the SIP bridge that this client
+     * end-to-end encrypts its streams.
+     */
+    private static List<String> getClientFeatures(boolean encryption) {
+        List<String> features = new ArrayList<>();
+        features.add("chat-relay");
+        if (encryption) {
+            features.add("encryption");
+        }
+        return features;
+    }
+
+    RoomOverallWebSocketMessage getAssembledJoinOrLeaveRoomModel(String roomId, String sessionId,
+                                                                 FederationSettingsDto federation) {
         RoomOverallWebSocketMessage roomOverallWebSocketMessage = new RoomOverallWebSocketMessage();
         roomOverallWebSocketMessage.setType("room");
-        RoomWebSocketMessage roomWebSocketMessage = new RoomWebSocketMessage();
+        RoomWebSocketMessageDto roomWebSocketMessage = new RoomWebSocketMessageDto();
         roomWebSocketMessage.setRoomId(roomId);
         roomWebSocketMessage.setSessionId(sessionId);
+        if (federation != null) {
+            String federationAuthToken = null;
+            if (federation.getHelloAuthParams() != null) {
+                federationAuthToken = federation.getHelloAuthParams().getToken();
+            }
+            RoomFederationWebSocketMessageDto roomFederationWebSocketMessage = new RoomFederationWebSocketMessageDto();
+            roomFederationWebSocketMessage.setSignaling(federation.getServer());
+            roomFederationWebSocketMessage.setUrl(federation.getNextcloudServer() + "/ocs/v2.php/apps/spreed/api/v3/signaling/backend");
+            roomFederationWebSocketMessage.setRoomid(federation.getRoomId());
+            roomFederationWebSocketMessage.setToken(federationAuthToken);
+            roomWebSocketMessage.setRoomFederationWebSocketMessage(roomFederationWebSocketMessage);
+        }
         roomOverallWebSocketMessage.setRoomWebSocketMessage(roomWebSocketMessage);
         return roomOverallWebSocketMessage;
     }
 
-    CallOverallWebSocketMessage getAssembledCallMessageModel(NCSignalingMessage ncSignalingMessage) {
+    CallOverallWebSocketMessage getAssembledCallMessageModel(NCSignalingMessageDto ncSignalingMessage) {
         CallOverallWebSocketMessage callOverallWebSocketMessage = new CallOverallWebSocketMessage();
         callOverallWebSocketMessage.setType("message");
 
-        CallWebSocketMessage callWebSocketMessage = new CallWebSocketMessage();
+        CallWebSocketMessageDto callWebSocketMessage = new CallWebSocketMessageDto();
 
-        ActorWebSocketMessage actorWebSocketMessage = new ActorWebSocketMessage();
+        ActorWebSocketMessageDto actorWebSocketMessage = new ActorWebSocketMessageDto();
         actorWebSocketMessage.setType("session");
         actorWebSocketMessage.setSessionId(ncSignalingMessage.getTo());
         callWebSocketMessage.setRecipientWebSocketMessage(actorWebSocketMessage);

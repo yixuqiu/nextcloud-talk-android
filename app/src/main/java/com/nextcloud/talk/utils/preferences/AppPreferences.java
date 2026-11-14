@@ -1,6 +1,7 @@
 /*
  * Nextcloud Talk - Android Client
  *
+ * SPDX-FileCopyrightText: 2024 Christian Reiner <foss@christian-reiner.info>
  * SPDX-FileCopyrightText: 2021 Andy Scherzinger <info@andy-scherzinger.de>
  * SPDX-FileCopyrightText: 2021 Tim Krüger <t@timkrueger.me>
  * SPDX-FileCopyrightText: 2017 Mario Danic <mario@lovelyhq.com>
@@ -9,6 +10,10 @@
 package com.nextcloud.talk.utils.preferences;
 
 import android.annotation.SuppressLint;
+
+import com.nextcloud.talk.ui.PlaybackSpeed;
+
+import kotlin.Pair;
 
 @SuppressLint("NonConstantResourceId")
 public interface AppPreferences {
@@ -63,17 +68,19 @@ public interface AppPreferences {
 
     void removePushToken();
 
+    boolean getUseUnifiedPush();
+
+    void setUseUnifiedPush(boolean value);
+
+    Long getUnifiedPushLatestEndpoint();
+
+    void setUnifiedPushLatestEndpoint(Long date);
+
     String getTemporaryClientCertAlias();
 
     void setTemporaryClientCertAlias(String alias);
 
     void removeTemporaryClientCertAlias();
-
-    boolean getPushToTalkIntroShown();
-
-    void setPushToTalkIntroShown(boolean shown);
-
-    void removePushToTalkIntroShown();
 
     String getCallRingtoneUri();
 
@@ -111,15 +118,33 @@ public interface AppPreferences {
 
     void removeScreenLock();
 
+    boolean getCallMicrophoneMuted();
+
+    void setCallMicrophoneMuted(boolean value);
+
+    String getCallViewMode();
+
+    void setCallViewMode(String value);
+
     boolean getIsKeyboardIncognito();
 
     void setIncognitoKeyboard(boolean value);
 
     void removeIncognitoKeyboard();
 
+    boolean getIsShowEcosystem();
+
+    void setShowEcosystem(boolean value);
+
+    void removeShowEcosystem();
+
     boolean isPhoneBookIntegrationEnabled();
 
     void setPhoneBookIntegration(boolean value);
+
+    boolean getCompressUploadImages();
+
+    void setCompressUploadImages(boolean value);
 
     // TODO Remove in 13.0.0
     void removeLinkPreviews();
@@ -130,6 +155,10 @@ public interface AppPreferences {
 
     void removeScreenLockTimeout();
 
+    long getLockTimestamp();
+
+    void setLockTimestamp(long timestamp);
+
     String getTheme();
 
     void setTheme(String newValue);
@@ -139,10 +168,6 @@ public interface AppPreferences {
     boolean isDbCypherToUpgrade();
 
     void setDbCypherToUpgrade(boolean value);
-
-    boolean getIsDbRoomMigrated();
-
-    void setIsDbRoomMigrated(boolean value);
 
     void setPhoneBookIntegrationLastRun(long currentTimeMillis);
 
@@ -160,9 +185,43 @@ public interface AppPreferences {
 
     String getSorting();
 
-    void saveWaveFormForFile(String filename, Float[] array);
+    void saveLastKnownId(String internalConversationId, int lastReadId);
 
-    Float[] getWaveFormFromFile(String filename);
+    int getLastKnownId(String internalConversationId, int defaultValue);
+
+    void deleteAllMessageQueuesFor(String userId);
+
+    void savePreferredPlayback(String userId, PlaybackSpeed speed);
+
+    PlaybackSpeed getPreferredPlayback(String userId);
+
+    void saveAudioFilePlaybackSpeed(String userId, PlaybackSpeed speed);
+
+    PlaybackSpeed getAudioFilePlaybackSpeed(String userId);
+
+    boolean getChatAudioShuffle();
+
+    void setChatAudioShuffle(boolean value);
+
+    String getChatAudioRepeatMode();
+
+    void setChatAudioRepeatMode(String value);
+
+    Long getNotificationWarningLastPostponedDate();
+
+    void setNotificationWarningLastPostponedDate(Long showNotificationWarning);
+
+    Boolean getShowRegularNotificationWarning();
+
+    void setShowRegularNotificationWarning(boolean value);
+
+    void setConversationListPositionAndOffset(int position, int offset);
+
+    Pair<Integer, Integer> getConversationListPositionAndOffset();
+
+    void setConversationListLastUserId(long userId);
+
+    long getConversationListLastUserId();
 
     void clear();
 }

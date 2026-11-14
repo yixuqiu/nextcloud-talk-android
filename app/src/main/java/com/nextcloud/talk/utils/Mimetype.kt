@@ -22,10 +22,12 @@ object Mimetype {
     const val IMAGE_JPEG = "image/jpeg"
     const val IMAGE_JPG = "image/jpg"
     const val IMAGE_GIF = "image/gif"
+    const val IMAGE_HEIC = "image/heic"
 
     const val VIDEO_MP4 = "video/mp4"
     const val VIDEO_QUICKTIME = "video/quicktime"
     const val VIDEO_OGG = "video/ogg"
+    const val VIDEO_WEBM = "video/webm"
 
     const val TEXT_MARKDOWN = "text/markdown"
     const val TEXT_PLAIN = "text/plain"

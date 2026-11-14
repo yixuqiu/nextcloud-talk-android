@@ -11,6 +11,7 @@ import android.content.Context
 import android.util.Log
 import androidx.work.Data
 import androidx.work.OneTimeWorkRequest
+import com.nextcloud.talk.utils.setExpeditedIfSupported
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
@@ -26,6 +27,10 @@ import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_INTERNAL_USER_ID
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_META_DATA
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.runBlocking
+import retrofit2.HttpException
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
@@ -46,21 +51,41 @@ class ShareOperationWorker(context: Context, workerParams: WorkerParameters) : W
 
     override fun doWork(): Result {
         for (filePath in filesArray) {
+            tryCreateShare(filePath)
+        }
+        roomToken?.let { _shareCompletedFlow.tryEmit(it) }
+        return Result.success()
+    }
+
+    @Suppress("TooGenericExceptionCaught")
+    private fun tryCreateShare(filePath: String?) {
+        for (attempt in 1..SHARE_MAX_ATTEMPTS) {
+            var succeeded = false
+            var shouldRetry = false
             ncApi.createRemoteShare(
                 credentials,
                 ApiUtils.getSharingUrl(baseUrl!!),
                 filePath,
                 roomToken,
                 "10",
-                metaData
+                metaData,
+                "", // no reference id
+                null // server default permissions
             )
                 .subscribeOn(Schedulers.io())
                 .blockingSubscribe(
-                    {},
-                    { e -> Log.w(TAG, "error while creating RemoteShare", e) }
+                    { succeeded = true },
+                    { e ->
+                        if (e is HttpException && e.code() == HTTP_NOT_FOUND && attempt < SHARE_MAX_ATTEMPTS) {
+                            shouldRetry = true
+                        } else {
+                            Log.w(TAG, "error while creating RemoteShare", e)
+                        }
+                    }
                 )
+            if (succeeded || !shouldRetry) return
+            Thread.sleep(SHARE_RETRY_DELAY_MS)
         }
-        return Result.success()
     }
 
     init {
@@ -71,13 +96,19 @@ class ShareOperationWorker(context: Context, workerParams: WorkerParameters) : W
         metaData = data.getString(KEY_META_DATA)
         data.getStringArray(KEY_FILE_PATHS)?.let { filesArray.addAll(it.toList()) }
 
-        val operationsUser = userManager.getUserWithId(userId).blockingGet()
+        val operationsUser = runBlocking { userManager.getUserWithId(userId) }!!
         baseUrl = operationsUser.baseUrl
         credentials = ApiUtils.getCredentials(operationsUser.username, operationsUser.token)!!
     }
 
     companion object {
         private val TAG = ShareOperationWorker::class.simpleName
+        private const val HTTP_NOT_FOUND = 404
+        private const val SHARE_MAX_ATTEMPTS = 4
+        private const val SHARE_RETRY_DELAY_MS = 2000L
+
+        private val _shareCompletedFlow: MutableSharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 1)
+        val shareCompletedFlow: SharedFlow<String> = _shareCompletedFlow
 
         fun shareFile(roomToken: String?, currentUser: User, remotePath: String, metaData: String?) {
             val paths: MutableList<String> = ArrayList()
@@ -91,6 +122,7 @@ class ShareOperationWorker(context: Context, workerParams: WorkerParameters) : W
                 .build()
             val shareWorker = OneTimeWorkRequest.Builder(ShareOperationWorker::class.java)
                 .setInputData(data)
+                .setExpeditedIfSupported()
                 .build()
             WorkManager.getInstance().enqueue(shareWorker)
         }

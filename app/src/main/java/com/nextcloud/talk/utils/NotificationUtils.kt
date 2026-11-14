@@ -7,41 +7,48 @@
  */
 package com.nextcloud.talk.utils
 
-import android.annotation.TargetApi
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.media.AudioAttributes
 import android.net.Uri
-import android.os.Build
 import android.service.notification.StatusBarNotification
 import android.text.TextUtils
 import android.util.Log
-import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.FileProvider
 import androidx.core.graphics.drawable.IconCompat
+import androidx.core.graphics.drawable.toBitmap
+import androidx.core.net.toUri
 import coil.executeBlocking
 import coil.imageLoader
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.transform.CircleCropTransformation
 import com.bluelinelabs.logansquare.LoganSquare
 import com.nextcloud.talk.BuildConfig
 import com.nextcloud.talk.R
+import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.models.RingtoneSettings
+import com.nextcloud.talk.ui.toDrawable
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.preferences.AppPreferences
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 
 @Suppress("TooManyFunctions")
 object NotificationUtils {
 
-    const val TAG = "NotificationUtils"
+    val TAG = NotificationUtils::class.java.simpleName
 
     enum class NotificationChannels {
         NOTIFICATION_CHANNEL_MESSAGES_V4,
-        NOTIFICATION_CHANNEL_CALLS_V4,
+        NOTIFICATION_CHANNEL_CALLS_V5,
+        NOTIFICATION_CHANNEL_CALLS_ONGOING_V1,
         NOTIFICATION_CHANNEL_UPLOADS
     }
 
@@ -57,7 +64,8 @@ object NotificationUtils {
     const val KEY_UPLOAD_GROUP = "com.nextcloud.talk.utils.KEY_UPLOAD_GROUP"
     const val GROUP_SUMMARY_NOTIFICATION_ID = -1
 
-    @TargetApi(Build.VERSION_CODES.O)
+    private const val BITMAP_COMPRESSION_QUALITY = 100
+
     private fun createNotificationChannel(
         context: Context,
         notificationChannel: Channel,
@@ -67,7 +75,6 @@ object NotificationUtils {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             notificationManager.getNotificationChannel(notificationChannel.id) == null
         ) {
             val importance = if (notificationChannel.isImportant) {
@@ -96,20 +103,39 @@ object NotificationUtils {
         val audioAttributes =
             AudioAttributes.Builder()
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST)
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
                 .build()
         val soundUri = getCallRingtoneUri(context, appPreferences)
 
         createNotificationChannel(
             context,
             Channel(
-                NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V4.name,
+                NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5.name,
                 context.resources.getString(R.string.nc_notification_channel_calls),
                 context.resources.getString(R.string.nc_notification_channel_calls_description),
                 true
             ),
             soundUri,
             audioAttributes
+        )
+    }
+
+    /**
+     * Separate from [NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5] (the incoming-ring channel,
+     * which must stay IMPORTANCE_HIGH) so the persistent "call in progress" foreground-service
+     * notification never heads-ups/peeks - it should only be visible by pulling down the status bar.
+     */
+    private fun createOngoingCallNotificationChannel(context: Context) {
+        createNotificationChannel(
+            context,
+            Channel(
+                NotificationChannels.NOTIFICATION_CHANNEL_CALLS_ONGOING_V1.name,
+                context.resources.getString(R.string.nc_notification_channel_calls_ongoing),
+                context.resources.getString(R.string.nc_notification_channel_calls_ongoing_description),
+                false
+            ),
+            null,
+            null
         )
     }
 
@@ -150,38 +176,32 @@ object NotificationUtils {
 
     fun registerNotificationChannels(context: Context, appPreferences: AppPreferences) {
         createCallsNotificationChannel(context, appPreferences)
+        createOngoingCallNotificationChannel(context)
         createMessagesNotificationChannel(context, appPreferences)
         createUploadsNotificationChannel(context)
     }
 
-    @TargetApi(Build.VERSION_CODES.O)
     fun removeOldNotificationChannels(context: Context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-            // Current version does not use notification channel groups - delete all groups
-            for (channelGroup in notificationManager.notificationChannelGroups) {
-                notificationManager.deleteNotificationChannelGroup(channelGroup.id)
-            }
+        // Current version does not use notification channel groups - delete all groups
+        for (channelGroup in notificationManager.notificationChannelGroups) {
+            notificationManager.deleteNotificationChannelGroup(channelGroup.id)
+        }
 
-            val channelsToKeep = NotificationChannels.values().map { it.name }
+        val channelsToKeep = NotificationChannels.values().map { it.name }
 
-            // Delete all notification channels created by previous versions
-            for (channel in notificationManager.notificationChannels) {
-                if (!channelsToKeep.contains(channel.id)) {
-                    notificationManager.deleteNotificationChannel(channel.id)
-                }
+        // Delete all notification channels created by previous versions
+        for (channel in notificationManager.notificationChannels) {
+            if (!channelsToKeep.contains(channel.id)) {
+                notificationManager.deleteNotificationChannel(channel.id)
             }
         }
     }
 
-    @TargetApi(Build.VERSION_CODES.O)
     private fun getNotificationChannel(context: Context, channelId: String): NotificationChannel? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            return notificationManager.getNotificationChannel(channelId)
-        }
-        return null
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        return notificationManager.getNotificationChannel(channelId)
     }
 
     private inline fun scanNotifications(
@@ -266,9 +286,9 @@ object NotificationUtils {
     }
 
     fun isCallsNotificationChannelEnabled(context: Context): Boolean {
-        val channel = getNotificationChannel(context, NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V4.name)
+        val channel = getNotificationChannel(context, NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5.name)
         if (channel != null) {
-            return isNotificationChannelEnabled(context, channel)
+            return isNotificationChannelEnabled(channel)
         }
         return false
     }
@@ -276,18 +296,13 @@ object NotificationUtils {
     fun isMessagesNotificationChannelEnabled(context: Context): Boolean {
         val channel = getNotificationChannel(context, NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name)
         if (channel != null) {
-            return isNotificationChannelEnabled(context, channel)
+            return isNotificationChannelEnabled(channel)
         }
         return false
     }
 
-    private fun isNotificationChannelEnabled(context: Context, channel: NotificationChannel): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            channel.importance != NotificationManager.IMPORTANCE_NONE
-        } else {
-            NotificationManagerCompat.from(context).areNotificationsEnabled()
-        }
-    }
+    private fun isNotificationChannelEnabled(channel: NotificationChannel): Boolean =
+        channel.importance != NotificationManager.IMPORTANCE_NONE
 
     private fun getRingtoneUri(
         context: Context,
@@ -295,76 +310,136 @@ object NotificationUtils {
         defaultRingtoneUri: String,
         channelId: String
     ): Uri? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = getNotificationChannel(context, channelId)
-            if (channel != null) {
-                return channel.sound
-            }
-            // Notification channel will not be available when starting the application for the first time.
-            // Ringtone uris are required to register the notification channels -> get uri from preferences.
+        val channel = getNotificationChannel(context, channelId)
+        if (channel != null) {
+            return channel.sound
         }
+        // Notification channel will not be available when starting the application for the first time.
+        // Ringtone uris are required to register the notification channels -> get uri from preferences.
+
         return if (TextUtils.isEmpty(ringtonePreferencesString)) {
-            Uri.parse(defaultRingtoneUri)
+            defaultRingtoneUri.toUri()
         } else {
             try {
                 val ringtoneSettings =
                     LoganSquare.parse(ringtonePreferencesString, RingtoneSettings::class.java)
                 ringtoneSettings.ringtoneUri
             } catch (exception: IOException) {
-                Uri.parse(defaultRingtoneUri)
+                NextcloudTalkApplication.sharedApplication?.logger?.w(
+                    TAG,
+                    "Failed to parse stored ringtone settings, falling back to default ringtone",
+                    exception
+                )
+                defaultRingtoneUri.toUri()
             }
         }
     }
 
-    fun getCallRingtoneUri(context: Context, appPreferences: AppPreferences): Uri? {
-        return getRingtoneUri(
+    fun getCallRingtoneUri(context: Context, appPreferences: AppPreferences): Uri? =
+        getRingtoneUri(
             context,
             appPreferences.callRingtoneUri,
             DEFAULT_CALL_RINGTONE_URI,
-            NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V4.name
+            NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5.name
         )
-    }
 
-    fun getMessageRingtoneUri(context: Context, appPreferences: AppPreferences): Uri? {
-        return getRingtoneUri(
+    fun getMessageRingtoneUri(context: Context, appPreferences: AppPreferences): Uri? =
+        getRingtoneUri(
             context,
             appPreferences.messageRingtoneUri,
             DEFAULT_MESSAGE_RINGTONE_URI,
             NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name
         )
+
+    fun loadAvatarSync(avatarUrl: String, context: Context, credentials: String? = null): IconCompat? {
+        val bitmap = loadAvatarBitmapSync(avatarUrl, context, credentials)
+        return bitmap?.let { IconCompat.createWithBitmap(it) }
     }
 
-    fun loadAvatarSync(avatarUrl: String, context: Context): IconCompat? {
-        var avatarIcon: IconCompat? = null
+    fun loadAvatarBitmapSync(
+        avatarUrl: String,
+        context: Context,
+        credentials: String? = null,
+        useCache: Boolean = true
+    ): Bitmap? {
+        var avatarBitmap: Bitmap? = null
 
-        val request = ImageRequest.Builder(context)
+        val requestBuilder = ImageRequest.Builder(context)
             .data(avatarUrl)
             .transformations(CircleCropTransformation())
             .placeholder(R.drawable.account_circle_96dp)
+            .listener(
+                onError = { _, result ->
+                    Log.w(TAG, "Can't load avatar for URL: $avatarUrl", result.throwable)
+                }
+            )
             .target(
                 onSuccess = { result ->
-                    val bitmap = (result as BitmapDrawable).bitmap
-                    avatarIcon = IconCompat.createWithBitmap(bitmap)
+                    avatarBitmap = (result as BitmapDrawable).bitmap
                 },
                 onError = { error ->
                     error?.let {
-                        val bitmap = (error as BitmapDrawable).bitmap
-                        avatarIcon = IconCompat.createWithBitmap(bitmap)
+                        avatarBitmap = (error as BitmapDrawable).bitmap
                     }
-                    Log.w(TAG, "Can't load avatar for URL: $avatarUrl")
                 }
             )
-            .build()
 
-        context.imageLoader.executeBlocking(request)
+        if (credentials != null) {
+            requestBuilder.addHeader("Authorization", credentials)
+        }
+        if (!useCache) {
+            requestBuilder
+                .memoryCachePolicy(CachePolicy.DISABLED)
+                .diskCachePolicy(CachePolicy.DISABLED)
+        }
 
-        return avatarIcon
+        context.imageLoader.executeBlocking(requestBuilder.build())
+
+        return avatarBitmap
     }
 
-    private data class Channel(
-        val id: String,
-        val name: String,
-        val description: String,
-        val isImportant: Boolean
-    )
+    /**
+     * The conversation-avatar endpoint answers a one-to-one room with the other participant of the
+     * requesting account, so the same URL returns a different image per account on the same server.
+     * Those avatars bypass the caches, which are keyed by URL only.
+     */
+    fun loadConversationAvatarBitmapSync(
+        baseUrl: String?,
+        roomToken: String,
+        credentials: String?,
+        context: Context,
+        isOneToOne: Boolean
+    ): Bitmap? {
+        val avatarUrl = ApiUtils.getUrlForConversationAvatar(ApiUtils.API_V1, baseUrl, roomToken)
+        return loadAvatarBitmapSync(avatarUrl, context, credentials, useCache = !isOneToOne)
+    }
+
+    fun saveBitmapToCache(context: Context, bitmap: Bitmap, fileName: String): Uri? {
+        val sharedAttachmentsDir = FileUtils.getSharedAttachmentsDirectory(context.cacheDir) ?: return null
+        val cacheFile = File(sharedAttachmentsDir, fileName)
+        return try {
+            FileOutputStream(cacheFile).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, BITMAP_COMPRESSION_QUALITY, out)
+            }
+            FileProvider.getUriForFile(context, BuildConfig.APPLICATION_ID, cacheFile)
+        } catch (e: IOException) {
+            Log.e(TAG, "Failed to save bitmap to cache", e)
+            null
+        }
+    }
+
+    /**
+     * Notification avatar for actors without an avatar on the server, drawn by the client as
+     * resolved by [CharacterAvatarUtils] instead of being requested.
+     */
+    fun characterAvatarBitmap(context: Context, avatar: ActorAvatar.Character): Bitmap =
+        avatar.toDrawable(context).toBitmap(CHARACTER_AVATAR_ICON_SIZE, CHARACTER_AVATAR_ICON_SIZE)
+
+    /**
+     * Pixel size the character avatar is rasterized to for notifications, which cannot scale a
+     * drawable themselves.
+     */
+    private const val CHARACTER_AVATAR_ICON_SIZE = 128
+
+    private data class Channel(val id: String, val name: String, val description: String, val isImportant: Boolean)
 }

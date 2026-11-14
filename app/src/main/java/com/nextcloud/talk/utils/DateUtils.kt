@@ -13,8 +13,12 @@ import android.icu.text.RelativeDateTimeFormatter.Direction
 import android.icu.text.RelativeDateTimeFormatter.RelativeUnit
 import com.nextcloud.talk.R
 import java.text.DateFormat
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
 import java.util.Calendar
 import java.util.Date
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class DateUtils(val context: Context) {
@@ -42,12 +46,50 @@ class DateUtils(val context: Context) {
         formatTime.timeZone = tz
     }
 
-    fun getLocalDateTimeStringFromTimestamp(timestampMilliseconds: Long): String {
-        return format.format(Date(timestampMilliseconds))
+    fun getLocalDateTimeStringFromTimestamp(timestampMilliseconds: Long): String =
+        format.format(Date(timestampMilliseconds))
+
+    fun getLocalTimeStringFromTimestamp(timestampSeconds: Long): String =
+        formatTime.format(Date(timestampSeconds * DateConstants.SECOND_DIVIDER))
+
+    fun isSameDate(date1: Date, date2: Date): Boolean {
+        val startDateCalendar = Calendar.getInstance().apply { time = date1 }
+        val endDateCalendar = Calendar.getInstance().apply { time = date2 }
+        val isSameDay = startDateCalendar.get(Calendar.YEAR) == endDateCalendar.get(Calendar.YEAR) &&
+            startDateCalendar.get(Calendar.DAY_OF_YEAR) == endDateCalendar.get(Calendar.DAY_OF_YEAR)
+        return isSameDay
     }
 
-    fun getLocalTimeStringFromTimestamp(timestampSeconds: Long): String {
-        return formatTime.format(Date(timestampSeconds * DateConstants.SECOND_DIVIDER))
+    fun getTimeDifferenceInSeconds(time2: Long, time1: Long): Long {
+        val difference = (time2 - time1)
+        return abs(difference)
+    }
+
+    fun getStringForMeetingStartDateTime(startDateTime: ZonedDateTime, currentTime: ZonedDateTime): String {
+        val isToday = startDateTime.toLocalDate().isEqual(currentTime.toLocalDate())
+        val isTomorrow = startDateTime.toLocalDate().isEqual(currentTime.toLocalDate().plusDays(1))
+        val locale = context.resources.configuration.locales[0]
+        val timeFormatter = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).withLocale(locale)
+        return when {
+            isToday -> String.format(
+                locale,
+                context.resources.getString(R.string.nc_today_meeting),
+                startDateTime.format(timeFormatter)
+            )
+
+            isTomorrow -> String.format(
+                locale,
+                context.resources.getString(R.string.nc_tomorrow_meeting),
+                startDateTime.format(timeFormatter)
+            )
+
+            else -> startDateTime.format(
+                DateTimeFormatter.ofLocalizedDateTime(
+                    FormatStyle.MEDIUM,
+                    FormatStyle.SHORT
+                ).withLocale(locale)
+            )
+        }
     }
 
     fun relativeStartTimeForLobby(timestampMilliseconds: Long, resources: Resources): String {

@@ -13,5 +13,11 @@ data class SearchMessageEntry(
     val title: String,
     val messageExcerpt: String,
     val conversationToken: String,
+    val threadId: String?,
     val messageId: String?
-)
+) {
+    fun isThreadReplyResult(): Boolean =
+        threadId != null &&
+            messageId != null &&
+            threadId != messageId
+}

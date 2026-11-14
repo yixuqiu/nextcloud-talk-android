@@ -34,6 +34,7 @@ import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
 import com.nextcloud.talk.models.json.search.ContactsByNumberOverall
+import com.nextcloud.talk.users.DefaultAccountProvider
 import com.nextcloud.talk.users.UserManager
 import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.ContactUtils
@@ -58,15 +59,20 @@ class ContactAddressBookWorker(val context: Context, workerParameters: WorkerPar
     lateinit var userManager: UserManager
 
     @Inject
+    lateinit var defaultAccountProvider: DefaultAccountProvider
+
+    @Inject
     lateinit var appPreferences: AppPreferences
 
     private lateinit var accountName: String
     private lateinit var accountType: String
 
+    @Suppress("LongMethod")
     override fun doWork(): Result {
         sharedApplication!!.componentApplication.inject(this)
 
-        val currentUser = userManager.currentUser.blockingGet()
+        // The phone book integration is not bound to an account, so it syncs for the default account.
+        val currentUser = defaultAccountProvider.getDefaultUserBlocking()
 
         accountName = context.getString(R.string.nc_app_product_name)
         accountType = BuildConfig.APPLICATION_ID
@@ -251,6 +257,7 @@ class ContactAddressBookWorker(val context: Context, workerParameters: WorkerPar
         }
     }
 
+    @Suppress("LongMethod")
     private fun createLinkedAccounts(contactsWithAssociatedPhoneNumbers: Map<String, String>?) {
         fun hasLinkedAccount(id: String): Boolean {
             var hasLinkedAccount = false
@@ -292,16 +299,74 @@ class ContactAddressBookWorker(val context: Context, workerParameters: WorkerPar
             return hasLinkedAccount
         }
 
+        fun createOps(
+            cloudId: String,
+            numbers: MutableList<String>,
+            displayName: String?
+        ): ArrayList<ContentProviderOperation> {
+            val ops = ArrayList<ContentProviderOperation>()
+            val rawContactsUri = ContactsContract.RawContacts.CONTENT_URI.buildUpon().build()
+            val dataUri = ContactsContract.Data.CONTENT_URI.buildUpon().build()
+
+            ops.add(
+                ContentProviderOperation
+                    .newInsert(rawContactsUri)
+                    .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, accountName)
+                    .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, accountType)
+                    .withValue(
+                        ContactsContract.RawContacts.AGGREGATION_MODE,
+                        ContactsContract.RawContacts.AGGREGATION_MODE_DEFAULT
+                    )
+                    .withValue(ContactsContract.RawContacts.SYNC2, cloudId)
+                    .build()
+            )
+            ops.add(
+                ContentProviderOperation
+                    .newInsert(dataUri)
+                    .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
+                    .withValue(
+                        ContactsContract.Data.MIMETYPE,
+                        ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE
+                    )
+                    .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, numbers[0])
+                    .build()
+            )
+            ops.add(
+                ContentProviderOperation
+                    .newInsert(dataUri)
+                    .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
+                    .withValue(
+                        ContactsContract.Data.MIMETYPE,
+                        ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE
+                    )
+                    .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, displayName)
+                    .build()
+            )
+            ops.add(
+                ContentProviderOperation
+                    .newInsert(dataUri)
+                    .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
+                    .withValue(
+                        ContactsContract.Data.MIMETYPE,
+                        "vnd.android.cursor.item/vnd.com.nextcloud.talk2.chat"
+                    )
+                    .withValue(ContactsContract.Data.DATA1, cloudId)
+                    .withValue(
+                        ContactsContract.Data.DATA2,
+                        String.format(
+                            context.resources.getString(R.string.nc_phone_book_integration_chat_via),
+                            accountName
+                        )
+                    )
+                    .build()
+            )
+            return ops
+        }
+
         fun createLinkedAccount(lookupKey: String, cloudId: String) {
             val lookupUri = Uri.withAppendedPath(ContactsContract.Contacts.CONTENT_LOOKUP_URI, lookupKey)
             val lookupContactUri = ContactsContract.Contacts.lookupContact(context.contentResolver, lookupUri)
-            val contactCursor = context.contentResolver.query(
-                lookupContactUri,
-                null,
-                null,
-                null,
-                null
-            )
+            val contactCursor = context.contentResolver.query(lookupContactUri, null, null, null, null)
 
             if (contactCursor != null) {
                 if (contactCursor.count > 0) {
@@ -319,71 +384,14 @@ class ContactAddressBookWorker(val context: Context, workerParameters: WorkerPar
                         return
                     }
 
-                    val ops = ArrayList<ContentProviderOperation>()
-                    val rawContactsUri = ContactsContract.RawContacts.CONTENT_URI.buildUpon().build()
-                    val dataUri = ContactsContract.Data.CONTENT_URI.buildUpon().build()
-
-                    ops.add(
-                        ContentProviderOperation
-                            .newInsert(rawContactsUri)
-                            .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, accountName)
-                            .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, accountType)
-                            .withValue(
-                                ContactsContract.RawContacts.AGGREGATION_MODE,
-                                ContactsContract.RawContacts.AGGREGATION_MODE_DEFAULT
-                            )
-                            .withValue(ContactsContract.RawContacts.SYNC2, cloudId)
-                            .build()
-                    )
-                    ops.add(
-                        ContentProviderOperation
-                            .newInsert(dataUri)
-                            .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                            .withValue(
-                                ContactsContract.Data.MIMETYPE,
-                                ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE
-                            )
-                            .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, numbers[0])
-                            .build()
-                    )
-                    ops.add(
-                        ContentProviderOperation
-                            .newInsert(dataUri)
-                            .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                            .withValue(
-                                ContactsContract.Data.MIMETYPE,
-                                ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE
-                            )
-                            .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, displayName)
-                            .build()
-                    )
-                    ops.add(
-                        ContentProviderOperation
-                            .newInsert(dataUri)
-                            .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                            .withValue(
-                                ContactsContract.Data.MIMETYPE,
-                                "vnd.android.cursor.item/vnd.com.nextcloud.talk2.chat"
-                            )
-                            .withValue(ContactsContract.Data.DATA1, cloudId)
-                            .withValue(
-                                ContactsContract.Data.DATA2,
-                                String.format(
-                                    context.resources.getString(
-                                        R.string.nc_phone_book_integration_chat_via
-                                    ),
-                                    accountName
-                                )
-                            )
-                            .build()
-                    )
+                    val ops = createOps(cloudId, numbers, displayName)
 
                     try {
                         context.contentResolver.applyBatch(ContactsContract.AUTHORITY, ops)
                     } catch (e: OperationApplicationException) {
-                        Log.e(javaClass.simpleName, "", e)
+                        Log.e(TAG, "", e)
                     } catch (e: RemoteException) {
-                        Log.e(javaClass.simpleName, "", e)
+                        Log.e(TAG, "", e)
                     }
 
                     Log.d(

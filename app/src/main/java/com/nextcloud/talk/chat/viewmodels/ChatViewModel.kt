@@ -1,100 +1,649 @@
 /*
  * Nextcloud Talk - Android Client
  *
+ * SPDX-FileCopyrightText: 2024 Christian Reiner <foss@christian-reiner.info>
  * SPDX-FileCopyrightText: 2023 Marcel Hibbe <dev@mhibbe.de>
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 package com.nextcloud.talk.chat.viewmodels
 
+import android.content.Context
+import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
+import androidx.annotation.StringRes
+import androidx.annotation.VisibleForTesting
+import androidx.core.net.toUri
+import androidx.core.content.FileProvider
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
-import com.nextcloud.talk.chat.data.ChatRepository
+import androidx.lifecycle.asFlow
+import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.google.gson.Gson
+import com.nextcloud.talk.BuildConfig
+import com.nextcloud.talk.R
+import com.nextcloud.talk.application.NextcloudTalkApplication
+import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
+import com.nextcloud.talk.chat.data.ChatMessageRepository
+import com.nextcloud.talk.chat.data.io.AudioFocusRequestManager
+import com.nextcloud.talk.chat.data.io.MediaRecorderManager
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.chat.data.model.FileParameters
+import com.nextcloud.talk.chat.data.network.ChatNetworkDataSource
+import com.nextcloud.talk.chat.runProviderCall
+import com.nextcloud.talk.chat.ui.model.ChatMessageUi
+import com.nextcloud.talk.chat.ui.model.MessageStatusIcon
+import com.nextcloud.talk.chat.ui.model.MessageTypeContent
+import com.nextcloud.talk.chat.ui.model.toUiModel
+import com.nextcloud.talk.chat.viewmodels.ChatViewModel.Companion.POST_UPLOAD_FETCH_RETRY_DELAYS_MS
+import com.nextcloud.talk.conversationlist.DirectShareHelper
+import com.nextcloud.talk.conversationlist.data.OfflineConversationsRepository
+import com.nextcloud.talk.conversationlist.data.network.OfflineFirstConversationsRepository
+import com.nextcloud.talk.conversationlist.viewmodels.ConversationsListViewModel.Companion.FOLLOWED_THREADS_EXIST
+import com.nextcloud.talk.dagger.modules.ApplicationScope
+import com.nextcloud.talk.data.database.mappers.toDomainModel
+import com.nextcloud.talk.data.database.model.ChatMessageEntity
+import com.nextcloud.talk.data.database.model.SendStatus
 import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.jobs.ReadMarkerSyncWorker
+import com.nextcloud.talk.jobs.SendMessageWorker
+import com.nextcloud.talk.jobs.ShareOperationWorker
+import com.nextcloud.talk.jobs.UploadAndShareFilesWorker
+import com.nextcloud.talk.logger.Logger
+import com.nextcloud.talk.mediaviewer.model.MediaViewerGroup
+import com.nextcloud.talk.mediaviewer.model.MediaViewerItem
+import com.nextcloud.talk.messagesearch.MessageSearchHelper
+import com.nextcloud.talk.models.MessageDraft
 import com.nextcloud.talk.models.domain.ConversationModel
-import com.nextcloud.talk.models.domain.ReactionAddedModel
-import com.nextcloud.talk.models.domain.ReactionDeletedModel
-import com.nextcloud.talk.models.json.capabilities.SpreedCapability
-import com.nextcloud.talk.models.json.chat.ChatMessage
+import com.nextcloud.talk.models.domain.SearchMessageEntry
+import com.nextcloud.talk.models.json.capabilities.SpreedCapabilityDto
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
 import com.nextcloud.talk.models.json.chat.ChatOverallSingleMessage
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
 import com.nextcloud.talk.models.json.conversations.RoomOverall
-import com.nextcloud.talk.models.json.conversations.RoomsOverall
-import com.nextcloud.talk.models.json.generic.GenericOverall
-import com.nextcloud.talk.models.json.reminder.Reminder
+import com.nextcloud.talk.models.json.opengraph.OpenGraphObjectDto
+import com.nextcloud.talk.models.json.reminder.ReminderDto
+import com.nextcloud.talk.models.json.threads.ThreadInfoDto
+import com.nextcloud.talk.models.json.upcomingEvents.UpcomingEventDto
+import com.nextcloud.talk.models.json.userAbsence.UserAbsenceDataDto
 import com.nextcloud.talk.repositories.reactions.ReactionsRepository
+import com.nextcloud.talk.repositories.unifiedsearch.UnifiedSearchRepository
+import com.nextcloud.talk.threadsoverview.data.ThreadsRepository
+import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil.hasSpreedFeatureCapability
+import com.nextcloud.talk.utils.CharacterAvatarUtils
+import com.nextcloud.talk.utils.ContactUtils
 import com.nextcloud.talk.utils.ConversationUtils
+import com.nextcloud.talk.utils.Mimetype
+import com.nextcloud.talk.utils.MimetypeUtils
+import com.nextcloud.talk.utils.ParticipantPermissions
+import com.nextcloud.talk.utils.SpreedFeatures
+import com.nextcloud.talk.utils.UploadSourceGrants
+import com.nextcloud.talk.utils.UserIdUtils
+import com.nextcloud.talk.utils.bundle.BundleKeys
+import com.nextcloud.talk.utils.isTransientFailure
+import com.nextcloud.talk.utils.message.SendMessageUtils
+import com.nextcloud.talk.utils.message.groupHashOf
+import com.nextcloud.talk.utils.preferences.AppPreferences
+import com.nextcloud.talk.utils.throttleLatest
+import com.nextcloud.talk.webrtc.WebSocketConnectionHelper
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
-import retrofit2.Response
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.shareIn
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import retrofit2.HttpException
+import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.UUID
 import javax.inject.Inject
 
+private const val FILE_PLACEHOLDER_MESSAGE = "{file}"
+private const val VCARD_MIMETYPE = "text/vcard"
+
+/**
+ * A file's referenceId marks it as part of an upload batch when it matches the cross-client
+ * format `sha256(uploadId)[0:60]-order`. Returns the shared hash prefix identifying the batch,
+ * or null if the id doesn't match (plain-text messages, or older/unrelated referenceIds).
+ */
+internal fun groupHash(referenceId: String?): String? = groupHashOf(referenceId)
+
+// A run of consecutive single-file share messages from the same author, uploaded together in one
+// batch - whether still uploading or already synced - either kept as-is (Single), merged into
+// one grouped "album" bubble (Group) or, once deleted, shown as its last message only (Collapsed) -
+// see ChatViewModel.combineFileShareGroups().
+internal sealed interface CombinedUnit {
+    val messages: List<ChatMessageUi>
+
+    data class Single(val message: ChatMessageUi) : CombinedUnit {
+        override val messages: List<ChatMessageUi> get() = listOf(message)
+    }
+
+    data class Group(override val messages: List<ChatMessageUi>) : CombinedUnit
+
+    data class Collapsed(override val messages: List<ChatMessageUi>) : CombinedUnit
+}
+
+/**
+ * A plain single-file share that can be combined with its neighbours - either already synced
+ * (Media) or still mid-upload (UploadingMedia), so a batch groups into one bubble immediately as
+ * it starts uploading rather than only once every file has synced. Mirrors web's
+ * isCombinableFileMessage() otherwise: excludes system/voice/geo/poll/deck/text messages (via the
+ * content-type check), deleted or failed messages, contact cards and audio files. Deleted messages
+ * are collapsed separately by combineFileShareGroups().
+ */
+internal fun isCombinableFileShare(message: ChatMessageUi): Boolean {
+    val mimeType = when (val content = message.content) {
+        is MessageTypeContent.Media -> content.mimeType
+        is MessageTypeContent.UploadingMedia -> content.mimeType.orEmpty()
+        else -> return false
+    }
+    return !message.isDeleted &&
+        message.statusIcon != MessageStatusIcon.FAILED &&
+        mimeType != VCARD_MIMETYPE &&
+        !MimetypeUtils.isAudioOnly(mimeType)
+}
+
+/**
+ * Two file shares belong to the same batch: both deleted or both not, same reply target and same
+ * upload-batch hash.
+ */
+internal fun canCombineFileShares(a: ChatMessageUi, b: ChatMessageUi): Boolean {
+    val hash = groupHash(a.referenceId)
+    return a.isDeleted == b.isDeleted &&
+        a.parentMessage?.id == b.parentMessage?.id &&
+        hash != null &&
+        hash == groupHash(b.referenceId)
+}
+
+/**
+ * Replaces consecutive file shares uploaded together in one batch with a single grouped unit.
+ * A message that isn't a plain file share, a reply to a different message, or part of another
+ * batch interrupts the run. A file share with a real caption (not just the "{file}" placeholder)
+ * ends its group - the caption belongs to the group's last item, same as web. Deleted file shares
+ * of the same batch collapse into their last deleted message.
+ */
+internal fun combineFileShareGroups(uiMessages: List<ChatMessageUi>): List<CombinedUnit> {
+    val result = mutableListOf<CombinedUnit>()
+    var pending = mutableListOf<ChatMessageUi>()
+
+    fun flush() {
+        when {
+            pending.isEmpty() -> {}
+            pending.size == 1 -> result.add(CombinedUnit.Single(pending[0]))
+            pending[0].isDeleted -> result.add(CombinedUnit.Collapsed(pending.toList()))
+            else -> result.add(CombinedUnit.Group(pending.toList()))
+        }
+        pending = mutableListOf()
+    }
+
+    for (message in uiMessages) {
+        if (!message.isDeleted && !isCombinableFileShare(message)) {
+            flush()
+            result.add(CombinedUnit.Single(message))
+            continue
+        }
+
+        if (pending.isNotEmpty() && !canCombineFileShares(pending.last(), message)) {
+            flush()
+        }
+
+        pending.add(message)
+
+        if (!message.isDeleted && message.plainMessage != FILE_PLACEHOLDER_MESSAGE) {
+            flush()
+        }
+    }
+    flush()
+
+    return result
+}
+
+/**
+ * Converts an already-synced media message into a media-viewer item, or null if it isn't one
+ * (text/system/voice/geo/poll/deck messages, a still-uploading placeholder, or a Media message
+ * whose file isn't actually an image/video - MessageTypeContent.Media covers every file
+ * attachment, not just image/video, e.g. a PDF grouped into the same upload batch as a photo).
+ * The viewer is only ever entered by tapping an already-synced image/video message, so anything
+ * else is never navigable to anyway.
+ */
+private fun ChatMessageUi.toMediaViewerItem(): MediaViewerItem? {
+    val content = (content as? MessageTypeContent.Media)
+        ?.takeIf { it.mimeType.startsWith(Mimetype.IMAGE_PREFIX) || it.mimeType.startsWith(Mimetype.VIDEO_PREFIX) }
+        ?: return null
+    val fileParameters = FileParameters(HashMap(messageParameters.mapValues { (_, params) -> HashMap(params) }))
+    return fileParameters.id?.let { fileId ->
+        MediaViewerItem(
+            messageId = id.toLong(),
+            referenceId = referenceId,
+            fileId = fileId,
+            fileName = fileParameters.name.orEmpty(),
+            mimeType = content.mimeType,
+            path = fileParameters.path.orEmpty(),
+            link = fileParameters.link.orEmpty(),
+            fileSize = fileParameters.size ?: 0L,
+            previewUrl = content.previewUrl,
+            actorDisplayName = actorDisplayName,
+            timestamp = timestamp
+        )
+    }
+}
+
 @Suppress("TooManyFunctions", "LongParameterList")
-class ChatViewModel @Inject constructor(
-    private val chatRepository: ChatRepository,
-    private val reactionsRepository: ReactionsRepository
-) : ViewModel() {
+class ChatViewModel @AssistedInject constructor(
+    private val logger: Logger,
+    // should be removed here. Use it via RetrofitChatNetwork
+    private val appPreferences: AppPreferences,
+    private val chatNetworkDataSource: ChatNetworkDataSource,
+    private val chatRepository: ChatMessageRepository,
+    private val threadsRepository: ThreadsRepository,
+    private val conversationRepository: OfflineConversationsRepository,
+    private val reactionsRepository: ReactionsRepository,
+    private val unifiedSearchRepository: UnifiedSearchRepository,
+    private val mediaRecorderManager: MediaRecorderManager,
+    private val audioFocusRequestManager: AudioFocusRequestManager,
+    private val userManager: UserManager,
+    @ApplicationScope private val appScope: CoroutineScope,
+    @Assisted private val initialUser: User,
+    @Assisted private val chatRoomToken: String,
+    @Assisted private val conversationThreadId: Long?
+) : ViewModel(),
+    DefaultLifecycleObserver {
 
-    object LifeCycleObserver : DefaultLifecycleObserver {
-        enum class LifeCycleFlag {
-            PAUSED,
-            RESUMED
+    @Inject
+    lateinit var arbitraryStorageManager: ArbitraryStorageManager
+
+    // Epoch seconds like ChatMessageEntity.timestamp; see failOrphanedPendingMessages.
+    private val createdAtSeconds = System.currentTimeMillis() / MILLIS_PER_SECOND
+
+    enum class LifeCycleFlag {
+        PAUSED,
+        RESUMED,
+        STOPPED
+    }
+
+    enum class ChatMode {
+        // Used to observe new messages. No search features are available in this mode
+        DEFAULT_MODE,
+
+        // Used when using the search feature inside the chat. Search controls are shown
+        SEARCH_MODE,
+
+        // Might be used when clicking a quoted message or choosing a message from the message search in conversation
+        // list (only if messages is not contained in latest chat block). Search controls are not shown
+        OLD_CHATBLOCK_MODE
+    }
+
+    enum class LoadMoreDirection {
+        OLDER,
+        NEWER
+    }
+
+    data class SearchUiState(
+        val query: String = "",
+        val results: List<SearchMessageEntry> = emptyList(),
+        val selectedIndex: Int = -1,
+        val isLoading: Boolean = false,
+        val hasMore: Boolean = false,
+        val error: Boolean = false
+    ) {
+        val selectedResult: SearchMessageEntry?
+            get() = results.getOrNull(selectedIndex)
+    }
+
+    /**
+     * The user of this chat with its latest stored values.
+     */
+    val currentUser: User
+        get() = currentUserFlow.value ?: initialUser
+
+    private var messageSearchHelper: MessageSearchHelper? = null
+    private var searchRequestJob: Job? = null
+    private val contextAnchorMessageId = MutableStateFlow<Long?>(null)
+
+    private val _chatMode = MutableStateFlow(ChatMode.DEFAULT_MODE)
+    val chatMode: StateFlow<ChatMode> = _chatMode
+
+    private val _searchUiState = MutableStateFlow(SearchUiState())
+    val searchUiState: StateFlow<SearchUiState> = _searchUiState
+
+    private val _noMoreSearchResults = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val noMoreSearchResults: MutableSharedFlow<Unit> = _noMoreSearchResults
+
+    private var localLastReadMessage: Int = 0
+
+    // Newest message list from the database, updated before the throttled rebuild of the UI items. It is the
+    // source of truth for the user's own sends (temporary copy with its send status, then the accepted
+    // message) when the read marker is decided, see updateRemoteLastReadMessageIfNeeded.
+    @Volatile
+    private var latestMessages: List<ChatMessage> = emptyList()
+
+    /**
+     * Set once the user marked a message as unread, so the automatic read marker handling keeps its
+     * hands off the conversation for the rest of this visit.
+     */
+    private var keepMarkedAsUnread: Boolean = false
+
+    private var showUnreadMessagesMarker: Boolean = true
+    private var isLoadMoreInProgress = false
+
+    lateinit var currentLifeCycleFlag: LifeCycleFlag
+    val disposableSet = mutableSetOf<Disposable>()
+
+    var messageDraft: MessageDraft = MessageDraft()
+    var hiddenUpcomingEvent: String? = null
+    lateinit var participantPermissions: ParticipantPermissions
+    private val _spreedCapabilities = MutableStateFlow<SpreedCapabilityDto?>(null)
+    val spreedCapabilities: StateFlow<SpreedCapabilityDto?> = _spreedCapabilities
+
+    private var lobbyPollingJob: Job? = null
+
+    // The message polling lives as long as this view model. A new screen after a configuration change calls
+    // initData() again, which must not start a second polling loop next to the running one.
+    private var messagePollingJob: Job? = null
+
+    private val _uploadProgressMap = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val uploadProgressMap: StateFlow<Map<String, Int>> = _uploadProgressMap
+
+    // Maps referenceId -> local device fileUri, kept around for a while after the upload finishes so the
+    // final message can show the file we already have on disk instead of a generic mimetype icon while it
+    // waits for the server-side preview to load for the first time.
+    private val _uploadedLocalPreviewMap = MutableStateFlow<Map<String, String>>(emptyMap())
+    val uploadedLocalPreviewMap: StateFlow<Map<String, String>> = _uploadedLocalPreviewMap
+
+    // Maps referenceId -> the upload's own WorkRequest id for cancellation support. Uploads within
+    // a conversation are now chained under one shared unique-work name (see
+    // UploadAndShareFilesWorker.upload()) so they run - and therefore get shared to the server - in
+    // send order, so cancellation has to target this specific request's id rather than that shared
+    // name, which would otherwise cancel every other queued upload too.
+    private val uploadReferenceToWorkId = mutableMapOf<String, UUID>()
+
+    // Maps referenceId -> the order files were sent in during this screen's session, assigned the
+    // moment each upload starts. Deliberately session-local and never persisted or sent anywhere:
+    // uploads within a conversation are chained sequentially (see UploadAndShareFilesWorker.upload),
+    // so a file can still be mid-upload when an earlier one in the same batch has already synced
+    // back with its real, server-assigned timestamp - which, purely because of how long the earlier
+    // upload took, can be later than the still-pending file's instantly-assigned placeholder
+    // timestamp, flipping their relative order in the timestamp-sorted list. Nudging the DB's own
+    // "timestamp"/"id" values to fix this would risk side effects on anything else that treats
+    // timestamp as the server's authoritative value (message expiry, etc.), so instead this is
+    // applied only as a display-order correction, on top of the otherwise-unmodified DB order.
+    private val referenceIdSendSequence = mutableMapOf<String, Long>()
+    private var nextSendSequenceValue = 0L
+
+    // Corrects the relative order of messages we know the local send sequence for (see
+    // referenceIdSendSequence above), leaving every other message's position untouched - so this
+    // never reorders anything relative to messages with no known hint (other users' messages,
+    // messages sent before this screen session, older history, ...), only fixes the relative order
+    // among messages from the SAME batch while some are still catching up on syncing. Applied the
+    // same way as applyMessageGrouping()/applySystemMessageGrouping() above it: in place, on the raw
+    // ChatMessage list, before it's mapped to ChatMessageUi.
+    @Suppress("Detekt.ReturnCount")
+    private fun reorderKnownSendSequence(messages: MutableList<ChatMessage>) {
+        if (referenceIdSendSequence.isEmpty()) return
+
+        val hintedIndices = messages.indices.filter { referenceIdSendSequence.containsKey(messages[it].referenceId) }
+        if (hintedIndices.size < 2) return
+
+        val hintedItems = hintedIndices.map { messages[it] }
+        val sortedItems = hintedItems.sortedBy { referenceIdSendSequence[it.referenceId] }
+        if (sortedItems == hintedItems) return
+
+        hintedIndices.forEachIndexed { position, index -> messages[index] = sortedItems[position] }
+    }
+
+    fun cancelUpload(referenceId: String) {
+        // uploadReferenceToWorkId is session-local (never persisted) - after an app restart it's
+        // empty even for an upload that's still stuck showing as "uploading" from a previous
+        // session, so a placeholder must still be removable even when there's no known work id to
+        // also cancel. Without this, cancel silently did nothing for any such placeholder, leaving
+        // the user with no way to clear a permanently stuck upload.
+        uploadReferenceToWorkId.remove(referenceId)?.let { workId ->
+            UploadAndShareFilesWorker.cancelUpload(referenceId, workId, _uploadedLocalPreviewMap.value[referenceId])
         }
-        lateinit var currentLifeCycleFlag: LifeCycleFlag
-        public val disposableSet = mutableSetOf<Disposable>()
+        viewModelScope.launch {
+            chatRepository.deleteTempMessageByReferenceId(referenceId)
+        }
+        _uploadProgressMap.update { it - referenceId }
+        _uploadedLocalPreviewMap.update { it - referenceId }
+    }
 
-        override fun onResume(owner: LifecycleOwner) {
-            super.onResume(owner)
-            currentLifeCycleFlag = LifeCycleFlag.RESUMED
+    fun getChatRepository(): ChatMessageRepository = chatRepository
+
+    /**
+     * The locally known media (image/video) groups for the media viewer, oldest first - every
+     * already-synced MessageItem/MediaGroupItem currently loaded in this chat. This is what lets
+     * the viewer navigate toward newer items instantly (bounded by what's already loaded here) and
+     * toward older items without a network round trip until this local knowledge is exhausted -
+     * see MediaViewerViewModel.loadOlderGroups(). The caller locates the tapped message's own
+     * position within the result.
+     */
+    fun mediaViewerSeed(): List<MediaViewerGroup> =
+        uiState.value.items.asReversed().mapNotNull { item ->
+            when (item) {
+                is ChatItem.MessageItem -> item.uiMessage.toMediaViewerItem()?.let { MediaViewerGroup(listOf(it)) }
+                is ChatItem.MediaGroupItem -> item.messages.mapNotNull { it.toMediaViewerItem() }
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { MediaViewerGroup(it) }
+                else -> null
+            }
         }
 
-        override fun onPause(owner: LifecycleOwner) {
-            super.onPause(owner)
-            currentLifeCycleFlag = LifeCycleFlag.PAUSED
-            disposableSet.forEach { disposable -> disposable.dispose() }
-            disposableSet.clear()
+    override fun onResume(owner: LifecycleOwner) {
+        super.onResume(owner)
+        val isReturningFromBackground = ::currentLifeCycleFlag.isInitialized
+        currentLifeCycleFlag = LifeCycleFlag.RESUMED
+        mediaRecorderManager.handleOnResume()
+        chatRepository.handleOnResume()
+        if (isReturningFromBackground) {
+            viewModelScope.launch {
+                chatRepository.fetchNewMessages()
+            }
         }
     }
 
-    private val _getFieldMapForChat: MutableLiveData<HashMap<String, Int>> = MutableLiveData()
-    val getFieldMapForChat: LiveData<HashMap<String, Int>>
-        get() = _getFieldMapForChat
+    override fun onPause(owner: LifecycleOwner) {
+        super.onPause(owner)
+        currentLifeCycleFlag = LifeCycleFlag.PAUSED
+        roomJoinClaimed = false
+        joinRoomJob?.cancel()
+        disposableSet.forEach { disposable -> disposable.dispose() }
+        disposableSet.clear()
+        searchRequestJob?.cancel()
+        messageSearchHelper?.cancelSearch()
+        mediaRecorderManager.handleOnPause()
+        chatRepository.handleOnPause()
+
+        saveMessageDraft()
+    }
+
+    override fun onStop(owner: LifecycleOwner) {
+        super.onStop(owner)
+        currentLifeCycleFlag = LifeCycleFlag.STOPPED
+        // A stopped chat keeps a voice recording running: it ends when the chat is left (onCleared) or by
+        // interruptAudioRecording, not when a rotation or another Talk screen like the media viewer covers the chat.
+        chatRepository.handleOnStop()
+    }
+
+    override fun onCleared() {
+        // the recording can not be shown again once the chat is gone
+        if (mediaRecorderManager.mediaRecorderState == MediaRecorderManager.MediaRecorderState.RECORDING) {
+            stopAndDiscardAudioRecording()
+        }
+    }
+
+    /**
+     * Ends a running recording although the chat was not left, e.g. because the app went to the background: a locked
+     * recording keeps what was captured so far and is shown as interrupted, a recording that was still held is
+     * discarded like on a cancelled touch.
+     */
+    fun interruptAudioRecording() {
+        if (mediaRecorderManager.mediaRecorderState != MediaRecorderManager.MediaRecorderState.RECORDING) {
+            return
+        }
+        if (_getVoiceRecordingLocked.value == true) {
+            stopAudioRecording()
+            _voiceRecordingInterrupted.value = true
+        } else {
+            stopAndDiscardAudioRecording()
+        }
+    }
+
+    fun onVoiceRecordingInterruptionShown() {
+        _voiceRecordingInterrupted.value = false
+    }
+
+    fun onSignalingChatMessageReceived(chatMessages: List<ChatMessageDto>) {
+        viewModelScope.launch {
+            chatRepository.onSignalingChatMessageReceived(chatMessages)
+        }
+    }
+
+    fun setUnreadMessagesMarker(shouldShow: Boolean) {
+        showUnreadMessagesMarker = shouldShow
+    }
+
+    private val _recordTouchObserver: MutableLiveData<Float> = MutableLiveData()
+    val recordTouchObserver: LiveData<Float>
+        get() = _recordTouchObserver
+
+    private val _getVoiceRecordingInProgress: MutableLiveData<Boolean> = MutableLiveData()
+    val getVoiceRecordingInProgress: LiveData<Boolean>
+        get() = _getVoiceRecordingInProgress
+
+    private val _voiceRecordingInterrupted: MutableLiveData<Boolean> = MutableLiveData(false)
+
+    /** True while the stop of a locked recording by leaving the app was not shown to the user yet. */
+    val voiceRecordingInterrupted: LiveData<Boolean>
+        get() = _voiceRecordingInterrupted
+
+    private val _getVoiceRecordingLocked: MutableLiveData<Boolean> = MutableLiveData()
+    val getVoiceRecordingLocked: LiveData<Boolean>
+        get() = _getVoiceRecordingLocked
+
+    private val _outOfOfficeViewState = MutableLiveData<OutOfOfficeUIState>(OutOfOfficeUIState.None)
+    val outOfOfficeViewState: LiveData<OutOfOfficeUIState>
+        get() = _outOfOfficeViewState
+
+    private val _upcomingEventViewState = MutableLiveData<UpcomingEventUIState>(UpcomingEventUIState.None)
+    val upcomingEventViewState: LiveData<UpcomingEventUIState>
+        get() = _upcomingEventViewState
+
+    private val _unbindRoomResult = MutableLiveData<UnbindRoomUiState>(UnbindRoomUiState.None)
+    val unbindRoomResult: LiveData<UnbindRoomUiState>
+        get() = _unbindRoomResult
+
+    private val _threadRetrieveState = MutableStateFlow<ThreadRetrieveUiState>(ThreadRetrieveUiState.None)
+    val threadRetrieveState: StateFlow<ThreadRetrieveUiState> = _threadRetrieveState
+
+    private val _reactionsSheetMessageId = MutableStateFlow<Long?>(null)
+    val reactionsSheetMessageId: StateFlow<Long?> = _reactionsSheetMessageId
+
+    fun showReactionsSheet(messageId: Long) {
+        _reactionsSheetMessageId.value = messageId
+    }
+
+    fun dismissReactionsSheet() {
+        _reactionsSheetMessageId.value = null
+    }
+
+    private val _profileSheetMessageId = MutableStateFlow<Long?>(null)
+    val profileSheetMessageId: StateFlow<Long?> = _profileSheetMessageId
+
+    fun showProfileSheet(messageId: Long) {
+        _profileSheetMessageId.value = messageId
+    }
+
+    fun dismissProfileSheet() {
+        _profileSheetMessageId.value = null
+    }
+
+    private val _messageActionsMessageId = MutableStateFlow<Long?>(null)
+    val messageActionsMessageId: StateFlow<Long?> = _messageActionsMessageId
+
+    fun showMessageActions(messageId: Long) {
+        _messageActionsMessageId.value = messageId
+    }
+
+    fun dismissMessageActions() {
+        _messageActionsMessageId.value = null
+    }
+
+    val getLastCommonReadFlow = chatRepository.lastCommonReadFlow
+
+    val isLoadingFlow = chatRepository.isLoadingFlow
+
     sealed interface ViewState
 
     object GetReminderStartState : ViewState
-    open class GetReminderExistState(val reminder: Reminder) : ViewState
+    open class GetReminderExistState(val reminder: ReminderDto) : ViewState
+    object GetReminderStateSet : ViewState
 
     private val _getReminderExistState: MutableLiveData<ViewState> = MutableLiveData(GetReminderStartState)
-
-    var isPausedDueToBecomingNoisy = false
-    var receiverRegistered = false
-    var receiverUnregistered = false
 
     val getReminderExistState: LiveData<ViewState>
         get() = _getReminderExistState
 
-    object NoteToSelfNotAvaliableState : ViewState
-    open class NoteToSelfAvaliableState(val roomToken: String) : ViewState
-
-    private val _getNoteToSelfAvaliability: MutableLiveData<ViewState> = MutableLiveData(NoteToSelfNotAvaliableState)
-    val getNoteToSelfAvaliability: LiveData<ViewState>
-        get() = _getNoteToSelfAvaliability
-
-    object GetRoomStartState : ViewState
-    object GetRoomErrorState : ViewState
-    open class GetRoomSuccessState(val conversationModel: ConversationModel) : ViewState
-
-    private val _getRoomViewState: MutableLiveData<ViewState> = MutableLiveData(GetRoomStartState)
-    val getRoomViewState: LiveData<ViewState>
-        get() = _getRoomViewState
-
     object GetCapabilitiesStartState : ViewState
     object GetCapabilitiesErrorState : ViewState
-    open class GetCapabilitiesSuccessState(val spreedCapabilities: SpreedCapability) : ViewState
+    open class GetCapabilitiesInitialLoadState(
+        val spreedCapabilities: SpreedCapabilityDto,
+        val conversationModel: ConversationModel
+    ) : ViewState
+    open class GetCapabilitiesUpdateState(val spreedCapabilities: SpreedCapabilityDto) : ViewState
 
     private val _getCapabilitiesViewState: MutableLiveData<ViewState> = MutableLiveData(GetCapabilitiesStartState)
     val getCapabilitiesViewState: LiveData<ViewState>
@@ -109,29 +658,28 @@ class ChatViewModel @Inject constructor(
         get() = _joinRoomViewState
 
     object LeaveRoomStartState : ViewState
-    class LeaveRoomSuccessState(val funToCallWhenLeaveSuccessful: (() -> Unit)?) : ViewState
+    object LeaveRoomSuccessState : ViewState
+
     private val _leaveRoomViewState: MutableLiveData<ViewState> = MutableLiveData(LeaveRoomStartState)
     val leaveRoomViewState: LiveData<ViewState>
         get() = _leaveRoomViewState
 
-    object SendChatMessageStartState : ViewState
-    class SendChatMessageSuccessState(val message: CharSequence) : ViewState
-    class SendChatMessageErrorState(val e: Throwable, val message: CharSequence) : ViewState
-    private val _sendChatMessageViewState: MutableLiveData<ViewState> = MutableLiveData(SendChatMessageStartState)
-    val sendChatMessageViewState: LiveData<ViewState>
-        get() = _sendChatMessageViewState
+    object ScheduledMessagesIdleState : ViewState
+    object ScheduledMessagesLoadingState : ViewState
+    data class ScheduledMessagesSuccessState(val messages: List<ChatMessage>) : ViewState
+    object ScheduledMessagesErrorState : ViewState
 
-    object PullChatMessageStartState : ViewState
-    class PullChatMessageSuccessState(val response: Response<*>, val lookIntoFuture: Boolean) : ViewState
-    object PullChatMessageErrorState : ViewState
-    object PullChatMessageCompleteState : ViewState
-    private val _pullChatMessageViewState: MutableLiveData<ViewState> = MutableLiveData(PullChatMessageStartState)
-    val pullChatMessageViewState: LiveData<ViewState>
-        get() = _pullChatMessageViewState
+    private val _scheduledMessagesViewState: MutableLiveData<ViewState> = MutableLiveData(ScheduledMessagesIdleState)
+    val scheduledMessagesViewState: LiveData<ViewState>
+        get() = _scheduledMessagesViewState
+
+    private val _scheduledMessagesCount = MutableLiveData<Int>()
+    val scheduledMessagesCount: LiveData<Int> = _scheduledMessagesCount
 
     object DeleteChatMessageStartState : ViewState
     class DeleteChatMessageSuccessState(val msg: ChatOverallSingleMessage) : ViewState
     object DeleteChatMessageErrorState : ViewState
+
     private val _deleteChatMessageViewState: MutableLiveData<ViewState> = MutableLiveData(DeleteChatMessageStartState)
     val deleteChatMessageViewState: LiveData<ViewState>
         get() = _deleteChatMessageViewState
@@ -144,57 +692,1117 @@ class ChatViewModel @Inject constructor(
     val createRoomViewState: LiveData<ViewState>
         get() = _createRoomViewState
 
-    object ReactionAddedStartState : ViewState
-    class ReactionAddedSuccessState(val reactionAddedModel: ReactionAddedModel) : ViewState
-    private val _reactionAddedViewState: MutableLiveData<ViewState> = MutableLiveData(ReactionAddedStartState)
-    val reactionAddedViewState: LiveData<ViewState>
-        get() = _reactionAddedViewState
+    enum class ReactionOperation { ADD, DELETE }
 
-    object ReactionDeletedStartState : ViewState
-    class ReactionDeletedSuccessState(val reactionDeletedModel: ReactionDeletedModel) : ViewState
-    private val _reactionDeletedViewState: MutableLiveData<ViewState> = MutableLiveData(ReactionDeletedStartState)
-    val reactionDeletedViewState: LiveData<ViewState>
-        get() = _reactionDeletedViewState
+    private val _reactionFailures = MutableSharedFlow<ReactionOperation>(extraBufferCapacity = 1)
+    val reactionFailures: SharedFlow<ReactionOperation> = _reactionFailures
 
-    object EditMessageStartState : ViewState
-    object EditMessageErrorState : ViewState
-    class EditMessageSuccessState(val messageEdited: ChatOverallSingleMessage) : ViewState
+    /** A reminder or a share to notes that the server refused, for the chat to report. */
+    private val _actionFailures = MutableSharedFlow<Int>(extraBufferCapacity = 1)
+    val actionFailures: SharedFlow<Int> = _actionFailures
 
-    private val _editMessageViewState: MutableLiveData<ViewState> = MutableLiveData(EditMessageStartState)
-    val editMessageViewState: LiveData<ViewState>
-        get() = _editMessageViewState
+    private val reactionLocks = mutableMapOf<Int, Mutex>()
 
-    fun refreshChatParams(pullChatMessagesFieldMap: HashMap<String, Int>, overrideRefresh: Boolean = false) {
-        if (pullChatMessagesFieldMap != _getFieldMapForChat.value || overrideRefresh) {
-            _getFieldMapForChat.postValue(pullChatMessagesFieldMap)
-            Log.d(TAG, "FieldMap Refreshed with $pullChatMessagesFieldMap vs ${_getFieldMapForChat.value}")
+    @Volatile private var firstUnreadMessageId: Int? = null
+
+    @Volatile private var oneOrMoreMessagesWereSent = false
+
+    private val expandedSystemMessageParents = MutableStateFlow<Set<Int>>(emptySet())
+
+    fun toggleSystemMessageCollapse(parentMessageId: Int) {
+        expandedSystemMessageParents.update { current ->
+            if (parentMessageId in current) current - parentMessageId else current + parentMessageId
         }
     }
 
-    fun getRoom(user: User, token: String) {
-        _getRoomViewState.value = GetRoomStartState
-        chatRepository.getRoom(user, token)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(GetRoomObserver())
+    // ------------------------------
+    // UI State. This should be the only UI state. Add more val here and update via copy whenever necessary.
+    // ------------------------------
+    data class ChatUiState(
+        val items: List<ChatItem> = emptyList(),
+        val isOneToOneConversation: Boolean = false,
+
+        // Adding the whole conversation is just an intermediate solution as it is used in the activity.
+        // For the future, only necessary vars from conversation should be in the ui state
+        val conversation: ConversationModel? = null,
+        val pinnedMessage: ChatMessage? = null,
+        val highlightedMessageId: Int? = null,
+        val highlightedSearchTerm: String? = null,
+        val highlightTriggerNonce: Long? = null,
+        val isInLobby: Boolean = false,
+        /**
+         * Set while the unread marker comes from the user marking a message as unread, so the chat does
+         * not scroll to a place they are already looking at.
+         */
+        val markedAsUnreadByUser: Boolean = false
+    )
+
+    private val _uiState = MutableStateFlow(ChatUiState())
+    val uiState: StateFlow<ChatUiState> = _uiState
+
+    // ------------------------------
+    // Current user flows
+    // ------------------------------
+    private val currentUserFlow: StateFlow<User?> =
+        userManager.userFlow(initialUser.id!!)
+            .stateIn(viewModelScope, SharingStarted.Eagerly, initialUser)
+
+    private val nonNullUserFlow = currentUserFlow.filterNotNull()
+
+    // Emits once per bound user, so updates of the user row (e.g. capabilities) don't restart dependent flows.
+    private val boundUserFlow = nonNullUserFlow.distinctUntilChangedBy { it.id }
+
+    // Unlike conversationFlow below, this is not deduped by lastReadMessage/lastCommonReadMessage,
+    // so it also reacts to fields those two ignore, e.g. hasCall (see [hasCall]).
+    private val rawConversationFlow: Flow<ConversationModel> =
+        boundUserFlow
+            .flatMapLatest { user ->
+                conversationRepository.observeConversation(requireNotNull(user.id), chatRoomToken)
+            }
+            .mapNotNull { result ->
+                when (result) {
+                    is OfflineFirstConversationsRepository.ConversationResult.Found ->
+                        result.conversation
+
+                    OfflineFirstConversationsRepository.ConversationResult.NotFound ->
+                        null
+                }
+            }
+
+    private val conversationFlow: Flow<ConversationModel> =
+        rawConversationFlow.distinctUntilChangedBy { it.lastReadMessage to it.lastCommonReadMessage }
+
+    private val conversationAndUserFlow =
+        combine(conversationFlow, nonNullUserFlow) { c, u -> c to u }
+            .shareIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(CONVERSATION_AND_USER_FLOW_SHARING_TIMEOUT_MS),
+                replay = 1
+            )
+
+    private val isChannelFlow: Flow<Boolean> =
+        combine(conversationAndUserFlow, spreedCapabilities) { (conversation, _), capabilities ->
+            ConversationUtils.isChannel(conversation, capabilities)
+        }.distinctUntilChanged()
+
+    // ------------------------------
+    // Messages
+    // ------------------------------
+    private fun Flow<List<ChatMessageEntity>>.mapToChatMessages(userId: String): Flow<List<ChatMessage>> =
+        map { entities ->
+            entities.map { entity ->
+                entity.toDomainModel().apply {
+                    avatarUrl = getAvatarUrl(this)
+                    incoming = actorId != userId
+                }
+            }
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val messagesFlow: Flow<List<ChatMessage>> =
+        conversationAndUserFlow
+            .flatMapLatest { (conversation, user) ->
+                combine(chatMode, contextAnchorMessageId) { mode, anchorMessageId ->
+                    mode to anchorMessageId
+                }
+                    .flatMapLatest { (mode, anchorMessageId) ->
+                        val messagesSource = if (mode == ChatMode.DEFAULT_MODE) {
+                            chatRepository.observeLatestMessages(conversation.internalId)
+                        } else if (anchorMessageId != null) {
+                            chatRepository.observeMessagesForAnchor(
+                                internalConversationId = conversation.internalId,
+                                anchorMessageId = anchorMessageId
+                            )
+                        } else {
+                            chatRepository.observeLatestMessages(conversation.internalId)
+                        }
+                        messagesSource
+                            .distinctUntilChanged()
+                            .mapToChatMessages(user.userId!!)
+                    }
+                    .combine(isChannelFlow) { messages, isChannel ->
+                        handleSystemMessages(messages, isChannel)
+                            .let(::handleThreadMessages)
+                    }
+            }
+            .distinctUntilChanged()
+
+    private val trackedParentIds = MutableStateFlow<Set<Long>>(emptySet())
+
+    private val parentMessagesFlow: Flow<Map<Long, ChatMessage>> =
+        trackedParentIds
+            .flatMapLatest { ids ->
+                if (ids.isEmpty()) {
+                    flowOf(emptyMap())
+                } else {
+                    chatRepository.observeParentMessages(ids.toList())
+                        .map { messages -> messages.associateBy { it.jsonMessageId.toLong() } }
+                }
+            }
+
+    // ------------------------------
+    // Last read message cache
+    // ------------------------------
+    private var lastReadMessage: Int = 0
+
+    private var roomJoinClaimed = false
+    private var isInitialLoadDelivered = false
+    private var leaveRoomJob: Job? = null
+    private var joinRoomJob: Job? = null
+
+    // ------------------------------
+    // Initialization
+    // ------------------------------
+    init {
+        observeConversation()
+        observeLobbyState()
+        observeLobbyPolling()
+        observeMessages()
+        observePinnedMessage()
+        observeRoomRefresh()
+        observeIncomingMessages()
+    }
+
+    fun enterSearchMode() {
+        _chatMode.value = ChatMode.SEARCH_MODE
+    }
+
+    fun switchToDefaultMode() {
+        resetUnreadMarkerCache()
+        contextAnchorMessageId.value = null
+        _chatMode.value = ChatMode.DEFAULT_MODE
+        _uiState.update { it.copy(highlightedMessageId = null, highlightedSearchTerm = null) }
+    }
+
+    fun exitSearchMode() {
+        searchRequestJob?.cancel()
+        messageSearchHelper?.cancelSearch()
+        _searchUiState.value = SearchUiState()
+        switchToDefaultMode()
+    }
+
+    fun onSearchQueryChanged(query: String) {
+        _searchUiState.update { it.copy(query = query, error = false) }
+
+        if (query.length < MIN_CHARS_FOR_SEARCH) {
+            searchRequestJob?.cancel()
+            messageSearchHelper?.cancelSearch()
+            _searchUiState.update {
+                it.copy(
+                    results = emptyList(),
+                    selectedIndex = -1,
+                    isLoading = false,
+                    hasMore = false,
+                    error = false
+                )
+            }
+            return
+        }
+
+        val helper = ensureSearchHelper()
+        if (helper == null) {
+            return
+        }
+        helper.cancelSearch()
+        searchRequestJob?.cancel()
+        _searchUiState.update { it.copy(isLoading = true, error = false) }
+
+        searchRequestJob = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    helper.startMessageSearch(query)
+                }
+                if (_searchUiState.value.query != query) {
+                    return@launch
+                }
+
+                val navigableResults = result.messages.filter { it.messageId?.toLongOrNull() != null }
+                _searchUiState.update {
+                    it.copy(
+                        results = navigableResults,
+                        selectedIndex = if (navigableResults.isNotEmpty()) 0 else -1,
+                        isLoading = false,
+                        hasMore = result.hasMore,
+                        error = false
+                    )
+                }
+                if (navigableResults.isNotEmpty()) {
+                    jumpToSearchSelection()
+                }
+            } catch (_: CancellationException) {
+                // Ignore cancellation; request was superseded by a newer one.
+            } catch (@Suppress("Detekt.TooGenericExceptionCaught") throwable: Throwable) {
+                logger.e(TAG, "Message search failed for query \"$query\"", throwable)
+                _searchUiState.update { state -> state.copy(isLoading = false, error = true) }
+            }
+        }
+    }
+
+    fun selectNextSearchResult() {
+        val state = _searchUiState.value
+        if (state.results.isEmpty()) return
+
+        if (state.selectedIndex >= state.results.lastIndex) {
+            if (state.hasMore) {
+                loadMoreSearchResultsAndSelectNext()
+            } else {
+                _noMoreSearchResults.tryEmit(Unit)
+            }
+            return
+        }
+
+        val nextIndex = (state.selectedIndex + 1).coerceAtMost(state.results.lastIndex)
+        _searchUiState.update { it.copy(selectedIndex = nextIndex) }
+        jumpToSearchSelection()
+    }
+
+    private fun loadMoreSearchResultsAndSelectNext() {
+        val helper = ensureSearchHelper()
+        val previousSize = _searchUiState.value.results.size
+
+        if (helper == null || _searchUiState.value.isLoading) {
+            return
+        }
+        val queryAtStart = _searchUiState.value.query
+
+        _searchUiState.update { it.copy(isLoading = true, error = false) }
+
+        searchRequestJob?.cancel()
+        searchRequestJob = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    helper.loadMore()
+                }
+                if (_searchUiState.value.query != queryAtStart) {
+                    return@launch
+                }
+
+                if (result == null) {
+                    _searchUiState.update { it.copy(isLoading = false) }
+                    return@launch
+                }
+
+                val navigableResults = result.messages.filter { it.messageId?.toLongOrNull() != null }
+                val nextIndex = if (navigableResults.size > previousSize) {
+                    previousSize
+                } else {
+                    _searchUiState.value.selectedIndex.coerceAtMost(navigableResults.lastIndex)
+                }
+                _searchUiState.update {
+                    it.copy(
+                        results = navigableResults,
+                        selectedIndex = nextIndex,
+                        isLoading = false,
+                        hasMore = result.hasMore,
+                        error = false
+                    )
+                }
+                if (navigableResults.isNotEmpty()) {
+                    jumpToSearchSelection()
+                }
+                if (navigableResults.size <= previousSize) {
+                    _noMoreSearchResults.tryEmit(Unit)
+                }
+            } catch (_: CancellationException) {
+                // Ignore cancellation; request was superseded.
+            } catch (@Suppress("Detekt.TooGenericExceptionCaught") throwable: Throwable) {
+                logger.e(TAG, "Failed to load more search results", throwable)
+                _searchUiState.update { state -> state.copy(isLoading = false, error = true) }
+            }
+        }
+    }
+
+    fun selectPreviousSearchResult() {
+        val state = _searchUiState.value
+        if (state.results.isEmpty()) return
+        val oldIndex = state.selectedIndex
+        val previousIndex = (state.selectedIndex - 1).coerceAtLeast(0)
+        if (previousIndex == oldIndex) {
+            _noMoreSearchResults.tryEmit(Unit)
+        }
+        _searchUiState.update { it.copy(selectedIndex = previousIndex) }
+        jumpToSearchSelection()
+    }
+
+    fun jumpToSearchSelection() {
+        val result = _searchUiState.value.selectedResult ?: return
+        val messageId = result.messageId?.toLongOrNull() ?: return
+        val targetThreadId = result.threadId?.toLongOrNull()?.takeIf { result.isThreadReplyResult() }
+
+        viewModelScope.launch {
+            val foundLocally = _uiState.value.items.any { it.containsMessage(messageId.toInt()) }
+            if (!foundLocally) {
+                loadMessageContextAndSwitchMode(
+                    messageId = messageId,
+                    targetThreadId = targetThreadId,
+                    mode = ChatMode.SEARCH_MODE
+                )
+            }
+            triggerMessageHighlight(messageId.toInt(), _searchUiState.value.query)
+        }
+    }
+
+    fun jumpToQuotedMessage(messageId: Long) {
+        viewModelScope.launch {
+            val foundLocally = _uiState.value.items.any { it.containsMessage(messageId.toInt()) }
+            if (!foundLocally) {
+                loadMessageContextAndSwitchMode(
+                    messageId = messageId,
+                    targetThreadId = conversationThreadId,
+                    mode = ChatMode.OLD_CHATBLOCK_MODE
+                )
+            }
+            triggerMessageHighlight(messageId.toInt())
+        }
+    }
+
+    suspend fun openMessageFromGlobalSearch(messageId: Long, threadId: Long?, searchQuery: String?) {
+        loadMessageContextAndSwitchMode(
+            messageId = messageId,
+            targetThreadId = threadId,
+            mode = ChatMode.OLD_CHATBLOCK_MODE
+        )
+        triggerMessageHighlight(messageId.toInt(), searchQuery)
+    }
+
+    private suspend fun loadMessageContextAndSwitchMode(messageId: Long, targetThreadId: Long?, mode: ChatMode) {
+        val result = chatRepository.loadMessageContext(
+            messageId = messageId,
+            limit = CONTEXT_MESSAGES_LIMIT,
+            threadId = targetThreadId
+        )
+
+        result.let {
+            resetUnreadMarkerCache()
+            contextAnchorMessageId.value = messageId
+            _chatMode.value = mode
+        }
+    }
+
+    private fun ensureSearchHelper(): MessageSearchHelper? {
+        val user = currentUserFlow.value
+        val helper = messageSearchHelper ?: user?.let {
+            MessageSearchHelper(
+                unifiedSearchRepository = unifiedSearchRepository,
+                currentUser = it,
+                fromRoom = chatRoomToken
+            )
+        }?.also { createdHelper ->
+            messageSearchHelper = createdHelper
+        }
+        return helper
+    }
+
+    private fun triggerMessageHighlight(messageId: Int, searchTerm: String? = null) {
+        _uiState.update { state ->
+            state.copy(
+                highlightedMessageId = messageId,
+                highlightedSearchTerm = searchTerm?.trim()?.takeIf { it.isNotEmpty() },
+                highlightTriggerNonce = System.nanoTime()
+            )
+        }
+    }
+
+    private fun resetUnreadMarkerCache() {
+        firstUnreadMessageId = null
+    }
+
+    // ------------------------------
+    // Observe conversation
+    // ------------------------------
+    private fun observeConversation() {
+        conversationFlow
+            .onEach { conversation ->
+                lastReadMessage = conversation.lastReadMessage
+
+                _uiState.update { current ->
+                    current.copy(
+                        conversation = conversation,
+                        isOneToOneConversation = !conversation.isOneToOneConversation()
+                    )
+                }
+            }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observeLobbyState() {
+        val conversationFromDb = boundUserFlow
+            .flatMapLatest { user ->
+                conversationRepository.observeConversation(requireNotNull(user.id), chatRoomToken)
+            }
+            .mapNotNull { result ->
+                (result as? OfflineFirstConversationsRepository.ConversationResult.Found)?.conversation
+            }
+
+        combine(conversationFromDb, _spreedCapabilities.filterNotNull()) { conversation, capabilities ->
+            val permissions = ParticipantPermissions(capabilities, conversation)
+            ConversationUtils.isLobbyViewApplicable(conversation, capabilities) &&
+                hasSpreedFeatureCapability(capabilities, SpreedFeatures.WEBINARY_LOBBY) &&
+                conversation.lobbyState == ConversationEnums.LobbyState.LOBBY_STATE_MODERATORS_ONLY &&
+                !permissions.canIgnoreLobby()
+        }
+            .onEach { isInLobby ->
+                _uiState.update { it.copy(isInLobby = isInLobby) }
+            }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observeLobbyPolling() {
+        uiState
+            .map { it.isInLobby }
+            .distinctUntilChanged()
+            .onEach { isInLobby ->
+                lobbyPollingJob?.cancel()
+                if (isInLobby) {
+                    lobbyPollingJob = viewModelScope.launch {
+                        while (true) {
+                            delay(LOBBY_POLLING_INTERVAL_MS)
+                            getRoom(chatRoomToken)
+                        }
+                    }
+                }
+            }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observePinnedMessage() {
+        boundUserFlow
+            .flatMapLatest { user ->
+                conversationRepository.observeConversation(requireNotNull(user.id), chatRoomToken)
+                    .mapNotNull { result ->
+                        (result as? OfflineFirstConversationsRepository.ConversationResult.Found)?.conversation
+                    }
+                    .distinctUntilChangedBy { it.lastPinnedId to it.hiddenPinnedId }
+                    .flatMapLatest { conversation ->
+                        val pinnedId = conversation.lastPinnedId
+                        if (pinnedId != null && pinnedId != 0L && pinnedId != conversation.hiddenPinnedId) {
+                            val bundle = Bundle().apply {
+                                putString(
+                                    BundleKeys.KEY_CHAT_URL,
+                                    ApiUtils.getUrlForChat(1, user.baseUrl, chatRoomToken)
+                                )
+                                putString(
+                                    BundleKeys.KEY_CREDENTIALS,
+                                    ApiUtils.getCredentials(user.username, user.token)
+                                )
+                                putString(BundleKeys.KEY_ROOM_TOKEN, chatRoomToken)
+                            }
+                            chatRepository.getMessage(pinnedId, bundle)
+                                .map { it as ChatMessage? }
+                                .catch { emit(null) }
+                        } else {
+                            flowOf(null)
+                        }
+                    }
+            }
+            .onEach { pinnedMessage ->
+                _uiState.update { it.copy(pinnedMessage = pinnedMessage) }
+            }
+            .catch { Log.e(TAG, "Error observing pinned message", it) }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observeRoomRefresh() {
+        chatRepository.roomRefreshFlow
+            .debounce(ROOM_REFRESH_DEBOUNCE_MS)
+            .onEach { getRoom(chatRoomToken) }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observeIncomingMessages() {
+        chatRepository.incomingMessageFlow
+            .onEach {
+                val (conversation, user) = conversationAndUserFlow.first()
+                val context = NextcloudTalkApplication.sharedApplication!!
+                val isOneToOne = conversation.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+                DirectShareHelper.reportIncomingMessage(
+                    context,
+                    user,
+                    conversation.token,
+                    conversation.displayName ?: conversation.token,
+                    isOneToOne
+                )
+            }
+            .launchIn(viewModelScope)
+    }
+
+    private data class CombinedInput(
+        val messages: List<ChatMessage>,
+        val lastCommonRead: Int,
+        val parentMap: Map<Long, ChatMessage>,
+        val conversationLastRead: Int,
+        val expandedParents: Set<Int> = emptySet(),
+        val conversation: ConversationModel? = null,
+        val capabilities: SpreedCapabilityDto? = null
+    )
+
+    // The conversation's own hasCall is the server's authoritative answer to "is a call currently
+    // active" — unlike a scan over whatever chat message window happens to be loaded (which used to
+    // make the call-started banner reappear for calls that had long since ended, since a loaded
+    // window's contents don't necessarily reflect what's actually happening right now).
+    val hasCall: Flow<Boolean> = rawConversationFlow.map { it.hasCall }.distinctUntilChanged()
+
+    private val _callEndedSystemMessage = MutableSharedFlow<ChatMessage.SystemMessageType>(extraBufferCapacity = 1)
+    val callEndedSystemMessage: SharedFlow<ChatMessage.SystemMessageType>
+        get() = _callEndedSystemMessage
+
+    private data class ProcessedMessages(val items: List<ChatItem>, val missingParentIds: List<Long>)
+
+    private fun observeMessages() {
+        // conversationFlow provides the user's own lastReadMessage for the unread marker.
+        // getLastCommonReadFlow provides the "last read by all" value for read-receipt checkmarks.
+        // These are two different concepts that must not be conflated.
+        combine(
+            // the raw message list is tapped before the throttle and the UI mapping below: the read marker
+            // decisions must not depend on how far the rendered items lag behind the database
+            messagesFlow.onEach(::onMessagesChanged),
+            getLastCommonReadFlow.onStart { emit(0) },
+            parentMessagesFlow,
+            combine(conversationFlow, _spreedCapabilities) { conv, caps -> conv to caps },
+            expandedSystemMessageParents
+        ) { messages, lastCommonRead, parentMap, convAndCaps, expandedParents ->
+            val (conversation, capabilities) = convAndCaps
+            CombinedInput(
+                messages,
+                maxOf(lastCommonRead, conversation.lastCommonReadMessage),
+                parentMap,
+                conversation.lastReadMessage,
+                expandedParents,
+                conversation,
+                capabilities
+            )
+        }
+            .throttleLatest(MESSAGES_REBUILD_WINDOW_MS)
+            .map { input ->
+                val (
+                    rawMessages,
+                    lastCommonRead,
+                    parentMap,
+                    conversationLastRead,
+                    expandedParents,
+                    conversation,
+                    capabilities
+                ) = input
+                // Mutable so reorderKnownSendSequence() can correct send order in place, the same
+                // way applyMessageGrouping()/applySystemMessageGrouping() annotate grouping in place
+                // - all three run before mapping to ChatMessageUi below.
+                val messages = rawMessages.toMutableList()
+                val messageMap: Map<Long, ChatMessage> = messages.associateBy { it.jsonMessageId.toLong() }
+                val combinedMap: Map<Long, ChatMessage> = messageMap + parentMap
+
+                val parentIds: List<Long> = messages.mapNotNull { it.parentMessageId }
+                val missingParentIds: List<Long> =
+                    parentIds.filterNot { parentId -> combinedMap.containsKey(parentId) }
+                        .distinct()
+
+                val isClassified = conversation != null && ConversationUtils.isClassified(conversation, capabilities)
+                val user = currentUserFlow.value
+                applyMessageGrouping(messages)
+                applySystemMessageGrouping(messages)
+                reorderKnownSendSequence(messages)
+                val uiMessages = messages.map { message ->
+                    val parent: ChatMessage? = combinedMap[message.parentMessageId]
+                    message.toUiModel(
+                        user = user ?: currentUser,
+                        chatMessage = message,
+                        lastCommonReadMessageId = lastCommonRead,
+                        parentMessage = parent,
+                        isClassified = isClassified
+                    )
+                }
+
+                val items = buildChatItems(uiMessages, conversationLastRead, expandedParents)
+                ProcessedMessages(items = items, missingParentIds = missingParentIds)
+            }
+            .flowOn(Dispatchers.Default)
+            .onEach { (items, missingParentIds) ->
+                if (missingParentIds.isNotEmpty()) {
+                    trackedParentIds.update { it + missingParentIds }
+                    viewModelScope.launch {
+                        val user = currentUserFlow.value ?: return@launch
+                        chatRepository.fetchMissingParents(
+                            "${user.id}@$chatRoomToken",
+                            missingParentIds
+                        )
+                    }
+                }
+
+                _uiState.update { current ->
+                    current.copy(items = items)
+                }
+            }
+            .launchIn(viewModelScope)
+    }
+
+    // ------------------------------
+    // Build chat items (pure)
+    // ------------------------------
+    @Suppress("CyclomaticComplexMethod")
+    private fun buildChatItems(
+        uiMessages: List<ChatMessageUi>,
+        lastReadMessage: Int,
+        expandedParents: Set<Int> = emptySet()
+    ): List<ChatItem> {
+        var lastDate: LocalDate? = null
+        var lastExpandableParentId: Int? = null
+
+        Log.d(TAG, "buildChatItems...................")
+
+        return buildList {
+            if (firstUnreadMessageId == null && lastReadMessage > 0) {
+                firstUnreadMessageId = findFirstUnreadMessageId(uiMessages, lastReadMessage)
+                Log.d(TAG, "reversedMessages.size = ${uiMessages.size}")
+                Log.d(TAG, "firstUnreadMessageId = $firstUnreadMessageId")
+                Log.d(TAG, "conversation.lastReadMessage = $lastReadMessage")
+            }
+
+            for (unit in combineFileShareGroups(uiMessages)) {
+                val messages = unit.messages
+                // The representative stands in for the whole unit for date/unread-marker purposes -
+                // for a group this is always its last (newest) message. Expandable system-message
+                // collapsing never applies to a group: isCombinableFileShare() excludes system
+                // messages entirely, so system-message-only checks are skipped for groups below.
+                val representative = messages.last()
+
+                if (unit is CombinedUnit.Single && representative.isExpandableParent) {
+                    lastExpandableParentId = representative.id
+                }
+
+                if (unit is CombinedUnit.Single &&
+                    representative.isHiddenByCollapse &&
+                    lastExpandableParentId !in expandedParents
+                ) {
+                    continue
+                }
+
+                val date = representative.date
+
+                if (date != lastDate) {
+                    add(ChatItem.DateHeaderItem(date))
+                    lastDate = date
+                }
+
+                if (!oneOrMoreMessagesWereSent && messages.any { it.id == firstUnreadMessageId }) {
+                    add(ChatItem.UnreadMessagesMarkerItem(date))
+                }
+
+                when (unit) {
+                    is CombinedUnit.Single -> {
+                        val adjustedMessage = if (representative.isExpandableParent) {
+                            representative.copy(isExpanded = representative.id in expandedParents)
+                        } else {
+                            representative
+                        }
+                        add(ChatItem.MessageItem(adjustedMessage))
+                    }
+                    is CombinedUnit.Group -> add(ChatItem.MediaGroupItem(messages))
+                    is CombinedUnit.Collapsed -> add(
+                        ChatItem.MessageItem(representative, collapsedMessageIds = messages.dropLast(1).map { it.id })
+                    )
+                }
+            }
+        }.asReversed()
+    }
+
+    private fun applyMessageGrouping(messages: List<ChatMessage>) {
+        messages.forEachIndexed { index, message ->
+            message.isGrouped = index > 0 && shouldGroupMessage(message, messages[index - 1])
+            message.isGroupedWithNext = index < messages.size - 1 && shouldGroupMessage(messages[index + 1], message)
+        }
+    }
+
+    private fun applySystemMessageGrouping(messages: List<ChatMessage>) {
+        messages.forEach { message ->
+            message.expandableParent = false
+            message.lastItemOfExpandableGroup = 0
+            message.expandableChildrenAmount = 0
+            message.hiddenByCollapse = false
+        }
+
+        var i = 0
+        while (i < messages.size) {
+            val msg = messages[i]
+            if (!msg.isSystemMessage) {
+                i++
+                continue
+            }
+            var runEnd = i
+            while (runEnd + 1 < messages.size) {
+                val next = messages[runEnd + 1]
+                if (next.isSystemMessage &&
+                    next.systemMessageType == msg.systemMessageType &&
+                    isSameDayMessages(messages[runEnd], next)
+                ) {
+                    runEnd++
+                } else {
+                    break
+                }
+            }
+            if (runEnd > i) {
+                val lastChildId = messages[runEnd].jsonMessageId
+                msg.expandableParent = true
+                msg.lastItemOfExpandableGroup = lastChildId
+                msg.expandableChildrenAmount = runEnd - i
+                for (j in i + 1..runEnd) {
+                    messages[j].lastItemOfExpandableGroup = lastChildId
+                }
+            }
+            i = runEnd + 1
+        }
+
+        messages.forEach { message ->
+            if (isChildOfExpandableGroup(message)) {
+                message.hiddenByCollapse = true
+            }
+        }
+    }
+
+    private fun isChildOfExpandableGroup(message: ChatMessage): Boolean =
+        message.isSystemMessage && !message.expandableParent && message.lastItemOfExpandableGroup != 0
+
+    private fun isSameDayMessages(message1: ChatMessage, message2: ChatMessage): Boolean {
+        val date1 = Instant.ofEpochMilli(message1.timestamp * TIMESTAMP_TO_MILLIS)
+            .atZone(ZoneId.systemDefault()).toLocalDate()
+        val date2 = Instant.ofEpochMilli(message2.timestamp * TIMESTAMP_TO_MILLIS)
+            .atZone(ZoneId.systemDefault()).toLocalDate()
+        return date1 == date2
+    }
+
+    private fun shouldGroupMessage(current: ChatMessage, previous: ChatMessage): Boolean {
+        val sameMessageKind = current.isSystemMessage == previous.isSystemMessage
+        val notUnclassifiedBot = current.actorType != "bots" || current.actorId == "changelog"
+        val sameActor = current.isSystemMessage ||
+            (current.actorType == previous.actorType && current.actorId == previous.actorId)
+        val currentDate = Instant.ofEpochMilli(current.timestamp * TIMESTAMP_TO_MILLIS)
+            .atZone(ZoneId.systemDefault()).toLocalDate()
+        val previousDate = Instant.ofEpochMilli(previous.timestamp * TIMESTAMP_TO_MILLIS)
+            .atZone(ZoneId.systemDefault()).toLocalDate()
+        val timeDifference = kotlin.math.abs(current.timestamp - previous.timestamp)
+        val neitherEdited = (current.lastEditTimestamp ?: 0L) == 0L || (previous.lastEditTimestamp ?: 0L) == 0L
+
+        return sameMessageKind &&
+            notUnclassifiedBot &&
+            sameActor &&
+            currentDate == previousDate &&
+            current.actorId == previous.actorId &&
+            timeDifference <= GROUPING_TIME_WINDOW_SECONDS &&
+            neitherEdited
+    }
+
+    fun onMessageSent() {
+        oneOrMoreMessagesWereSent = true
+    }
+
+    fun observeConversationAndUserFirstTime() {
+        conversationAndUserFlow
+            .take(1)
+            .onEach { (conversation, user) ->
+                val credentials =
+                    ApiUtils.getCredentials(user.username, user.token) ?: return@onEach
+
+                val url =
+                    ApiUtils.getUrlForChat(1, user.baseUrl, chatRoomToken)
+
+                chatRepository.updateConversation(conversation)
+
+                // The live-update mode (chat relay vs long polling) is decided in parallel: the
+                // initial load must never wait for the websocket to connect.
+                if (messagePollingJob == null) {
+                    messagePollingJob = viewModelScope.launch {
+                        val isChatRelaySupported = withTimeoutOrNull(WEBSOCKET_CONNECT_TIMEOUT_MS) {
+                            awaitChatRelaySupport(user)
+                        } ?: false
+                        startMessagePolling(isChatRelaySupported)
+                    }
+                }
+
+                loadInitialMessages(
+                    withCredentials = credentials,
+                    withUrl = url
+                )
+
+                getCapabilities(user, chatRoomToken, conversation)
+            }
+            .launchIn(viewModelScope)
+    }
+
+    fun isChatRelaySupported(user: User): Boolean {
+        val websocketInstance = WebSocketConnectionHelper.getWebSocketInstanceForUser(user)
+        return websocketInstance?.supportsChatRelay() == true
+    }
+
+    private suspend fun awaitChatRelaySupport(user: User): Boolean {
+        val wsInstance = WebSocketConnectionHelper.getWebSocketInstanceForUser(user) ?: return false
+        while (!wsInstance.isConnected) {
+            delay(WEBSOCKET_POLL_INTERVAL_MS)
+        }
+        return wsInstance.supportsChatRelay()
+    }
+
+    fun observeConversationAndUserEveryTime() {
+        conversationAndUserFlow
+            .onEach { (conversation, user) ->
+                chatRepository.updateConversation(conversation)
+
+                getCapabilities(user, chatRoomToken, conversation)
+
+                advanceLocalLastReadMessageIfNeeded(
+                    conversation.lastReadMessage
+                )
+            }
+            .launchIn(viewModelScope)
+    }
+
+    private fun observeShareCompleted() {
+        ShareOperationWorker.shareCompletedFlow
+            .filter { it == chatRoomToken }
+            .onEach {
+                Log.d(TAG, "Share completed for room $chatRoomToken — fetching new messages immediately")
+                fetchNewMessagesWithRetry()
+            }
+            .launchIn(viewModelScope)
+
+        UploadAndShareFilesWorker.uploadCompletedFlow
+            .filter { it == chatRoomToken }
+            .onEach {
+                Log.d(TAG, "Upload completed for room $chatRoomToken — fetching new messages immediately")
+                UploadAndShareFilesWorker.clearUploadCompletedReplay()
+                fetchNewMessagesWithRetry()
+            }
+            .launchIn(viewModelScope)
+    }
+
+    /**
+     * Retries [ChatMessageRepository.fetchNewMessages], waiting [POST_UPLOAD_FETCH_RETRY_DELAYS_MS]
+     * between attempts (one attempt per delay, plus the initial immediate one). Stops as soon as at
+     * least one new message is received so that the happy-path (server responds quickly) has no
+     * unnecessary delay, while a slow/indexing-lagged server still gets ~20s of extra chances
+     * (increasing backoff) before we fall back to the regular insurance-request cycle - which can
+     * otherwise take up to 2 minutes to tick again, leaving the just-sent message stuck showing its
+     * "sent, not yet confirmed" spinner in the meantime.
+     */
+    private suspend fun fetchNewMessagesWithRetry() {
+        val gotFirst = chatRepository.fetchNewMessages()
+        if (gotFirst) {
+            Log.d(TAG, "fetchNewMessagesWithRetry: new messages received on initial attempt")
+            return
+        }
+        POST_UPLOAD_FETCH_RETRY_DELAYS_MS.forEachIndexed { index, delayMs ->
+            Log.d(TAG, "fetchNewMessagesWithRetry: attempt ${index + 2}, waiting ${delayMs}ms")
+            delay(delayMs)
+            val gotMessages = chatRepository.fetchNewMessages()
+            if (gotMessages) {
+                Log.d(TAG, "fetchNewMessagesWithRetry: new messages received on attempt ${index + 2}")
+                return
+            }
+        }
+        Log.w(
+            TAG,
+            "fetchNewMessagesWithRetry: no new messages after " +
+                "${POST_UPLOAD_FETCH_RETRY_DELAYS_MS.size + 1} attempts, deferring to the insurance-request cycle"
+        )
+    }
+    private fun handleSystemMessages(chatMessageList: List<ChatMessage>, isChannel: Boolean): List<ChatMessage> {
+        if (isChannel) {
+            return chatMessageList.filter { !it.isSystemMessage }
+        }
+
+        fun shouldRemoveMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+            isInfoMessageAboutDeletion(currentMessage) ||
+                isReactionsMessage(currentMessage) ||
+                isPollVotedMessage(currentMessage) ||
+                isEditMessage(currentMessage) ||
+                isThreadCreatedMessage(currentMessage) ||
+                isUnpinnedMessage(currentMessage)
+
+        val chatMessageMap = chatMessageList.associateBy { it.jsonMessageId }.toMutableMap()
+        val chatMessageIterator = chatMessageMap.iterator()
+
+        // Only drives the "conversation will be deleted after the call" warning (callEndedSystemMessage)
+        // — the call-started banner itself comes from hasCall / conversation.hasCall now.
+        chatMessageList.lastOrNull {
+            it.systemMessageType in
+                listOf(
+                    ChatMessage.SystemMessageType.CALL_ENDED,
+                    ChatMessage.SystemMessageType.CALL_ENDED_EVERYONE
+                )
+        }?.let { callMessage ->
+            processCallSystemMessage(callMessage)
+        }
+
+        while (chatMessageIterator.hasNext()) {
+            val currentMessage = chatMessageIterator.next()
+
+            if (shouldRemoveMessage(currentMessage)) {
+                chatMessageIterator.remove()
+            }
+        }
+        return chatMessageMap.values.toList()
+    }
+
+    private var hasSeenInitialCallSystemMessage = false
+    private var lastNotifiedCallEndedMessageId: Int? = null
+
+    private fun processCallSystemMessage(recent: ChatMessage) {
+        val isInitialSnapshot = !hasSeenInitialCallSystemMessage
+        hasSeenInitialCallSystemMessage = true
+
+        if (!isInitialSnapshot && lastNotifiedCallEndedMessageId != recent.jsonMessageId) {
+            _callEndedSystemMessage.tryEmit(recent.systemMessageType!!)
+        }
+        lastNotifiedCallEndedMessageId = recent.jsonMessageId
+    }
+
+    private fun isInfoMessageAboutDeletion(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.parentMessageId != null &&
+            currentMessage.value.systemMessageType == ChatMessage
+                .SystemMessageType.MESSAGE_DELETED
+
+    private fun isReactionsMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.REACTION ||
+            currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.REACTION_DELETED ||
+            currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.REACTION_REVOKED
+
+    private fun isThreadCreatedMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.THREAD_CREATED
+
+    private fun isEditMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.parentMessageId != null &&
+            currentMessage.value.systemMessageType == ChatMessage
+                .SystemMessageType.MESSAGE_EDITED
+
+    private fun isPollVotedMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.POLL_VOTED
+
+    private fun isUnpinnedMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+        currentMessage.value.systemMessageType == ChatMessage.SystemMessageType.MESSAGE_UNPINNED
+
+    private fun handleThreadMessages(chatMessageList: List<ChatMessage>): List<ChatMessage> {
+        fun isThreadChildMessage(currentMessage: MutableMap.MutableEntry<Int, ChatMessage>): Boolean =
+            currentMessage.value.isThread &&
+                currentMessage.value.threadId?.toInt() != currentMessage.value.jsonMessageId
+
+        val chatMessageMap = chatMessageList.associateBy { it.jsonMessageId }.toMutableMap()
+
+        if (conversationThreadId == null) {
+            val chatMessageIterator = chatMessageMap.iterator()
+            while (chatMessageIterator.hasNext()) {
+                val currentMessage = chatMessageIterator.next()
+
+                if (isThreadChildMessage(currentMessage)) {
+                    chatMessageIterator.remove()
+                }
+            }
+        }
+
+        return chatMessageMap.values.toList()
+    }
+
+    // val timeString = DateUtils.getLocalTimeStringFromTimestamp(message.timestamp)
+
+    /**
+     * Avatar to request from the server for a message, empty for the actors the server has none for
+     * - those get their avatar drawn on the client instead, see [CharacterAvatarUtils].
+     */
+    fun getAvatarUrl(message: ChatMessage): String =
+        if (!message.hasClientSideAvatar()) {
+            ApiUtils.getUrlForAvatar(
+                currentUser.baseUrl,
+                message.actorId,
+                false
+            )
+        } else {
+            ""
+        }
+
+    private fun ChatMessage.hasClientSideAvatar(): Boolean =
+        CharacterAvatarUtils.avatarFor(actorType, actorId, actorDisplayName, guestLabel = null) != null
+
+    fun initData() {
+        chatRepository.initData(
+            currentUser,
+            ApiUtils.getCredentials(currentUser.username, currentUser.token)!!,
+            ApiUtils.getUrlForChat(ApiUtils.API_V1, currentUser.baseUrl, chatRoomToken),
+            chatRoomToken,
+            conversationThreadId
+        )
+
+        observeConversationAndUserFirstTime()
+        observeConversationAndUserEveryTime()
+        observeShareCompleted()
+    }
+
+    fun ConversationModel?.isOneToOneConversation(): Boolean =
+        this?.type ==
+            ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+
+    @Deprecated("use observeConversation")
+    fun getRoom(token: String) {
+        // _getRoomViewState.value = GetRoomStartState
+        conversationRepository.getRoom(currentUser, token)
+    }
+
+    fun loadScheduledMessages(credentials: String, url: String) {
+        _scheduledMessagesViewState.value = ScheduledMessagesLoadingState
+        viewModelScope.launch {
+            chatRepository.getScheduledChatMessages(credentials, url).collect { result ->
+                if (result.isSuccess) {
+                    _scheduledMessagesViewState.value =
+                        ScheduledMessagesSuccessState(result.getOrNull().orEmpty())
+                    _scheduledMessagesCount.value = result.getOrNull()?.size ?: 0
+                } else {
+                    _scheduledMessagesViewState.value = ScheduledMessagesErrorState
+                }
+            }
+        }
     }
 
     fun getCapabilities(user: User, token: String, conversationModel: ConversationModel) {
-        _getCapabilitiesViewState.value = GetCapabilitiesStartState
-
+        Log.d(TAG, "Remote server ${conversationModel.remoteServer}")
         if (conversationModel.remoteServer.isNullOrEmpty()) {
-            _getCapabilitiesViewState.value = GetCapabilitiesSuccessState(user.capabilities!!.spreedCapability!!)
+            val spreedCapability = user.capabilities?.spreedCapability
+            if (spreedCapability == null) {
+                Log.w(TAG, "No local spreed capabilities available yet for user ${user.id}, skipping update")
+                return
+            }
+            participantPermissions = ParticipantPermissions(
+                spreedCapability,
+                conversationModel
+            )
+            if (isInitialLoadPending()) {
+                isInitialLoadDelivered = true
+                _getCapabilitiesViewState.value = GetCapabilitiesInitialLoadState(
+                    spreedCapability,
+                    conversationModel
+                )
+            } else {
+                _getCapabilitiesViewState.value = GetCapabilitiesUpdateState(spreedCapability)
+            }
+            _spreedCapabilities.value = spreedCapability
         } else {
-            chatRepository.getCapabilities(user, token)
+            chatNetworkDataSource.getCapabilities(user, token)
                 .subscribeOn(Schedulers.io())
                 ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(object : Observer<SpreedCapability> {
+                ?.subscribe(object : Observer<SpreedCapabilityDto> {
                     override fun onSubscribe(d: Disposable) {
-                        LifeCycleObserver.disposableSet.add(d)
+                        disposableSet.add(d)
                     }
 
-                    override fun onNext(spreedCapabilities: SpreedCapability) {
-                        _getCapabilitiesViewState.value = GetCapabilitiesSuccessState(spreedCapabilities)
+                    override fun onNext(spreedCapabilities: SpreedCapabilityDto) {
+                        participantPermissions = ParticipantPermissions(
+                            spreedCapabilities,
+                            conversationModel
+                        )
+                        if (isInitialLoadPending()) {
+                            isInitialLoadDelivered = true
+                            _getCapabilitiesViewState.value = GetCapabilitiesInitialLoadState(
+                                spreedCapabilities,
+                                conversationModel
+                            )
+                        } else {
+                            _getCapabilitiesViewState.value = GetCapabilitiesUpdateState(spreedCapabilities)
+                        }
+                        _spreedCapabilities.value = spreedCapabilities
                     }
 
                     override fun onError(e: Throwable) {
@@ -209,83 +1817,86 @@ class ChatViewModel @Inject constructor(
         }
     }
 
+    /**
+     * A failed first load of the capabilities is retried by the next refresh of the conversation, which then is the
+     * initial load. A failed refresh after the initial load is not.
+     */
+    private fun isInitialLoadPending(): Boolean = !isInitialLoadDelivered
+
+    /**
+     * Joins after a leave that is still running, so the server never handles the leave after the join. The wait is
+     * cancelled when the screen is paused.
+     */
     fun joinRoom(user: User, token: String, roomPassword: String) {
         _joinRoomViewState.value = JoinRoomStartState
-        chatRepository.joinRoom(user, token, roomPassword)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.retry(JOIN_ROOM_RETRY_COUNT)
-            ?.subscribe(JoinRoomObserver())
+        joinRoomJob?.cancel()
+        joinRoomJob = viewModelScope.launch {
+            leaveRoomJob?.join()
+            chatNetworkDataSource.joinRoom(user, token, roomPassword)
+                .subscribeOn(Schedulers.io())
+                ?.observeOn(AndroidSchedulers.mainThread())
+                ?.retry(JOIN_ROOM_RETRY_COUNT)
+                ?.subscribe(JoinRoomObserver())
+        }
     }
 
     fun setReminder(user: User, roomToken: String, messageId: String, timestamp: Int, chatApiVersion: Int) {
-        chatRepository.setReminder(user, roomToken, messageId, timestamp, chatApiVersion)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(SetReminderObserver())
+        requestWithFeedback("set the reminder", R.string.nc_common_error_sorry) {
+            chatNetworkDataSource.setReminder(user, roomToken, messageId, timestamp, chatApiVersion)
+        }
     }
 
+    @Suppress("Detekt.TooGenericExceptionCaught")
     fun getReminder(user: User, roomToken: String, messageId: String, chatApiVersion: Int) {
-        chatRepository.getReminder(user, roomToken, messageId, chatApiVersion)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(GetReminderObserver())
+        viewModelScope.launch {
+            _getReminderExistState.value = try {
+                GetReminderExistState(chatNetworkDataSource.getReminder(user, roomToken, messageId, chatApiVersion))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.d(TAG, "Error when getting reminder", e)
+                GetReminderStartState
+            }
+        }
+    }
+
+    fun overrideReminderState() {
+        _getReminderExistState.value = GetReminderStateSet
     }
 
     fun deleteReminder(user: User, roomToken: String, messageId: String, chatApiVersion: Int) {
-        chatRepository.deleteReminder(user, roomToken, messageId, chatApiVersion)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onNext(genericOverall: GenericOverall) {
-                    _getReminderExistState.value = GetReminderStartState
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.d(TAG, "Error when deleting reminder", e)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
+        requestWithFeedback("delete the reminder", R.string.nc_common_error_sorry) {
+            chatNetworkDataSource.deleteReminder(user, roomToken, messageId, chatApiVersion)
+            _getReminderExistState.value = GetReminderStartState
+        }
     }
 
-    fun leaveRoom(credentials: String, url: String, funToCallWhenLeaveSuccessful: (() -> Unit)?) {
-        val startNanoTime = System.nanoTime()
-        chatRepository.leaveRoom(credentials, url)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
+    fun leaveRoom(credentials: String, url: String, functionToCallAfterLeave: (() -> Unit)?) {
+        leaveRoomJob = appScope.launch {
+            try {
+                val result = chatNetworkDataSource.leaveRoom(credentials, url)
+                if (result.ocs?.meta?.statusCode == HTTP_CODE_OK) {
+                    Log.d(TAG, "leaveRoom completed")
+                } else {
+                    Log.e(TAG, "leaveRoom failed with OCS status: ${result.ocs?.meta?.statusCode}")
                 }
-
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "leaveRoom - leaveRoom - ERROR", e)
+                withContext(Dispatchers.Main) {
+                    _leaveRoomViewState.value = LeaveRoomSuccessState
+                    functionToCallAfterLeave?.invoke()
                 }
-
-                override fun onComplete() {
-                    Log.d(TAG, "leaveRoom - leaveRoom - completed: $startNanoTime")
-                }
-
-                override fun onNext(t: GenericOverall) {
-                    _leaveRoomViewState.value = LeaveRoomSuccessState(funToCallWhenLeaveSuccessful)
-                }
-            })
+            } catch (e: Exception) {
+                Log.e(TAG, "leaveRoom - ERROR", e)
+            }
+        }
     }
 
     fun createRoom(credentials: String, url: String, queryMap: Map<String, String>) {
-        chatRepository.createRoom(credentials, url, queryMap)
+        chatNetworkDataSource.createRoom(credentials, url, queryMap)
             .subscribeOn(Schedulers.io())
             .observeOn(AndroidSchedulers.mainThread())
             .subscribe(object : Observer<RoomOverall> {
                 override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
+                    disposableSet.add(d)
                 }
 
                 override fun onError(e: Throwable) {
@@ -303,270 +1914,738 @@ class ChatViewModel @Inject constructor(
             })
     }
 
-    fun sendChatMessage(
-        credentials: String,
-        url: String,
-        message: CharSequence,
-        displayName: String,
-        replyTo: Int,
-        sendWithoutNotification: Boolean
-    ) {
-        chatRepository.sendChatMessage(
-            credentials,
-            url,
-            message,
-            displayName,
-            replyTo,
-            sendWithoutNotification
-        ).subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onError(e: Throwable) {
-                    _sendChatMessageViewState.value = SendChatMessageErrorState(e, message)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onNext(t: GenericOverall) {
-                    _sendChatMessageViewState.value = SendChatMessageSuccessState(message)
-                }
-            })
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun getThread(credentials: String, url: String) {
+        viewModelScope.launch {
+            try {
+                val thread = threadsRepository.getThread(credentials, url)
+                _threadRetrieveState.value = ThreadRetrieveUiState.Success(thread.ocs?.data)
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to retrieve thread for $url", exception)
+                _threadRetrieveState.value = ThreadRetrieveUiState.Error(exception)
+            }
+        }
     }
 
-    fun pullChatMessages(credentials: String, url: String) {
-        chatRepository.pullChatMessages(credentials, url, _getFieldMapForChat.value!!)
-            .subscribeOn(Schedulers.io())
-            .takeUntil { (LifeCycleObserver.currentLifeCycleFlag == LifeCycleObserver.LifeCycleFlag.PAUSED) }
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<Response<*>> {
-                override fun onSubscribe(d: Disposable) {
-                    Log.d(TAG, "pullChatMessages - pullChatMessages SUBSCRIBE")
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "pullChatMessages - pullChatMessages ERROR", e)
-                    _pullChatMessageViewState.value = PullChatMessageErrorState
-                }
-
-                override fun onComplete() {
-                    Log.d(TAG, "pullChatMessages - pullChatMessages COMPLETE")
-                    _pullChatMessageViewState.value = PullChatMessageCompleteState
-                }
-
-                override fun onNext(response: Response<*>) {
-                    val lookIntoFuture = getFieldMapForChat.value?.get("lookIntoFuture") == 1
-                    _pullChatMessageViewState.value = PullChatMessageSuccessState(response, lookIntoFuture)
-                }
-            })
-    }
-
-    fun deleteChatMessages(credentials: String, url: String, messageId: String) {
-        chatRepository.deleteChatMessage(credentials, url)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ChatOverallSingleMessage> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.e(
-                        TAG,
-                        "Something went wrong when trying to delete message with id " +
-                            messageId,
-                        e
+    @Suppress("Detekt.TooGenericExceptionCaught", "MagicNumber")
+    fun setThreadNotificationLevel(credentials: String, url: String, level: Int) {
+        fun updateFollowedThreadsIndicator(notificationLevel: Int?) {
+            when (notificationLevel) {
+                1, 2 -> {
+                    val accountId = UserIdUtils.getIdForUser(currentUser)
+                    arbitraryStorageManager.storeStorageSetting(
+                        accountId,
+                        FOLLOWED_THREADS_EXIST,
+                        true.toString(),
+                        ""
                     )
-                    _deleteChatMessageViewState.value = DeleteChatMessageErrorState
                 }
+            }
+        }
 
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onNext(t: ChatOverallSingleMessage) {
-                    _deleteChatMessageViewState.value = DeleteChatMessageSuccessState(t)
-                }
-            })
+        viewModelScope.launch {
+            try {
+                val thread = threadsRepository.setThreadNotificationLevel(credentials, url, level)
+                updateFollowedThreadsIndicator(thread.ocs?.data?.attendee?.notificationLevel)
+                _threadRetrieveState.value = ThreadRetrieveUiState.Success(thread.ocs?.data)
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to set thread notification level for $url", exception)
+                _threadRetrieveState.value = ThreadRetrieveUiState.Error(exception)
+            }
+        }
     }
 
-    fun setChatReadMarker(credentials: String, url: String, previousMessageId: Int) {
-        chatRepository.setChatReadMarker(credentials, url, previousMessageId)
-            .subscribeOn(Schedulers.io())
-            .observeOn(AndroidSchedulers.mainThread())
-            .subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
+    /**
+     * A PENDING text message is only sent by SendMessageWorker. Without send work left for the
+     * conversation it would show the clock forever, so it is marked FAILED and the user can resend or
+     * delete it. Only messages created before this view model are considered: loadInitialMessages
+     * runs on every activity creation (e.g. rotation), and a message sent just now may not have its
+     * work written to WorkManager yet.
+     */
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private suspend fun failOrphanedPendingMessages() {
+        try {
+            val internalConversationId = "${currentUser.id}@$chatRoomToken"
+            if (!SendMessageWorker.hasActiveSend(WorkManager.getInstance(), internalConversationId)) {
+                val failed = chatRepository.failPendingMessagesWithoutSendWork(createdAtSeconds)
+                if (failed > 0) {
+                    Log.w(TAG, "Marked $failed pending message(s) without send work as failed")
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not check for pending messages without send work", e)
+        }
+    }
+
+    suspend fun loadInitialMessages(withCredentials: String, withUrl: String) {
+        failOrphanedPendingMessages()
+        val bundle = Bundle()
+        bundle.putString(BundleKeys.KEY_CHAT_URL, withUrl)
+        bundle.putString(BundleKeys.KEY_CREDENTIALS, withCredentials)
+        chatRepository.loadInitialMessages(
+            withNetworkParams = bundle
+        )
+    }
+
+    suspend fun startMessagePolling(hasHighPerformanceBackend: Boolean) {
+        chatRepository.startMessagePolling(hasHighPerformanceBackend)
+    }
+
+    fun loadMoreMessages(messageId: Int, direction: LoadMoreDirection) {
+        Log.d(TAG, "Compose load more, messageId: $messageId direction: $direction")
+        val user = currentUserFlow.value
+        val urlForChatting = ApiUtils.getUrlForChat(
+            1,
+            user?.baseUrl,
+            chatRoomToken
+        )
+        val credentials = ApiUtils.getCredentials(user?.username, user?.token)
+
+        viewModelScope.launch {
+            if (isLoadMoreInProgress) {
+                return@launch
+            }
+
+            isLoadMoreInProgress = true
+            val bundle = Bundle()
+            bundle.putString(BundleKeys.KEY_CHAT_URL, urlForChatting)
+            bundle.putString(BundleKeys.KEY_CREDENTIALS, credentials!!)
+            try {
+                val directionForRepository = when (direction) {
+                    LoadMoreDirection.OLDER -> ChatMessageRepository.LoadMoreDirection.OLDER
+                    LoadMoreDirection.NEWER -> ChatMessageRepository.LoadMoreDirection.NEWER
                 }
 
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, e.message, e)
-                }
+                chatRepository.loadMoreMessages(
+                    messageId.toLong(),
+                    directionForRepository,
+                    uiState.value.conversation!!.token,
+                    LOAD_MORE_MESSAGES_LIMIT,
+                    withNetworkParams = bundle
+                )
+            } finally {
+                isLoadMoreInProgress = false
+            }
+        }
+    }
 
-                override fun onComplete() {
-                    // unused atm
-                }
+    fun messageIdsToDelete(messageId: Int): List<Int> = messageIdsToDelete(_uiState.value.items, messageId)
 
-                override fun onNext(t: GenericOverall) {
-                    // unused atm
+    fun deleteChatMessages(credentials: String, urlsByMessageId: Map<Int, String>) {
+        val deletedPlaceholder = NextcloudTalkApplication.sharedApplication!!
+            .getString(R.string.message_deleted_by_you)
+
+        viewModelScope.launch {
+            val results = urlsByMessageId.map { (messageId, url) ->
+                async {
+                    chatRepository.deleteChatMessage(credentials, url, messageId.toLong(), deletedPlaceholder)
+                        .onFailure { throwable ->
+                            Log.e(TAG, "Failed to delete message with id $messageId", throwable)
+                        }
                 }
-            })
+            }.awaitAll()
+
+            if (results.any { it.isFailure }) {
+                _deleteChatMessageViewState.value = DeleteChatMessageErrorState
+                return@launch
+            }
+
+            val responses = results.mapNotNull { it.getOrNull() }
+            val response = responses.firstOrNull { it.ocs?.meta?.statusCode == HttpURLConnection.HTTP_ACCEPTED }
+                ?: responses.firstOrNull()
+            response?.let { _deleteChatMessageViewState.value = DeleteChatMessageSuccessState(it) }
+        }
+    }
+
+    // Runs on the background dispatcher of the rebuild pipeline (flowOn in observeMessages): it only
+    // publishes the immutable list through a volatile field. localLastReadMessage is written on the main
+    // thread only, so the own message is combined with it when the marker is decided (readMarkerToSend).
+    //
+    // Only the list of the newest messages counts. A window around a quoted or searched message (search and
+    // old chat block mode) can lie far from them and miss the own message just sent, which must still be
+    // known when the chat is left from there.
+    private fun onMessagesChanged(messages: List<ChatMessage>) {
+        if (chatMode.value == ChatMode.DEFAULT_MODE || contextAnchorMessageId.value == null) {
+            latestMessages = messages
+        }
+    }
+
+    fun advanceLocalLastReadMessageIfNeeded(messageId: Int) {
+        Log.d(TAG, "advanceLocalLastReadMessageIfNeeded, messageId: $messageId")
+        Log.d(TAG, "advanceLocalLastReadMessageIfNeeded, localLastReadMessage: $localLastReadMessage")
+
+        if (keepMarkedAsUnread) {
+            Log.d(TAG, "advanceLocalLastReadMessageIfNeeded, skipped: the chat was marked as unread")
+            return
+        }
+
+        if (localLastReadMessage < messageId && -1 < messageId) {
+            Log.d(TAG, "advanceLocalLastReadMessageIfNeeded, setting localLastReadMessage to $messageId")
+            localLastReadMessage = messageId
+        }
+    }
+
+    /**
+     * Please use with caution to not spam the server
+     */
+    fun updateRemoteLastReadMessageIfNeeded() {
+        Log.d(TAG, "updateRemoteLastReadMessageIfNeeded, localLastReadMessage: $localLastReadMessage")
+        if (keepMarkedAsUnread) {
+            Log.d(TAG, "updateRemoteLastReadMessageIfNeeded, skipped: the chat was marked as unread")
+            return
+        }
+        val conversationLastReadMessage = _uiState.value.conversation?.lastReadMessage ?: return
+        Log.d(TAG, "updateRemoteLastReadMessageIfNeeded, conversation.lastReadMessage: $conversationLastReadMessage")
+
+        val messages = latestMessages
+        val newestOwnMessageId = newestOwnMessageId(messages)
+        val marker = localReadMarker(
+            localLastReadMessage = localLastReadMessage,
+            conversationLastReadMessage = conversationLastReadMessage,
+            newestOwnMessageId = newestOwnMessageId
+        )
+        if (marker != null) {
+            // The local read state is always written; only the server request waits for an own message
+            // that is still on its way (offline queue included), see readMarkerToSend.
+            val sendToServer = readMarkerToSend(
+                localLastReadMessage = localLastReadMessage,
+                conversationLastReadMessage = conversationLastReadMessage,
+                newestOwnMessageId = newestOwnMessageId,
+                hasUnconfirmedOwnMessage = hasUnconfirmedOwnMessage(messages)
+            ) != null
+            Log.d(TAG, "updateRemoteLastReadMessageIfNeeded, setChatReadMessage, sendToServer: $sendToServer")
+
+            setChatReadMessage(marker, sendToServer)
+        }
+    }
+
+    /**
+     * Marks the chat as read up to [lastReadMessage]: the local conversation entry is updated
+     * immediately (optimistic, so the conversation list reflects it right away) while sending the
+     * marker to the server is delegated to [ReadMarkerSyncWorker], which retries transient
+     * failures with backoff. The server stays the authority — every room list sync re-asserts its
+     * read state, so a marker that ultimately could not be sent falls back to the server state
+     * instead of leaving the client diverged.
+     *
+     * [markPendingReadMarker] runs synchronously, before anything is launched, so the marker is
+     * armed the instant this returns: leaving the chat commonly races the conversation list's own
+     * resume-triggered sync, and that race is only guarded correctly if the pending marker already
+     * exists by the time the sync's response is merged. [updateLocalReadState] itself does two
+     * suspending database reads before writing - registering the marker only there, inside a
+     * launched coroutine, previously left a real gap (observed at ~250ms, more under main-thread
+     * contention) during which such a sync could see no pending marker yet and apply unguarded.
+     */
+    /**
+     * Marks the chat as unread from [firstUnreadMessage] on: the read marker moves back to the message
+     * before it, the conversation entry is left unread until the server reports its own state, and the
+     * chat stops advancing the marker on its own for the rest of this visit - otherwise scrolling, or
+     * simply leaving the chat, would immediately mark everything read again.
+     */
+    fun markChatAsUnread(lastReadMessage: Int) {
+        keepMarkedAsUnread = true
+        localLastReadMessage = lastReadMessage
+        resetUnreadMarkerCache()
+        _uiState.update { it.copy(markedAsUnreadByUser = true) }
+
+        viewModelScope.launch {
+            chatRepository.updateLocalUnreadState(lastReadMessage)
+        }
+        ReadMarkerSyncWorker.enqueue(
+            context = NextcloudTalkApplication.sharedApplication!!.applicationContext,
+            userId = currentUser.id!!,
+            roomToken = chatRoomToken,
+            lastReadMessage = lastReadMessage
+        )
+    }
+
+    fun setChatReadMessage(lastReadMessage: Int, sendToServer: Boolean = true) {
+        // marking as read is the explicit counterpart of marking as unread and hands the read marker
+        // back to the automatic handling
+        keepMarkedAsUnread = false
+        _uiState.update { it.copy(markedAsUnreadByUser = false) }
+        if (!sendToServer) {
+            // The marker waits for an own message that is on its way: show the lower unread count, but keep
+            // the stored marker and register nothing pending, so the marker is decided again (and sent) by
+            // the next call once the message is confirmed or failed.
+            viewModelScope.launch {
+                chatRepository.updateLocalUnreadCountOnly(lastReadMessage)
+            }
+            return
+        }
+        chatRepository.markPendingReadMarker(lastReadMessage)
+        viewModelScope.launch {
+            chatRepository.updateLocalReadState(lastReadMessage)
+        }
+        ReadMarkerSyncWorker.enqueue(
+            context = NextcloudTalkApplication.sharedApplication!!.applicationContext,
+            userId = currentUser.id!!,
+            roomToken = chatRoomToken,
+            lastReadMessage = lastReadMessage
+        )
     }
 
     fun shareToNotes(credentials: String, url: String, message: String, displayName: String) {
-        chatRepository.shareToNotes(credentials, url, message, displayName)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onNext(genericOverall: GenericOverall) {
-                    // unused atm
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.d(TAG, "Error when sharing to notes $e")
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
+        shareToNotes("share the message to notes", credentials, url) { referenceId ->
+            chatNetworkDataSource.shareToNotes(credentials, url, message, displayName, referenceId)
+        }
     }
 
-    fun checkForNoteToSelf(credentials: String, baseUrl: String, includeStatus: Boolean) {
-        chatRepository.checkForNoteToSelf(credentials, baseUrl, includeStatus).subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(CheckForNoteToSelfObserver())
+    suspend fun checkForNoteToSelf(credentials: String, baseUrl: String): ConversationModel? =
+        try {
+            val response = chatNetworkDataSource.checkForNoteToSelf(credentials, baseUrl)
+            if (response.ocs?.meta?.statusCode == HTTP_CODE_OK) {
+                ConversationModel.mapToConversationModel(
+                    response.ocs?.data!!,
+                    currentUser
+                )
+            } else {
+                null
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "checkForNoteToSelf I/O error: $e")
+            null
+        } catch (e: HttpException) {
+            Log.e(TAG, "checkForNoteToSelf HTTP error: $e")
+            null
+        }
+
+    fun shareLocationToNotes(
+        credentials: String,
+        url: String,
+        chatUrl: String,
+        objectType: String,
+        objectId: String,
+        metadata: String
+    ) {
+        shareToNotes("share the location to notes", credentials, chatUrl) { referenceId ->
+            chatNetworkDataSource.shareLocationToNotes(credentials, url, objectType, objectId, metadata, referenceId)
+        }
     }
 
-    fun shareLocationToNotes(credentials: String, url: String, objectType: String, objectId: String, metadata: String) {
-        chatRepository.shareLocationToNotes(credentials, url, objectType, objectId, metadata)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<GenericOverall> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
+    /**
+     * Shares to the note to self and, when the share failed for a transient reason, asks the note to
+     * self whether the message arrived anyway before sending it a second time. The server stores the
+     * reference id of a message without ever looking at it again, so it deduplicates nothing: a blind
+     * second attempt after a timeout the server did accept posts the note twice.
+     */
+    private fun shareToNotes(
+        description: String,
+        credentials: String,
+        lookupUrl: String,
+        share: suspend (String) -> Unit
+    ) {
+        val referenceId = SendMessageUtils().generateReferenceId()
 
-                override fun onNext(genericOverall: GenericOverall) {
-                    // unused atm
-                }
+        viewModelScope.launch {
+            val failure = attemptShare(share, referenceId) ?: return@launch
 
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "Error when sharing location to notes $e")
-                }
+            if (!isTransientFailure(failure)) {
+                reportShareFailure(description, failure)
+                return@launch
+            }
 
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
+            when (alreadyShared(credentials, lookupUrl, referenceId)) {
+                true -> Unit
+                false -> attemptShare(share, referenceId)?.let { reportShareFailure(description, it) }
+                null -> reportShareFailure(description, failure)
+            }
+        }
+    }
+
+    /** Runs the share once and reports what went wrong, or null when it worked. */
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private suspend fun attemptShare(share: suspend (String) -> Unit, referenceId: String): Exception? =
+        try {
+            share(referenceId)
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            e
+        }
+
+    /**
+     * Whether the note to self already holds the message of this share, or null when the lookup could
+     * not be answered. An unanswered lookup is not retried, because posting a second copy is worse than
+     * not retrying, but it is reported rather than passed off as a message that arrived.
+     */
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private suspend fun alreadyShared(credentials: String, lookupUrl: String, referenceId: String): Boolean? =
+        try {
+            val fieldMap = hashMapOf(
+                "lookIntoFuture" to 0,
+                "includeLastKnown" to 1,
+                "setReadMarker" to 0,
+                "markNotificationsAsRead" to 0,
+                "timeout" to 0,
+                "limit" to SHARE_LOOKUP_LIMIT
+            )
+            val recent = chatNetworkDataSource.pullChatMessages(credentials, lookupUrl, fieldMap)
+            holdsShare(recent.body()?.ocs?.data, referenceId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.w(TAG, "Could not check whether the share arrived, so it is not sent again", e)
+            null
+        }
+
+    private suspend fun reportShareFailure(description: String, throwable: Throwable) {
+        logger.e(TAG, "Failed to $description", throwable)
+        _actionFailures.emit(R.string.nc_message_not_added_to_notes)
+    }
+
+    /**
+     * Runs an action whose only visible outcome is whether it worked. The reminder dialog is already
+     * dismissed and the chat has already said the message was sent by the time the answer arrives, so
+     * a failure that is not reported here is never reported at all.
+     *
+     * Deliberately without a retry: sharing to notes posts a message with a reference id generated per
+     * call, so a second attempt after a timeout the server did accept would post it twice.
+     */
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    private fun requestWithFeedback(description: String, @StringRes failureMessage: Int, request: suspend () -> Unit) {
+        viewModelScope.launch {
+            try {
+                request()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.e(TAG, "Failed to $description", e)
+                _actionFailures.emit(failureMessage)
+            }
+        }
     }
 
     fun deleteReaction(roomToken: String, chatMessage: ChatMessage, emoji: String) {
-        reactionsRepository.deleteReaction(roomToken, chatMessage, emoji)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ReactionDeletedModel> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.d(TAG, "$e")
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onNext(reactionDeletedModel: ReactionDeletedModel) {
-                    if (reactionDeletedModel.success) {
-                        _reactionDeletedViewState.value = ReactionDeletedSuccessState(reactionDeletedModel)
-                    }
-                }
-            })
+        toggleReaction(roomToken, chatMessage, emoji, ReactionOperation.DELETE)
     }
 
     fun addReaction(roomToken: String, chatMessage: ChatMessage, emoji: String) {
-        reactionsRepository.addReaction(roomToken, chatMessage, emoji)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ReactionAddedModel> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
+        toggleReaction(roomToken, chatMessage, emoji, ReactionOperation.ADD)
+    }
+
+    /**
+     * The repository renders the reaction locally before it calls the server, so operations on the same
+     * message and emoji are serialized: a second tap waits for the first one instead of racing it, which
+     * keeps the local state and the order of the requests in sync with what the user tapped.
+     */
+    private fun toggleReaction(
+        roomToken: String,
+        chatMessage: ChatMessage,
+        emoji: String,
+        operation: ReactionOperation
+    ) {
+        val credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token)
+        val url = ApiUtils.getUrlForMessageReaction(
+            baseUrl = currentUser.baseUrl!!,
+            roomToken = roomToken,
+            messageId = chatMessage.jsonMessageId.toString()
+        )
+
+        viewModelScope.launch {
+            reactionLockFor(chatMessage.jsonMessageId).withLock {
+                val succeeded = when (operation) {
+                    ReactionOperation.ADD -> reactionsRepository.addReaction(
+                        credentials,
+                        currentUser.id!!,
+                        url,
+                        roomToken,
+                        chatMessage,
+                        emoji
+                    ).success
+
+                    ReactionOperation.DELETE -> reactionsRepository.deleteReaction(
+                        credentials,
+                        currentUser.id!!,
+                        url,
+                        roomToken,
+                        chatMessage,
+                        emoji
+                    ).success
                 }
 
-                override fun onError(e: Throwable) {
-                    Log.d(TAG, "$e")
+                if (!succeeded) {
+                    Log.w(TAG, "Reaction $operation failed and was reverted")
+                    _reactionFailures.tryEmit(operation)
                 }
+            }
+        }
+    }
 
-                override fun onComplete() {
-                    // unused atm
+    /**
+     * Applying a reaction rewrites the whole cached message, so reactions of one message are serialized
+     * as a whole - locking per emoji would let two emojis of the same message overwrite each other.
+     */
+    private fun reactionLockFor(messageId: Int): Mutex = reactionLocks.getOrPut(messageId) { Mutex() }
+
+    fun startAudioRecording(context: Context, currentConversation: ConversationModel) {
+        audioFocusRequestManager.audioFocusRequest(true) {
+            Log.d(TAG, "Recording Started")
+            mediaRecorderManager.start(context, currentConversation, onSilenced = ::interruptAudioRecording)
+            _getVoiceRecordingInProgress.postValue(true)
+        }
+    }
+
+    /** Stops the recorder whether or not the audio focus is given back, so the shown state never outlasts it. */
+    fun stopAudioRecording() {
+        mediaRecorderManager.stop()
+        _getVoiceRecordingInProgress.postValue(false)
+        Log.d(TAG, "Recording stopped")
+        audioFocusRequestManager.audioFocusRequest(false) {}
+    }
+
+    fun stopAndSendAudioRecording(roomToken: String = "", replyToMessageId: Int? = null, displayName: String) {
+        stopAudioRecording()
+
+        if (mediaRecorderManager.mediaRecorderState != MediaRecorderManager.MediaRecorderState.ERROR) {
+            val uri = Uri.fromFile(File(mediaRecorderManager.currentVoiceRecordFile))
+            Log.d(TAG, "File uploaded")
+            uploadFile(
+                fileUri = uri.toString(),
+                isVoiceMessage = true,
+                caption = "",
+                roomToken = roomToken,
+                replyToMessageId = replyToMessageId,
+                displayName = displayName
+            )
+        }
+    }
+
+    fun stopAndDiscardAudioRecording() {
+        stopAudioRecording()
+        Log.d(TAG, "File discarded")
+        val cachedFile = File(mediaRecorderManager.currentVoiceRecordFile)
+        cachedFile.delete()
+    }
+
+    fun getCurrentVoiceRecordFile(): String = mediaRecorderManager.currentVoiceRecordFile
+
+    /** Saves the picked contact as a vCard and uploads it, also when the chat is recreated meanwhile. */
+    @Suppress("LongParameterList")
+    fun shareContact(contactUri: Uri, roomToken: String, replyToMessageId: Int?, displayName: String) {
+        val context = NextcloudTalkApplication.sharedApplication!!.applicationContext
+        viewModelScope.launch {
+            val file = runProviderCall(onFailure = { e -> logger.e(TAG, "Failed to read contact $contactUri", e) }) {
+                ContactUtils.saveContactAsVcfFile(context, contactUri)
+            }
+            if (file == null) {
+                _actionFailures.emit(R.string.nc_common_error_sorry)
+                return@launch
+            }
+            val shareUri = FileProvider.getUriForFile(context, BuildConfig.APPLICATION_ID, file)
+            uploadFile(
+                fileUri = shareUri.toString(),
+                isVoiceMessage = false,
+                roomToken = roomToken,
+                replyToMessageId = replyToMessageId,
+                displayName = displayName
+            )
+        }
+    }
+
+    fun uploadFile(
+        fileUri: String,
+        isVoiceMessage: Boolean,
+        caption: String = "",
+        roomToken: String = "",
+        replyToMessageId: Int? = null,
+        displayName: String,
+        compressImages: Boolean = false,
+        uploadId: String? = null,
+        order: Int = 1,
+        allowUpdate: Boolean = false
+    ) {
+        val metaDataMap = mutableMapOf<String, Any>()
+        var room = ""
+
+        if (!participantPermissions.hasChatPermission()) {
+            Log.w(TAG, "uploading file(s) is forbidden because of missing attendee permissions")
+            return
+        }
+
+        // Same as a regular text send: once the user has sent something themselves, the unread
+        // marker must never latch onto it once it syncs back with its real (higher) message id -
+        // otherwise the marker can end up sitting right above the file the user just sent.
+        onMessageSent()
+
+        if (replyToMessageId != 0) {
+            metaDataMap["replyTo"] = replyToMessageId.toString()
+        }
+
+        if (isVoiceMessage) {
+            metaDataMap["messageType"] = "voice-message"
+        }
+
+        if (caption != "") {
+            metaDataMap["caption"] = caption
+        }
+
+        val referenceId = SendMessageUtils().generateGroupedReferenceId(uploadId ?: UUID.randomUUID().toString(), order)
+        metaDataMap["referenceId"] = referenceId
+        referenceIdSendSequence[referenceId] = nextSendSequenceValue++
+
+        val metaData = Gson().toJson(metaDataMap)
+
+        room = if (roomToken == "") chatRoomToken else roomToken
+
+        try {
+            require(fileUri.isNotEmpty())
+
+            val internalConversationId = "${currentUser.id}@$chatRoomToken"
+            val enqueueUpload = {
+                UploadAndShareFilesWorker.upload(
+                    userId = currentUser.id!!,
+                    fileUri = fileUri,
+                    roomToken = room,
+                    conversationName = displayName,
+                    metaData = metaData,
+                    referenceId = referenceId,
+                    internalConversationId = internalConversationId,
+                    compressImages = compressImages,
+                    allowUpdate = allowUpdate
+                )
+            }
+
+            // enqueued right here, in the order of the calls: the queue of a conversation is chained, and the
+            // slow lookup of the file info below must neither reorder the files nor die with the view model
+            // the access the picker granted ends with the chat, while the upload can wait for the network
+            UploadSourceGrants.keep(NextcloudTalkApplication.sharedApplication!!, fileUri)
+            val workerId = enqueueUpload()
+            if (!isVoiceMessage) {
+                uploadReferenceToWorkId[referenceId] = workerId
+                _uploadedLocalPreviewMap.update { it + (referenceId to fileUri) }
+
+                viewModelScope.launch {
+                    // getType/query are blocking binder calls into the provider's process (e.g. Nextcloud Files)
+                    val (fileName, mimeType, fileSize) = withContext(Dispatchers.IO) {
+                        try {
+                            resolveFileInfo(fileUri)
+                        } catch (e: IllegalArgumentException) {
+                            // unknown or revoked uri: the worker reports the failed upload, the placeholder stays
+                            Log.w(TAG, "Could not resolve file info of the file to send", e)
+                            Triple(fileUri.toUri().lastPathSegment.orEmpty(), null, 0L)
+                        } catch (e: SecurityException) {
+                            Log.w(TAG, "No access to the file info of the file to send", e)
+                            Triple(fileUri.toUri().lastPathSegment.orEmpty(), null, 0L)
+                        }
+                    }
+                    chatRepository.addUploadPlaceholderMessage(
+                        localFileUri = fileUri,
+                        fileName = fileName,
+                        caption = caption,
+                        mimeType = mimeType,
+                        fileSize = fileSize,
+                        referenceId = referenceId
+                    ).collect {}
+
+                    // observed only now: a failure the worker reported before the placeholder existed is
+                    // delivered with the current state and marks the placeholder that was just added
+                    observeUploadProgress(workerId, referenceId)
                 }
+            }
+        } catch (e: IllegalArgumentException) {
+            Log.e(javaClass.simpleName, "Something went wrong when trying to upload file", e)
+        }
+    }
 
-                override fun onNext(reactionAddedModel: ReactionAddedModel) {
-                    if (reactionAddedModel.success) {
-                        _reactionAddedViewState.value = ReactionAddedSuccessState(reactionAddedModel)
+    private fun resolveFileInfo(fileUri: String): Triple<String, String?, Long> {
+        val uri = fileUri.toUri()
+        val mimeType = NextcloudTalkApplication.sharedApplication!!.contentResolver.getType(uri)
+        val cursor = NextcloudTalkApplication.sharedApplication!!.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIndex = it.getColumnIndex(OpenableColumns.SIZE)
+            if (it.moveToFirst()) {
+                val name = if (nameIndex >= 0) it.getString(nameIndex).orEmpty() else uri.lastPathSegment.orEmpty()
+                val size = if (sizeIndex >= 0) it.getLong(sizeIndex) else 0L
+                return Triple(name, mimeType, size)
+            }
+        }
+        return Triple(uri.lastPathSegment.orEmpty(), mimeType, 0L)
+    }
+
+    private fun observeUploadProgress(workerId: UUID, referenceId: String) {
+        WorkManager.getInstance(NextcloudTalkApplication.sharedApplication!!)
+            .getWorkInfoByIdLiveData(workerId)
+            .asFlow()
+            .onEach { workInfo ->
+                if (workInfo == null) return@onEach
+                val progress = workInfo.progress.getInt(UploadAndShareFilesWorker.PROGRESS_KEY, -1)
+                if (progress >= 0) {
+                    _uploadProgressMap.update { it + (referenceId to progress) }
+                }
+                if (workInfo.state == WorkInfo.State.FAILED) {
+                    viewModelScope.launch { chatRepository.markUploadPlaceholderFailed(referenceId) }
+                }
+                if (workInfo.state.isFinished) {
+                    _uploadProgressMap.update { it - referenceId }
+                    uploadReferenceToWorkId.remove(referenceId)
+                    viewModelScope.launch {
+                        delay(LOCAL_PREVIEW_GRACE_PERIOD_MS)
+                        _uploadedLocalPreviewMap.update { it - referenceId }
                     }
                 }
-            })
+            }
+            .launchIn(viewModelScope)
     }
 
-    fun editChatMessage(credentials: String, url: String, text: String) {
-        chatRepository.editChatMessage(credentials, url, text)
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ChatOverallSingleMessage> {
-                override fun onSubscribe(d: Disposable) {
-                    LifeCycleObserver.disposableSet.add(d)
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "failed to edit message", e)
-                    _editMessageViewState.value = EditMessageErrorState
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-
-                override fun onNext(messageEdited: ChatOverallSingleMessage) {
-                    _editMessageViewState.value = EditMessageSuccessState(messageEdited)
-                }
-            })
+    fun postToRecordTouchObserver(float: Float) {
+        _recordTouchObserver.postValue(float)
     }
 
-    inner class GetRoomObserver : Observer<ConversationModel> {
-        override fun onSubscribe(d: Disposable) {
-            // unused atm
+    fun setVoiceRecordingLocked(boolean: Boolean) {
+        _getVoiceRecordingLocked.postValue(boolean)
+    }
+
+    /**
+     * Allows one join of the room per resume of the chat screen. The claim is released when the screen is paused,
+     * where the chat leaves the room.
+     */
+    fun claimRoomJoin(): Boolean {
+        if (roomJoinClaimed) {
+            return false
+        }
+        roomJoinClaimed = true
+        return true
+    }
+
+    fun handleOrientationChange() {
+        isInitialLoadDelivered = false
+        _getCapabilitiesViewState.value = GetCapabilitiesStartState
+    }
+
+    @Deprecated("use getMessageById(messageId: Long)")
+    fun getMessageById(url: String, conversationModel: ConversationModel, messageId: Long): Flow<ChatMessage> {
+        val bundle = Bundle().apply {
+            putString(BundleKeys.KEY_CHAT_URL, url)
+            putString(BundleKeys.KEY_CREDENTIALS, currentUser.getCredentials())
+            putString(BundleKeys.KEY_ROOM_TOKEN, chatRoomToken)
         }
 
-        override fun onNext(conversationModel: ConversationModel) {
-            _getRoomViewState.value = GetRoomSuccessState(conversationModel)
+        return chatRepository.getMessage(messageId, bundle)
+    }
+
+    fun getMessageById(messageId: Long): Flow<ChatMessage> {
+        val urlForChatting = ApiUtils.getUrlForChat(
+            1, // Keep API v1 for local message lookup until version wiring is centralized.
+            currentUser.baseUrl,
+            chatRoomToken
+        )
+
+        val bundle = Bundle().apply {
+            putString(BundleKeys.KEY_CHAT_URL, urlForChatting)
+            putString(BundleKeys.KEY_CREDENTIALS, currentUser.getCredentials())
+            putString(BundleKeys.KEY_ROOM_TOKEN, chatRoomToken)
         }
 
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when fetching room")
-            _getRoomViewState.value = GetRoomErrorState
-        }
-
-        override fun onComplete() {
-            // unused atm
-        }
+        return chatRepository.getMessage(messageId, bundle)
     }
 
     inner class JoinRoomObserver : Observer<ConversationModel> {
         override fun onSubscribe(d: Disposable) {
-            LifeCycleObserver.disposableSet.add(d)
+            disposableSet.add(d)
         }
 
         override fun onNext(conversationModel: ConversationModel) {
@@ -583,75 +2662,397 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    inner class SetReminderObserver : Observer<Reminder> {
-        override fun onSubscribe(d: Disposable) {
-            LifeCycleObserver.disposableSet.add(d)
-        }
-
-        override fun onNext(reminder: Reminder) {
-            Log.d(TAG, "reminder set successfully")
-        }
-
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when sending reminder, $e")
-        }
-
-        override fun onComplete() {
-            // unused atm
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun outOfOfficeStatusOfUser(credentials: String, baseUrl: String, userId: String) {
+        viewModelScope.launch {
+            try {
+                val response = chatNetworkDataSource.getOutOfOfficeStatusForUser(credentials, baseUrl, userId)
+                _outOfOfficeViewState.value = OutOfOfficeUIState.Success(response.ocs?.data!!)
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to fetch out-of-office status for user $userId", exception)
+                _outOfOfficeViewState.value = OutOfOfficeUIState.Error(exception)
+            }
         }
     }
 
-    inner class GetReminderObserver : Observer<Reminder> {
-        override fun onSubscribe(d: Disposable) {
-            LifeCycleObserver.disposableSet.add(d)
-        }
-
-        override fun onNext(reminder: Reminder) {
-            _getReminderExistState.value = GetReminderExistState(reminder)
-        }
-
-        override fun onError(e: Throwable) {
-            Log.d(TAG, "Error when getting reminder $e")
-            _getReminderExistState.value = GetReminderStartState
-        }
-
-        override fun onComplete() {
-            // unused atm
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun fetchUpcomingEvent(credentials: String, baseUrl: String, roomToken: String) {
+        viewModelScope.launch {
+            updateHiddenUpcomingEvent()
+            try {
+                val response = chatNetworkDataSource.getUpcomingEvents(credentials, baseUrl, roomToken)
+                val firstEvent = response.ocs?.data?.events?.firstOrNull()
+                if (firstEvent != null) {
+                    _upcomingEventViewState.value = UpcomingEventUIState.Success(firstEvent)
+                } else {
+                    _upcomingEventViewState.value = UpcomingEventUIState.None
+                }
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to fetch upcoming event for room $roomToken", exception)
+                _upcomingEventViewState.value = UpcomingEventUIState.Error(exception)
+            }
         }
     }
 
-    inner class CheckForNoteToSelfObserver : Observer<RoomsOverall> {
-        override fun onSubscribe(d: Disposable) {
-            LifeCycleObserver.disposableSet.add(d)
+    fun deleteTempMessage(chatMessage: ChatMessage) {
+        viewModelScope.launch {
+            chatRepository.deleteTempMessage(chatMessage)
         }
+    }
 
-        override fun onNext(roomsOverall: RoomsOverall) {
-            val rooms = roomsOverall.ocs?.data
-            rooms?.let {
-                try {
-                    val noteToSelf = rooms.first {
-                        val model = ConversationModel.mapToConversationModel(it)
-                        ConversationUtils.isNoteToSelfConversation(model)
+    @Suppress("Detekt.TooGenericExceptionCaught")
+    fun unbindRoom(credentials: String, baseUrl: String, roomToken: String) {
+        viewModelScope.launch {
+            try {
+                val response = chatNetworkDataSource.unbindRoom(credentials, baseUrl, roomToken)
+                _unbindRoomResult.value = UnbindRoomUiState.Success(response.ocs?.meta?.statusCode!!)
+            } catch (exception: Exception) {
+                logger.e(TAG, "Failed to unbind room $roomToken", exception)
+                _unbindRoomResult.value = UnbindRoomUiState.Error(exception.message.toString())
+            }
+        }
+    }
+
+    fun resendMessage(message: ChatMessage) {
+        val referenceId = message.referenceId.orEmpty()
+        viewModelScope.launch {
+            // PENDING without send work is never sent: both steps run even if this scope is cancelled.
+            withContext(NonCancellable) {
+                chatRepository.markMessageForResend(referenceId).collect { result ->
+                    if (result.isSuccess) {
+                        Log.d(TAG, "message marked pending for resend")
+                        SendMessageWorker.enqueue(
+                            internalConversationId = "${currentUser.id}@$chatRoomToken",
+                            referenceId = referenceId,
+                            threadTitle = null
+                        )
+                    } else {
+                        Log.e(TAG, "resend failed")
                     }
-                    _getNoteToSelfAvaliability.value = NoteToSelfAvaliableState(noteToSelf.token!!)
-                } catch (e: NoSuchElementException) {
-                    _getNoteToSelfAvaliability.value = NoteToSelfNotAvaliableState
-                    Log.e(TAG, "Note to self not found $e")
                 }
             }
         }
+    }
 
-        override fun onError(e: Throwable) {
-            Log.d(TAG, "Error when getting rooms for Note to Self Observer $e")
+    suspend fun fetchOpenGraph(url: String): OpenGraphObjectDto? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                chatNetworkDataSource.getOpenGraph(
+                    currentUser.getCredentials(),
+                    currentUser.baseUrl!!,
+                    url
+                )?.openGraphObject
+            }.getOrNull()
         }
 
-        override fun onComplete() {
-            // unused atm
+    suspend fun updateMessageDraft() {
+        val model = conversationRepository.getLocallyStoredConversation(
+            currentUser,
+            chatRoomToken
+        )
+        model?.messageDraft?.let {
+            messageDraft = it
         }
     }
 
+    fun saveMessageDraft() {
+        viewModelScope.launch {
+            val model = conversationRepository.getLocallyStoredConversation(
+                currentUser,
+                chatRoomToken
+            )
+            model?.let {
+                it.messageDraft = messageDraft
+                conversationRepository.updateConversation(it)
+            }
+        }
+    }
+
+    suspend fun updateHiddenUpcomingEvent() {
+        val model = conversationRepository.getLocallyStoredConversation(
+            currentUser,
+            chatRoomToken
+        )
+        model?.hiddenUpcomingEvent?.let {
+            hiddenUpcomingEvent = it
+        }
+    }
+
+    fun saveHiddenUpcomingEvent(value: String) {
+        hiddenUpcomingEvent = value
+        viewModelScope.launch {
+            val model = conversationRepository.getLocallyStoredConversation(
+                currentUser,
+                chatRoomToken
+            )
+            model?.let {
+                it.hiddenUpcomingEvent = value
+                conversationRepository.updateConversation(it)
+            }
+        }
+    }
+
+    fun pinMessage(credentials: String, url: String, messageId: Long, pinUntil: Int = 0) {
+        viewModelScope.launch {
+            chatRepository.pinMessage(credentials, url, pinUntil, messageId)
+            // the banner already shows the local state, the refresh re-asserts the server's
+            getRoom(chatRoomToken)
+        }
+    }
+
+    fun unPinMessage(credentials: String, url: String, messageId: Long) {
+        viewModelScope.launch {
+            chatRepository.unPinMessage(credentials, url, messageId)
+            // this updates the room if there are other pinned messages we need to show
+            getRoom(chatRoomToken)
+        }
+    }
+
+    fun hidePinnedMessage(credentials: String, url: String, messageId: Long) {
+        viewModelScope.launch {
+            chatRepository.hidePinnedMessage(credentials, url, messageId)
+            // the banner already follows the local state, the refresh re-asserts the server's
+            getRoom(chatRoomToken)
+        }
+    }
+
+    fun refreshRoom() {
+        viewModelScope.launch {
+            getRoom(chatRoomToken)
+        }
+    }
+
+    fun clearThreadTitle() {
+        messageDraft.threadTitle = ""
+        saveMessageDraft()
+    }
+
     companion object {
-        private val TAG = ChatViewModel::class.simpleName
+        private val TAG = ChatViewModel::class.java.simpleName
+        private const val MILLIS_PER_SECOND = 1000L
+
+        /** Enough of the note to self to cover what a share of ours could have landed behind. */
+        private const val SHARE_LOOKUP_LIMIT = 20
+
+        /**
+         * Whether [messages] already hold the share that was sent with [referenceId], or null when the
+         * server returned no messages to judge by, because the lookup failed or answered "not modified".
+         */
+        @VisibleForTesting
+        fun holdsShare(messages: List<ChatMessageDto>?, referenceId: String): Boolean? =
+            messages?.any { it.referenceId == referenceId }
+
+        /**
+         * Id of the newest message sent by the user that the server has already accepted, or null; the
+         * server marks everything up to it as read. Temporary messages (negative ids) are not accepted yet
+         * and are ignored.
+         */
+        internal fun newestOwnMessageId(messages: List<ChatMessage>): Int? =
+            messages.filter { !it.incoming && it.jsonMessageId > 0 }
+                .maxOfOrNull { it.jsonMessageId }
+
+        /**
+         * True while a text message of the user is on its way to the server: its temporary copy is stored
+         * and not failed, so the server may have accepted it (and moved the user's read marker to it)
+         * already, while its server copy is not in [messages] yet. This client must not send an older
+         * marker over it. A file placeholder is not counted before its upload is finished: the server has
+         * no message for it until then.
+         */
+        internal fun hasUnconfirmedOwnMessage(messages: List<ChatMessage>): Boolean =
+            messages.any { message ->
+                val isFileUploading = message.sendStatus != SendStatus.SENT_PENDING_ACK &&
+                    message.messageParameters.orEmpty().containsKey("file")
+                !message.incoming &&
+                    message.isTemporary &&
+                    message.sendStatus != SendStatus.FAILED &&
+                    !isFileUploading
+            }
+
+        /**
+         * The read marker to send to the server, or null when nothing has to be sent. The server sets the
+         * marker to a message at the moment the user sends it, so the client never sends a marker
+         * below the newest own message: that would move the marker back and leave the message with a
+         * single check mark for the other participants.
+         */
+        internal fun readMarkerToSend(
+            localLastReadMessage: Int,
+            conversationLastReadMessage: Int,
+            newestOwnMessageId: Int?,
+            hasUnconfirmedOwnMessage: Boolean
+        ): Int? =
+            localReadMarker(localLastReadMessage, conversationLastReadMessage, newestOwnMessageId)
+                .takeUnless { hasUnconfirmedOwnMessage }
+
+        /**
+         * The read marker to write into the local conversation state, or null when it has it already.
+         * Unlike [readMarkerToSend] it does not wait for an own message that is on its way: the local state
+         * is not sent anywhere, so the conversation list loses its unread count right away, also offline.
+         */
+        internal fun localReadMarker(
+            localLastReadMessage: Int,
+            conversationLastReadMessage: Int,
+            newestOwnMessageId: Int?
+        ): Int? = maxOf(localLastReadMessage, newestOwnMessageId ?: 0).takeIf { it > conversationLastReadMessage }
+
+        /**
+         * Ids of the messages a delete of [messageId] applies to: every already-uploaded message of the
+         * media group the message is shown in, or just the message itself.
+         */
+        internal fun messageIdsToDelete(items: List<ChatItem>, messageId: Int): List<Int> =
+            items
+                .filterIsInstance<ChatItem.MediaGroupItem>()
+                .firstOrNull { group -> group.messages.any { it.id == messageId } }
+                ?.messages
+                ?.filter { it.id == messageId || it.content !is MessageTypeContent.UploadingMedia }
+                ?.map { it.id }
+                ?: listOf(messageId)
+
+        /**
+         * Returns the read marker that makes [messageId] the first unread message: the id of the
+         * message right before it, or 0 when it is the oldest message there is, which marks the whole
+         * conversation as unread. Returns null when the message is not part of [items] at all.
+         *
+         * [items] run newest first, the way the chat list renders them bottom-up, so the message before
+         * the selected one is the next id in that order. Date headers and markers carry no message and
+         * are skipped; a media group carries several, its own messages ordered oldest last.
+         */
+        internal fun readMarkerForMarkingUnread(items: List<ChatItem>, messageId: Int): Int? {
+            val newestFirstIds = items.flatMap { item ->
+                item.messageIds().asReversed()
+            }
+
+            val selectedIndex = newestFirstIds.indexOf(messageId)
+            if (selectedIndex < 0) return null
+
+            return newestFirstIds.getOrNull(selectedIndex + 1) ?: 0
+        }
+
+        /**
+         * Returns the id of the first unread message, or null when it cannot be determined (yet).
+         *
+         * The position is only trustworthy when the visible window provably reaches back to the
+         * unread boundary, i.e. a message at or below [lastReadMessage] is visible. Without that
+         * proof the oldest visible message may still be far above the true first unread message
+         * (e.g. after a capped fetch of only the newest messages) and a marker latched onto it
+         * would sit in the middle of the unread messages. Temporary messages carry negative ids
+         * and don't count as proof.
+         */
+        internal fun findFirstUnreadMessageId(uiMessages: List<ChatMessageUi>, lastReadMessage: Int): Int? {
+            val unreadBoundaryIsVisible = uiMessages.any { it.id in 1..lastReadMessage }
+            if (!unreadBoundaryIsVisible) {
+                return null
+            }
+            return uiMessages.firstOrNull { it.id > lastReadMessage }?.id
+        }
+
         const val JOIN_ROOM_RETRY_COUNT: Long = 3
+        const val HTTP_CODE_OK: Int = 200
+        private const val CONVERSATION_AND_USER_FLOW_SHARING_TIMEOUT_MS = 5_000L
+        private const val WEBSOCKET_CONNECT_TIMEOUT_MS = 3000L
+        private const val WEBSOCKET_POLL_INTERVAL_MS = 50L
+        private const val ROOM_REFRESH_DEBOUNCE_MS = 500L
+        private const val MESSAGES_REBUILD_WINDOW_MS = 200L
+        private const val LOBBY_POLLING_INTERVAL_MS = 5_000L
+        private const val GROUPING_TIME_WINDOW_SECONDS = 300L
+        private const val TIMESTAMP_TO_MILLIS = 1000L
+        private const val MIN_CHARS_FOR_SEARCH = 2
+        private const val CONTEXT_MESSAGES_LIMIT = 50
+        private const val LOAD_MORE_MESSAGES_LIMIT = 100
+
+        // Increasing backoff for fetchNewMessagesWithRetry() - covers realistic server indexing
+        // lag (~20s total) so a just-sent upload doesn't sit stuck until the next insurance-request
+        // cycle (up to 2 minutes later) before its "sent, not yet confirmed" spinner clears.
+        private val POST_UPLOAD_FETCH_RETRY_DELAYS_MS = listOf(1_000L, 1_500L, 2_000L, 3_000L, 4_000L, 5_000L, 5_000L)
+        private const val LOCAL_PREVIEW_GRACE_PERIOD_MS = 15_000L
+    }
+
+    sealed class OutOfOfficeUIState {
+        data object None : OutOfOfficeUIState()
+        data class Success(val userAbsence: UserAbsenceDataDto) : OutOfOfficeUIState()
+        data class Error(val exception: Exception) : OutOfOfficeUIState()
+    }
+
+    sealed class UnbindRoomUiState {
+        data object None : UnbindRoomUiState()
+        data class Success(val statusCode: Int) : UnbindRoomUiState()
+        data class Error(val message: String) : UnbindRoomUiState()
+    }
+
+    sealed class ThreadRetrieveUiState {
+        data object None : ThreadRetrieveUiState()
+        data class Success(val thread: ThreadInfoDto?) : ThreadRetrieveUiState()
+        data class Error(val exception: Exception) : ThreadRetrieveUiState()
+    }
+
+    sealed class UpcomingEventUIState {
+        data object None : UpcomingEventUIState()
+        data class Success(val event: UpcomingEventDto) : UpcomingEventUIState()
+        data class Error(val exception: Exception) : UpcomingEventUIState()
+    }
+
+    sealed class ChatEvent {
+        object Initial : ChatEvent()
+        object StartRegularPolling : ChatEvent()
+        object Loading : ChatEvent()
+        object Ready : ChatEvent()
+        data class Error(val throwable: Throwable) : ChatEvent()
+    }
+
+    sealed interface ChatItem {
+        // For a MediaGroupItem, the last (newest) message stands in as the representative -
+        // matches how the grouped bubble itself is anchored (see MediaGroupItem docs below).
+        fun messageOrNull(): ChatMessageUi? =
+            when (this) {
+                is MessageItem -> uiMessage
+                is MediaGroupItem -> messages.lastOrNull()
+                else -> null
+            }
+
+        /** Ids of all messages this item stands for, oldest first. */
+        fun messageIds(): List<Int> =
+            when (this) {
+                is MessageItem -> collapsedMessageIds + uiMessage.id
+                is MediaGroupItem -> messages.map { it.id }
+                else -> emptyList()
+            }
+
+        fun containsMessage(messageId: Int): Boolean = messageId in messageIds()
+
+        fun dateOrNull(): LocalDate? =
+            when (this) {
+                is DateHeaderItem -> date
+                is UnreadMessagesMarkerItem -> date
+                else -> null
+            }
+
+        fun stableKey(): Any =
+            when (this) {
+                is MessageItem -> "msg_${uiMessage.id}"
+                is MediaGroupItem -> "msg_group_${messages.first().id}"
+                is DateHeaderItem -> "header_$date"
+                is UnreadMessagesMarkerItem -> "last_read_$date"
+                is LoadGapItem -> "load_gap_$anchorMessageId"
+            }
+
+        // collapsedMessageIds: the older deleted messages of the same upload batch that are shown as
+        // this one message only (see CombinedUnit.Collapsed), oldest first.
+        data class MessageItem(val uiMessage: ChatMessageUi, val collapsedMessageIds: List<Int> = emptyList()) :
+            ChatItem
+
+        // A run of consecutive single-file share messages from the same author - whether still
+        // uploading or already synced - uploaded together in one batch (matching referenceId hash,
+        // see groupHash()), rendered as one grouped "album" bubble instead of N separate bubbles.
+        // Ordered chronologically -
+        // messages.last() is the newest and stands in for the group wherever a single representative
+        // message is needed (bubble anchor, reactions, read status, pagination anchor id).
+        data class MediaGroupItem(val messages: List<ChatMessageUi>) : ChatItem
+        data class DateHeaderItem(val date: LocalDate) : ChatItem
+        data class UnreadMessagesMarkerItem(val date: LocalDate) : ChatItem
+        data class LoadGapItem(val anchorMessageId: Int) : ChatItem
+    }
+
+    @AssistedFactory
+    interface ChatViewModelFactory {
+        fun build(user: User, roomToken: String, conversationThreadId: Long?): ChatViewModel
     }
 }

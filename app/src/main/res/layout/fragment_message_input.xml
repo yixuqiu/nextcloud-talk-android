@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ~ Nextcloud Talk - Android Client
+  ~
+  ~ SPDX-FileCopyrightText: 2025 Andy Scherzinger <info@andy-scherzinger.de>
+  ~ SPDX-FileCopyrightText: 2024 Julius Linus <juliuslinus1@gmail.com>
+  ~ SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+
+    <androidx.compose.ui.platform.ComposeView
+        android:id="@+id/fragment_call_started"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="@dimen/standard_half_margin"
+        android:layout_marginVertical="@dimen/standard_margin"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/messageInputContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="@dimen/standard_half_margin"
+        android:layout_marginBottom="@dimen/standard_half_margin"
+        app:cardBackgroundColor="@color/bg_message_list_incoming_bubble"
+        app:cardCornerRadius="@dimen/button_corner_radius"
+        app:cardElevation="@dimen/zero"
+        app:strokeWidth="@dimen/zero">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <com.google.android.material.textview.MaterialTextView
+                android:id="@+id/fragment_connection_lost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@color/hwSecurityRed"
+                android:gravity="center"
+                android:text="@string/connection_lost_sent_messages_are_queued"
+                android:textColor="@color/white"
+                android:visibility="gone"
+                tools:visibility="visible" />
+
+            <include
+                android:id="@+id/fragment_editView"
+                layout="@layout/edit_message_view"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone"
+                tools:visibility="visible" />
+
+            <include
+                android:id="@+id/fragment_create_thread_view"
+                layout="@layout/create_thread_view"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <com.nextcloud.talk.ui.MessageInput
+                android:id="@+id/fragment_message_input_view"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:animateLayoutChanges="true"
+                android:inputType="textLongMessage|textAutoComplete"
+                android:maxLength="1000" />
+
+            <com.google.android.material.textview.MaterialTextView
+                android:id="@+id/reactionOnlyAffordance"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="@dimen/standard_margin"
+                android:gravity="center"
+                android:text="@string/nc_channel_only_moderators_can_post"
+                android:textColor="@color/medium_emphasis_text"
+                android:visibility="gone"
+                tools:visibility="visible" />
+
+            <androidx.emoji2.emojipicker.EmojiPickerView
+                android:id="@+id/emoji_picker"
+                android:layout_width="match_parent"
+                android:layout_height="250dp"
+                android:visibility="gone" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+</LinearLayout>

@@ -7,8 +7,8 @@
  */
 package com.nextcloud.talk.shareditems.repositories
 
-import android.net.Uri
 import android.util.Log
+import androidx.core.net.toUri
 import com.nextcloud.talk.R
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
@@ -20,22 +20,22 @@ import com.nextcloud.talk.shareditems.model.SharedItemType
 import com.nextcloud.talk.shareditems.model.SharedItems
 import com.nextcloud.talk.shareditems.model.SharedLocationItem
 import com.nextcloud.talk.shareditems.model.SharedOtherItem
+import com.nextcloud.talk.shareditems.model.SharedPinnedItem
 import com.nextcloud.talk.shareditems.model.SharedPollItem
 import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.DateConstants
 import com.nextcloud.talk.utils.DateUtils
 import io.reactivex.Observable
+import retrofit2.HttpException
 import retrofit2.Response
-import java.util.HashMap
 import java.util.Locale
 import javax.inject.Inject
 
 class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, private val dateUtils: DateUtils) :
     SharedItemsRepository {
 
-    override fun media(parameters: SharedItemsRepository.Parameters, type: SharedItemType): Observable<SharedItems>? {
-        return media(parameters, type, null)
-    }
+    override fun media(parameters: SharedItemsRepository.Parameters, type: SharedItemType): Observable<SharedItems>? =
+        media(parameters, type, null)
 
     override fun media(
         parameters: SharedItemsRepository.Parameters,
@@ -53,6 +53,7 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
         ).map { map(it, parameters, type) }
     }
 
+    @Suppress("LongMethod")
     private fun map(
         response: Response<ChatShareOverall>,
         parameters: SharedItemsRepository.Parameters,
@@ -65,21 +66,38 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
             chatLastGiven = response.headers()["x-chat-last-given"]!!.toInt()
         }
 
+        if (!response.isSuccessful) {
+            throw HttpException(response)
+        }
         val mediaItems = response.body()!!.ocs!!.data
         if (mediaItems != null) {
             for (it in mediaItems) {
-                val actorParameters = it.value.messageParameters!!["actor"]!!
+                val metaData = it.value.metaData
                 val dateTime = dateUtils.getLocalDateTimeStringFromTimestamp(
                     it.value.timestamp * DateConstants.SECOND_DIVIDER
                 )
 
-                if (it.value.messageParameters?.containsKey("file") == true) {
+                if (metaData != null) {
+                    val fileParameters = it.value.messageParameters?.get("file")
+                    val message = it.value.message!!
+                    val name = fileParameters?.get("name") ?: message
+
+                    val sharedItem = SharedPinnedItem(
+                        it.value.id.toString(),
+                        name,
+                        it.value.actorId!!,
+                        metaData.pinnedActorDisplayName!!,
+                        dateTime
+                    )
+                    items[it.value.id.toString()] = sharedItem
+                } else if (it.value.messageParameters?.containsKey("file") == true) {
                     val fileParameters = it.value.messageParameters!!["file"]!!
+                    val actorParameters = it.value.messageParameters!!["actor"]!!
 
                     val previewAvailable =
                         "yes".equals(fileParameters["preview-available"]!!, ignoreCase = true)
 
-                    items[it.value.id] = SharedFileItem(
+                    items[it.value.id.toString()] = SharedFileItem(
                         fileParameters["id"]!!,
                         fileParameters["name"]!!,
                         actorParameters["id"]!!,
@@ -90,18 +108,25 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
                         fileParameters["link"]!!,
                         fileParameters["mimetype"]!!,
                         previewAvailable,
-                        previewLink(fileParameters["id"], parameters.baseUrl!!)
+                        previewLink(fileParameters["id"], parameters.baseUrl!!),
+                        it.value.id,
+                        it.value.referenceId,
+                        it.value.timestamp
                     )
                 } else if (it.value.messageParameters?.containsKey("object") == true) {
                     val objectParameters = it.value.messageParameters!!["object"]!!
-                    items[it.value.id] = itemFromObject(objectParameters, actorParameters, dateTime)
+                    val actorParameters = it.value.messageParameters!!["actor"]!!
+                    items[it.value.id.toString()] = itemFromObject(objectParameters, actorParameters, dateTime)
                 } else {
                     Log.w(TAG, "Item contains neither 'file' or 'object'.")
                 }
             }
         }
 
-        val sortedMutableItems = items.toSortedMap().values.toList().reversed().toMutableList()
+        // Sort by numeric message id, not the map key's lexicographic String order (which would
+        // sort "10" before "9") - the viewer that consumes this list depends on true chronological
+        // order to reconstruct upload-batch groups and page adjacency correctly.
+        val sortedMutableItems = items.toSortedMap(compareBy { it.toLong() }).values.toList().reversed().toMutableList()
         val moreItemsExisting = items.count() == BATCH_SIZE
 
         return SharedItems(
@@ -136,7 +161,7 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
                     actorParameters["id"]!!,
                     actorParameters["name"]!!,
                     dateTime,
-                    Uri.parse(objectParameters["id"]!!.replace("geo:", "geo:0,0?z=11&q="))
+                    objectParameters["id"]!!.replace("geo:", "geo:0,0?z=11&q=").toUri()
                 )
             }
 
@@ -147,7 +172,7 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
                     actorParameters["id"]!!,
                     actorParameters["name"]!!,
                     dateTime,
-                    Uri.parse(objectParameters["link"]!!)
+                    objectParameters["link"]!!.toUri()
                 )
             }
 
@@ -169,7 +194,7 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
 
         return ncApi.getSharedItemsOverview(
             credentials,
-            ApiUtils.getUrlForChatSharedItemsOverview(1, parameters.baseUrl!!, parameters.roomToken),
+            ApiUtils.getUrlForChatSharedItemsOverview(1, parameters.baseUrl, parameters.roomToken),
             1
         ).map {
             val types = mutableSetOf<SharedItemType>()
@@ -193,13 +218,12 @@ class SharedItemsRepositoryImpl @Inject constructor(private val ncApi: NcApi, pr
         }
     }
 
-    private fun previewLink(fileId: String?, baseUrl: String): String {
-        return ApiUtils.getUrlForFilePreviewWithFileId(
+    private fun previewLink(fileId: String?, baseUrl: String): String =
+        ApiUtils.getUrlForFilePreviewWithFileId(
             baseUrl,
             fileId!!,
             sharedApplication!!.resources.getDimensionPixelSize(R.dimen.maximum_file_preview_size)
         )
-    }
 
     companion object {
         const val BATCH_SIZE: Int = 28

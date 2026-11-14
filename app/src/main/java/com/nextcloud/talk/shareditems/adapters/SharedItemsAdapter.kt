@@ -11,9 +11,14 @@ import android.content.Context
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
+import com.nextcloud.talk.chat.ChatActivity
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.databinding.SharedItemGridBinding
 import com.nextcloud.talk.databinding.SharedItemListBinding
+import com.nextcloud.talk.mediaviewer.activities.MediaViewerActivity
+import com.nextcloud.talk.mediaviewer.model.capSeedAroundMessage
+import com.nextcloud.talk.mediaviewer.model.isImageOrVideo
+import com.nextcloud.talk.mediaviewer.model.toMediaViewerItem
 import com.nextcloud.talk.polls.ui.PollMainDialogFragment
 import com.nextcloud.talk.shareditems.activities.SharedItemsActivity
 import com.nextcloud.talk.shareditems.model.SharedDeckCardItem
@@ -21,21 +26,26 @@ import com.nextcloud.talk.shareditems.model.SharedFileItem
 import com.nextcloud.talk.shareditems.model.SharedItem
 import com.nextcloud.talk.shareditems.model.SharedLocationItem
 import com.nextcloud.talk.shareditems.model.SharedOtherItem
+import com.nextcloud.talk.shareditems.model.SharedPinnedItem
 import com.nextcloud.talk.shareditems.model.SharedPollItem
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.bundle.BundleKeys
+import java.util.Collections.emptyList
 
 class SharedItemsAdapter(
     private val showGrid: Boolean,
     private val user: User,
     private val roomToken: String,
     private val isUserConversationOwnerOrModerator: Boolean,
+    private val isOne2One: Boolean,
     private val viewThemeUtils: ViewThemeUtils
 ) : RecyclerView.Adapter<SharedItemsViewHolder>() {
 
-    var items: List<SharedItem> = emptyList()
+    var items: MutableList<SharedItem> = emptyList()
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): SharedItemsViewHolder {
-        return if (showGrid) {
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): SharedItemsViewHolder =
+        if (showGrid) {
             SharedItemsGridViewHolder(
                 SharedItemGridBinding.inflate(
                     LayoutInflater.from(parent.context),
@@ -56,21 +66,19 @@ class SharedItemsAdapter(
                 viewThemeUtils
             )
         }
-    }
 
     override fun onBindViewHolder(holder: SharedItemsViewHolder, position: Int) {
         when (val item = items[position]) {
             is SharedPollItem -> holder.onBind(item, ::showPoll)
-            is SharedFileItem -> holder.onBind(item)
+            is SharedFileItem -> holder.onBind(item, ::openMediaViewer, ::openInChat)
             is SharedLocationItem -> holder.onBind(item)
             is SharedOtherItem -> holder.onBind(item)
             is SharedDeckCardItem -> holder.onBind(item)
+            is SharedPinnedItem -> holder.onBind(item, ::openMessage, ::unpinMessage)
         }
     }
 
-    override fun getItemCount(): Int {
-        return items.size
-    }
+    override fun getItemCount(): Int = items.size
 
     private fun showPoll(item: SharedItem, context: Context) {
         val pollVoteDialog = PollMainDialogFragment.newInstance(
@@ -83,6 +91,57 @@ class SharedItemsAdapter(
         pollVoteDialog.show(
             (context as SharedItemsActivity).supportFragmentManager,
             TAG
+        )
+    }
+
+    private fun unpinMessage(item: SharedItem, context: Context) {
+        val credentials = ApiUtils.getCredentials(user.username, user.token)
+        val url = ApiUtils.getUrlForChatMessagePinning(1, user.baseUrl, roomToken, item.id)
+
+        val canPin = isOne2One || isUserConversationOwnerOrModerator
+        if (canPin) {
+            credentials?.let {
+                (context as SharedItemsActivity).chatViewModel.unPinMessage(
+                    credentials,
+                    url,
+                    item.id.toLongOrNull() ?: 0L
+                )
+                val index = items.indexOf(item)
+                items.remove(item)
+                this.notifyItemRemoved(index)
+            }
+        }
+    }
+
+    // Seeds the swipeable viewer with every image/video currently loaded in this gallery (not just
+    // the tapped item), so swiping crosses between them the same way it does from the chat screen.
+    // Items are displayed newest-first (see SharedItemsRepositoryImpl.map()); toMediaViewerGroups()
+    // expects oldest-first, so the seed is sorted back before being passed along.
+    private fun openMediaViewer(item: SharedFileItem, context: Context) {
+        val seedItems = items
+            .filterIsInstance<SharedFileItem>()
+            .filter { it.isImageOrVideo() }
+            .sortedBy { it.messageId }
+            .map { it.toMediaViewerItem() }
+            .capSeedAroundMessage(item.messageId)
+        context.startActivity(
+            MediaViewerActivity.newIntent(context, user.id!!, roomToken, seedItems, item.messageId)
+        )
+    }
+
+    private fun openInChat(item: SharedFileItem, context: Context) {
+        val intent = ChatActivity.createIntent(context, user.id!!, roomToken).apply {
+            putExtra(BundleKeys.KEY_MESSAGE_ID, item.messageId)
+        }
+        context.startActivity(intent)
+    }
+
+    private fun openMessage(item: SharedItem, context: Context) {
+        (context as SharedItemsActivity).startContextChatWindowForMessage(
+            user,
+            roomToken,
+            item.id,
+            null
         )
     }
 

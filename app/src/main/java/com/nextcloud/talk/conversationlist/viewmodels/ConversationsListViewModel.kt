@@ -6,61 +6,1076 @@
  */
 package com.nextcloud.talk.conversationlist.viewmodels
 
+import android.content.Context
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
-import com.nextcloud.talk.conversationlist.data.ConversationsListRepository
+import androidx.lifecycle.viewModelScope
+import com.nextcloud.talk.R
+import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
+import com.nextcloud.talk.contacts.ContactsRepository
+import com.nextcloud.talk.conversationlist.data.OfflineConversationsRepository
+import com.nextcloud.talk.conversationlist.data.network.ConversationListUpdater
+import com.nextcloud.talk.conversationlist.ui.ConversationListEntry
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.invitation.data.InvitationsModel
 import com.nextcloud.talk.invitation.data.InvitationsRepository
+import com.nextcloud.talk.jobs.ConversationActionScheduler
+import com.nextcloud.talk.jobs.ConversationActionWorker.ConversationAction
+import com.nextcloud.talk.logger.Logger
+import com.nextcloud.talk.messagesearch.MessageSearchHelper
+import com.nextcloud.talk.messagesearch.MessageSearchHelper.MessageSearchResults
+import com.nextcloud.talk.models.domain.ConversationModel
+import com.nextcloud.talk.models.json.conversations.ConversationDto
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
+import com.nextcloud.talk.models.json.converters.EnumActorTypeConverter
+import com.nextcloud.talk.models.json.participants.ParticipantDto
+import com.nextcloud.talk.openconversations.data.OpenConversationsRepository
+import com.nextcloud.talk.repositories.unifiedsearch.UnifiedSearchRepository
+import com.nextcloud.talk.threadsoverview.data.ThreadsRepository
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.ARCHIVE
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.DEFAULT
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.MENTION
+import com.nextcloud.talk.ui.dialog.FilterConversationFragment.Companion.UNREAD
 import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CapabilitiesUtil.hasSpreedFeatureCapability
+import com.nextcloud.talk.utils.SpreedFeatures
+import com.nextcloud.talk.utils.UserIdUtils
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
-import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
 
-class ConversationsListViewModel @Inject constructor(
-    private val conversationsListRepository: ConversationsListRepository
-) :
-    ViewModel() {
+@Suppress("LongParameterList", "TooManyFunctions", "LargeClass")
+class ConversationsListViewModel @AssistedInject constructor(
+    private val repository: OfflineConversationsRepository,
+    private val threadsRepository: ThreadsRepository,
+    private val openConversationsRepository: OpenConversationsRepository,
+    private val contactsRepository: ContactsRepository,
+    private val unifiedSearchRepository: UnifiedSearchRepository,
+    private val invitationsRepository: InvitationsRepository,
+    private val arbitraryStorageManager: ArbitraryStorageManager,
+    var userManager: UserManager,
+    private val conversationListUpdater: ConversationListUpdater,
+    private val conversationActionScheduler: ConversationActionScheduler,
+    private val logger: Logger,
+    @Assisted val currentUser: User
+) : ViewModel() {
 
-    @Inject
-    lateinit var invitationsRepository: InvitationsRepository
+    val credentials = ApiUtils.getCredentials(currentUser.username, currentUser.token) ?: ""
 
-    @Inject
-    lateinit var userManager: UserManager
+    private val searchHelper = MessageSearchHelper(unifiedSearchRepository, currentUser)
 
     sealed interface ViewState
 
-    object GetFederationInvitationsStartState : ViewState
-    object GetFederationInvitationsErrorState : ViewState
+    sealed class ThreadsExistUiState {
+        data object None : ThreadsExistUiState()
+        data class Success(val threadsExistence: Boolean?) : ThreadsExistUiState()
+        data class Error(val exception: Exception) : ThreadsExistUiState()
+    }
 
-    open class GetFederationInvitationsSuccessState(val showInvitationsHint: Boolean) : ViewState
+    private val _threadsExistState = MutableStateFlow<ThreadsExistUiState>(ThreadsExistUiState.None)
+    val threadsExistState: StateFlow<ThreadsExistUiState> = _threadsExistState
 
-    private val _getFederationInvitationsViewState: MutableLiveData<ViewState> =
-        MutableLiveData(GetFederationInvitationsStartState)
-    val getFederationInvitationsViewState: LiveData<ViewState>
-        get() = _getFederationInvitationsViewState
+    sealed class OpenConversationsUiState {
+        data object None : OpenConversationsUiState()
+        data class Success(val conversations: List<ConversationDto>) : OpenConversationsUiState()
+        data class Error(val exception: Throwable) : OpenConversationsUiState()
+    }
 
-    object ShowBadgeStartState : ViewState
-    object ShowBadgeErrorState : ViewState
-    open class ShowBadgeSuccessState(val showBadge: Boolean) : ViewState
+    private val _openConversationsState = MutableStateFlow<OpenConversationsUiState>(OpenConversationsUiState.None)
+    val openConversationsState: StateFlow<OpenConversationsUiState> = _openConversationsState
 
-    private val _showBadgeViewState: MutableLiveData<ViewState> = MutableLiveData(ShowBadgeStartState)
-    val showBadgeViewState: LiveData<ViewState>
-        get() = _showBadgeViewState
+    sealed class ConversationReadUnreadUiState {
+        data object None : ConversationReadUnreadUiState()
+        data object Success : ConversationReadUnreadUiState()
+        data object Error : ConversationReadUnreadUiState()
+    }
+
+    private val _readUnreadState = MutableStateFlow<ConversationReadUnreadUiState>(ConversationReadUnreadUiState.None)
+    val readUnreadState: StateFlow<ConversationReadUnreadUiState> = _readUnreadState.asStateFlow()
+
+    sealed class FavoriteUiState {
+        data object None : FavoriteUiState()
+        data object Success : FavoriteUiState()
+        data object Error : FavoriteUiState()
+    }
+
+    private val _favoriteState = MutableStateFlow<FavoriteUiState>(FavoriteUiState.None)
+    val favoriteState: StateFlow<FavoriteUiState> = _favoriteState.asStateFlow()
+
+    sealed class ArchiveUiState {
+        data object None : ArchiveUiState()
+        data class Success(val archived: Boolean, val conversationDisplayName: String) : ArchiveUiState()
+        data object Error : ArchiveUiState()
+    }
+
+    private val _archiveState = MutableStateFlow<ArchiveUiState>(ArchiveUiState.None)
+    val archiveState: StateFlow<ArchiveUiState> = _archiveState.asStateFlow()
+
+    object GetRoomsStartState : ViewState
+    class GetRoomsErrorState(val throwable: Throwable) : ViewState
+    open class GetRoomsSuccessState(val listIsNotEmpty: Boolean) : ViewState
+
+    private val _getRoomsViewState: MutableLiveData<ViewState> = MutableLiveData(GetRoomsStartState)
+    val getRoomsViewState: LiveData<ViewState>
+        get() = _getRoomsViewState
+
+    val getRoomsFlow = repository.roomListFlow(currentUser.id!!)
+        .onEach { list ->
+            _getRoomsViewState.value = GetRoomsSuccessState(list.isNotEmpty())
+        }.catch {
+            _getRoomsViewState.value = GetRoomsErrorState(it)
+        }
+
+    init {
+        repository.syncErrorFlow
+            // e.g. the sync of the account shown before switching to this one
+            .filter { syncError -> syncError.accountId == currentUser.id }
+            .onEach { syncError -> _getRoomsViewState.value = GetRoomsErrorState(syncError.throwable) }
+            .launchIn(viewModelScope)
+    }
+
+    private val _isLoadingRooms = MutableStateFlow(true)
+
+    /**
+     * Number of [getRooms] jobs that have not completed yet. Guarded by [roomSyncsLock], together
+     * with the matching update of [_isLoadingRooms]: [getRooms] is also called off the main thread,
+     * from a background event subscriber.
+     */
+    private var roomSyncsInFlight = 0
+    private val roomSyncsLock = Any()
+
+    /**
+     * True while any [getRooms] call is in progress (from start until the last overlapping
+     * fetch-Job completes, i.e. after both the local-DB and the network-sync emissions have been
+     * produced).
+     */
+    val isLoadingRooms: StateFlow<Boolean> = _isLoadingRooms.asStateFlow()
+
+    val getRoomsStateFlow = repository
+        .roomListFlow(currentUser.id!!)
+        .catch { throwable ->
+            Log.e(TAG, "Error observing the conversation list", throwable)
+            _getRoomsViewState.value = GetRoomsErrorState(throwable)
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, listOf())
+
+    /** The conversations stored now, also those a sync stored that [getRoomsStateFlow] doesn't have yet. */
+    suspend fun storedRooms(): List<ConversationModel> = repository.roomListFlow(currentUser.id!!).first()
+
+    /**
+     * Drives the shimmer skeleton visibility. Visible while rooms are still being loaded for
+     * the first time (no data in the list yet). Hidden as soon as either the room list is
+     * non-empty or the loading job has fully completed.
+     */
+    val isShimmerVisible: StateFlow<Boolean> = combine(
+        _isLoadingRooms,
+        getRoomsStateFlow
+    ) { isLoading, rooms ->
+        isLoading && rooms.isEmpty()
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    private val _federationInvitationHintVisible = MutableStateFlow(false)
+    val federationInvitationHintVisible: StateFlow<Boolean> = _federationInvitationHintVisible.asStateFlow()
+
+    private val _showAvatarBadge = MutableStateFlow(false)
+    val showAvatarBadge: StateFlow<Boolean> = _showAvatarBadge.asStateFlow()
+
+    private val searchResultEntries: MutableStateFlow<List<ConversationListEntry>> =
+        MutableStateFlow(emptyList())
+
+    /** Job tracking the currently active [getSearchQuery] coroutine; canceled on cleanup. */
+    private var searchJob: Job? = null
+
+    /**
+     * Tracks the query that the last completed/running [getSearchQuery] call was started for.
+     * Used to skip re-searching the same query on configuration changes (rotation, display
+     * off/on) where the [LaunchedEffect] in the Compose toolbar fires again with an unchanged
+     * key but a brand-new composition.  Reset whenever search is canceled or deactivated so
+     * that the next explicit search always runs.
+     */
+    private var lastSearchedFilter: String = ""
+
+    /**
+     * The message entries shown after "load more", which replace the first page of messages
+     * whenever a later server response rebuilds the search results.
+     */
+    private var loadedMoreMessageEntries: List<ConversationListEntry>? = null
+
+    /** Job of the running [loadMoreMessages] call, which belongs to [searchJob]. */
+    private var loadMoreJob: Job? = null
+
+    /**
+     * Whether the first page of messages of [searchJob] has arrived. Until then, a "load more"
+     * entry still shown from the previous query must not load more messages.
+     */
+    private var areMessagesLoaded = false
+
+    private val _filterStateFlow = MutableStateFlow<Map<String, Boolean>>(
+        mapOf(MENTION to false, UNREAD to false, ARCHIVE to false, DEFAULT to true)
+    )
+    val filterStateFlow: StateFlow<Map<String, Boolean>> = _filterStateFlow.asStateFlow()
+
+    private val _isSearchActiveFlow = MutableStateFlow(false)
+    val isSearchActiveFlow: StateFlow<Boolean> = _isSearchActiveFlow.asStateFlow()
+
+    private val _currentSearchQueryFlow = MutableStateFlow("")
+    val currentSearchQueryFlow: StateFlow<String> = _currentSearchQueryFlow.asStateFlow()
+
+    /**
+     * True from the moment the user types a non-empty query until every
+     * server request of the search has answered.  Used by the UI to distinguish "waiting for results" from
+     * "search completed with no results", so that [SearchNoResultsView] is not shown
+     * prematurely during the search round-trip.
+     */
+    private val _isSearchLoadingFlow = MutableStateFlow(false)
+    val isSearchLoadingFlow: StateFlow<Boolean> = _isSearchLoadingFlow.asStateFlow()
+
+    private val _selectedConversationForOps = MutableStateFlow<ConversationModel?>(null)
+    val selectedConversationForOps: StateFlow<ConversationModel?> = _selectedConversationForOps.asStateFlow()
+
+    fun setSelectedConversationForOps(model: ConversationModel?) {
+        _selectedConversationForOps.value = model
+    }
+
+    fun clearSelectedConversationForOpsWithDelay(delayMs: Long) {
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(delayMs)
+            _selectedConversationForOps.value = null
+        }
+    }
+
+    private val hideRoomToken = MutableStateFlow<String?>(null)
+
+    /** Tokens of rooms being left or deleted; hidden optimistically until the request finished. */
+    private val pendingRemovalTokens = MutableStateFlow<Set<String>>(emptySet())
+
+    private val excludedRoomTokens = combine(hideRoomToken, pendingRemovalTokens) { hideToken, pendingTokens ->
+        if (hideToken != null) pendingTokens + hideToken else pendingTokens
+    }
+
+    private enum class SearchDisplayMode {
+        OFF,
+        ALL_CONVERSATIONS,
+        RESULTS
+    }
+
+    private data class TagFilterSelection(val tagId: String? = null, val isFavorites: Boolean = false)
+
+    private val _selectedTagFilterFlow = MutableStateFlow<String?>(null)
+    val selectedTagFilterFlow: StateFlow<String?> = _selectedTagFilterFlow.asStateFlow()
+
+    // Favorites has a real, server-assigned id, so the caller tells us if it's the one selected.
+    private val selectedTagIsFavoritesFlow = MutableStateFlow(false)
+
+    /** Select a tag to filter the conversation list, or null to clear the filter. */
+    fun selectTagFilter(tagId: String?, isFavorites: Boolean = false) {
+        _selectedTagFilterFlow.value = tagId
+        selectedTagIsFavoritesFlow.value = tagId != null && isFavorites
+    }
+
+    private val searchDisplayModeFlow = combine(_isSearchActiveFlow, _currentSearchQueryFlow) { active, query ->
+        when {
+            !active -> SearchDisplayMode.OFF
+            query.isEmpty() -> SearchDisplayMode.ALL_CONVERSATIONS
+            else -> SearchDisplayMode.RESULTS
+        }
+    }
+
+    /**
+     * Single source of truth for the [ConversationList] LazyColumn.
+     * Auto-reacts to rooms, filter, tag filter, search-active and search-result changes.
+     */
+    val conversationListEntriesFlow: StateFlow<List<ConversationListEntry>> = combine(
+        getRoomsStateFlow,
+        _filterStateFlow,
+        searchDisplayModeFlow,
+        combine(_selectedTagFilterFlow, selectedTagIsFavoritesFlow, ::TagFilterSelection),
+        combine(searchResultEntries, excludedRoomTokens, ::Pair)
+    ) { rooms, filterState, searchMode, tagFilter, (searchResults, excludedTokens) ->
+        buildConversationListEntries(rooms, filterState, searchMode, tagFilter, searchResults, excludedTokens)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /**
+     * Rooms that would actually be shown in the list under the current filter chips
+     * (mention/unread/archive) and hidden-room/lobby rules, but *before* narrowing to a
+     * specific tag. Used to decide which tag filter chips currently have a matching,
+     * visible conversation - e.g. a tag whose only conversation is archived should not
+     * show up as a chip unless the "Archived" filter is active.
+     */
+    val visibleRoomsFlow: StateFlow<List<ConversationModel>> = combine(
+        getRoomsStateFlow,
+        _filterStateFlow,
+        searchDisplayModeFlow,
+        excludedRoomTokens
+    ) { rooms, filterState, searchMode, excludedTokens ->
+        baseFilterRooms(rooms, filterState, searchMode, excludedTokens)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Clears the tag filter when the filtered-by tag no longer exists (e.g. it was deleted). */
+    fun clearTagFilterIfMatches(tagId: String) {
+        if (_selectedTagFilterFlow.value == tagId) {
+            _selectedTagFilterFlow.value = null
+            selectedTagIsFavoritesFlow.value = false
+        }
+    }
+
+    /** Update filter state; triggers [conversationListEntriesFlow] re-emit. */
+    fun applyFilter(newFilterState: Map<String, Boolean>) {
+        _filterStateFlow.value = newFilterState
+    }
+
+    /**
+     * Reload filter settings from [ArbitraryStorageManager] and update [filterStateFlow].
+     * Runs on IO dispatcher; [conversationListEntriesFlow] will re-emit once done.
+     */
+    fun reloadFilterFromStorage(accountId: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val mention = arbitraryStorageManager.getStorageSetting(accountId, MENTION, "")
+                .blockingGet()?.value == "true"
+            val unread = arbitraryStorageManager.getStorageSetting(accountId, UNREAD, "")
+                .blockingGet()?.value == "true"
+            val archive = arbitraryStorageManager.getStorageSetting(accountId, ARCHIVE, "")
+                .blockingGet()?.value == "true"
+            _filterStateFlow.value = mapOf(
+                MENTION to mention,
+                UNREAD to unread,
+                ARCHIVE to archive,
+                DEFAULT to true
+            )
+        }
+    }
+
+    /** Cancel any active message search and clear search results. */
+    fun cancelSearch() {
+        cancelRunningSearch()
+        _isSearchLoadingFlow.value = false
+        searchHelper.cancelSearch()
+        searchResultEntries.value = emptyList()
+        _currentSearchQueryFlow.value = ""
+    }
+
+    /**
+     * Updates the displayed query text and stops the search of a previous query. The search
+     * itself is started by [getSearchQuery], which waits for a pause in typing before it sends
+     * the server requests.
+     */
+    fun setSearchQuery(text: String) {
+        _currentSearchQueryFlow.value = text
+        when {
+            text.isEmpty() -> {
+                cancelRunningSearch()
+                _isSearchLoadingFlow.value = false
+                searchResultEntries.value = emptyList()
+            }
+
+            text != lastSearchedFilter -> {
+                cancelRunningSearch()
+                _isSearchLoadingFlow.value = true
+            }
+        }
+    }
+
+    /** Stops the search of the previous query, so that its server responses no longer replace the results. */
+    private fun cancelRunningSearch() {
+        loadMoreJob?.cancel()
+        loadMoreJob = null
+        searchJob?.cancel()
+        searchJob = null
+        lastSearchedFilter = ""
+        loadedMoreMessageEntries = null
+        areMessagesLoaded = false
+    }
+
+    /** Mark the SearchView as expanded (true) or collapsed (false). */
+    fun setIsSearchActive(active: Boolean) {
+        _isSearchActiveFlow.value = active
+        if (!active) {
+            cancelSearch()
+        } else {
+            // Clear any stale results from a previous search so they don't
+            // flash on screen before the user has typed the first character.
+            cancelRunningSearch()
+            _isSearchLoadingFlow.value = false
+            searchResultEntries.value = emptyList()
+            _currentSearchQueryFlow.value = ""
+        }
+    }
+
+    /** Exclude the forward-source room token from the list. */
+    fun setHideRoomToken(token: String?) {
+        hideRoomToken.value = token
+    }
+
+    /** Optimistically hide a room that is being left or deleted. */
+    fun markConversationPendingRemoval(token: String) {
+        pendingRemovalTokens.value = pendingRemovalTokens.value + token
+    }
+
+    /** Un-hide a room, either because the removal was undone or because it finished or failed. */
+    fun clearConversationPendingRemoval(token: String) {
+        pendingRemovalTokens.value = pendingRemovalTokens.value - token
+    }
 
     fun getFederationInvitations() {
-        _getFederationInvitationsViewState.value = GetFederationInvitationsStartState
-        _showBadgeViewState.value = ShowBadgeStartState
+        _federationInvitationHintVisible.value = false
+        _showAvatarBadge.value = false
 
-        userManager.users.blockingGet()?.forEach {
-            invitationsRepository.fetchInvitations(it)
-                .subscribeOn(Schedulers.io())
-                ?.observeOn(AndroidSchedulers.mainThread())
-                ?.subscribe(FederatedInvitationsObserver())
+        viewModelScope.launch {
+            userManager.getUsers().forEach {
+                invitationsRepository.fetchInvitations(it)
+                    .subscribeOn(Schedulers.io())
+                    ?.observeOn(AndroidSchedulers.mainThread())
+                    ?.subscribe(FederatedInvitationsObserver())
+            }
         }
+    }
+
+    @Suppress("LongMethod")
+    fun getSearchQuery(context: Context, filter: String) {
+        // The LaunchedEffect fires again with the same query when the composition restarts
+        // (rotation, display off). The search of that query is still running or done, because
+        // [setSearchQuery] cancels it as soon as the query changes, so it is not started again.
+        if (filter == lastSearchedFilter && searchJob != null) return
+
+        cancelRunningSearch()
+        _isSearchLoadingFlow.value = true
+        lastSearchedFilter = filter
+        _currentSearchQueryFlow.value = filter
+        val conversationsTitle = context.resources.getString(R.string.conversations)
+        val openConversationsTitle = context.resources.getString(R.string.openConversations)
+        val usersTitle = context.resources.getString(R.string.nc_user)
+        val messagesTitle = context.resources.getString(R.string.messages)
+        val actorTypeConverter = EnumActorTypeConverter()
+        val wordPattern = """\b${Regex.escape(filter)}\b""".toRegex(RegexOption.IGNORE_CASE)
+
+        searchJob = viewModelScope.launch {
+            combine(
+                getRoomsStateFlow,
+                openConversationsRepository.fetchOpenConversationsFlow(currentUser, filter)
+                    .afterTypingPause()
+                    .pendingUntilLoaded(emptyList()),
+                contactsRepository.getContactsFlow(currentUser, filter)
+                    .afterTypingPause()
+                    .pendingUntilLoaded(emptyList()),
+                getMessagesFlow(filter)
+                    .afterTypingPause()
+                    .pendingUntilLoaded(MessageSearchResults(emptyList(), false))
+            ) { rooms, pendingOpenConvs, pendingContacts, pendingMessages ->
+                val isAnyRemotePending = pendingOpenConvs == null || pendingContacts == null || pendingMessages == null
+                val fetchedOpenConvs = pendingOpenConvs.orEmpty()
+                val contacts = pendingContacts.orEmpty()
+                val messages = pendingMessages?.messages.orEmpty()
+                val hasMore = pendingMessages?.hasMore == true
+                areMessagesLoaded = pendingMessages != null
+                val localConvs = rooms
+                    .filter { it.displayName?.contains(filter, ignoreCase = true) == true }
+                    .distinctBy { it.token }
+                // Open conversations were fetched once, so a room joined afterwards would otherwise be listed twice
+                val joinedTokens = rooms.mapTo(HashSet()) { it.token }
+                val openConvs = fetchedOpenConvs
+                    .filter { it.token !in joinedTokens }
+                    .distinctBy { it.token }
+                val entries = mutableListOf<ConversationListEntry>()
+
+                if (localConvs.isNotEmpty()) {
+                    entries.add(ConversationListEntry.Header(conversationsTitle))
+                    sortedByMatchQuality(
+                        localConvs,
+                        { it.name },
+                        filter,
+                        wordPattern,
+                        isSingleUser = { it.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL }
+                    ).forEach { entries.add(ConversationListEntry.ConversationEntry(it)) }
+                }
+                if (openConvs.isNotEmpty()) {
+                    entries.add(ConversationListEntry.Header(openConversationsTitle))
+                    sortedByMatchQuality(
+                        openConvs,
+                        { it.name },
+                        filter,
+                        wordPattern,
+                        isSingleUser = { it.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL }
+                    ).forEach { conv ->
+                        entries.add(
+                            ConversationListEntry.ConversationEntry(
+                                ConversationModel.mapToConversationModel(conv, currentUser)
+                            )
+                        )
+                    }
+                }
+                if (contacts.isNotEmpty()) {
+                    entries.add(ConversationListEntry.Header(usersTitle))
+                    sortedByMatchQuality(contacts, { it.label }, filter, wordPattern)
+                        .forEach { autocompleteUser ->
+                            val participant = ParticipantDto()
+                            participant.actorId = autocompleteUser.id
+                            participant.actorType = actorTypeConverter.getFromString(autocompleteUser.source)
+                            participant.displayName = autocompleteUser.label
+                            entries.add(ConversationListEntry.ContactEntry(participant))
+                        }
+                }
+                val messageEntries = loadedMoreMessageEntries
+                    ?: sortedByMatchQuality(
+                        messages,
+                        { it.messageExcerpt },
+                        filter,
+                        wordPattern,
+                        exactMatchEnabled = false
+                    )
+                        .map { ConversationListEntry.MessageResultEntry(it) }
+                        .plus(listOfNotNull(ConversationListEntry.LoadMore.takeIf { hasMore }))
+                if (messageEntries.any { it is ConversationListEntry.MessageResultEntry }) {
+                    entries.add(ConversationListEntry.Header(messagesTitle))
+                }
+                entries.addAll(messageEntries)
+
+                entries.toList() to isAnyRemotePending
+            }.collect { (results, isAnyRemotePending) ->
+                searchResultEntries.emit(results)
+                _isSearchLoadingFlow.value = isAnyRemotePending
+            }
+        }
+    }
+
+    /**
+     * Starts the server request only once the query has stayed unchanged for [SEARCH_DEBOUNCE_MS],
+     * so that typing does not send a request per keystroke. Changing the query cancels the search
+     * while it still waits.
+     */
+    private fun <T> Flow<T>.afterTypingPause(): Flow<T> = onStart { delay(SEARCH_DEBOUNCE_MS) }
+
+    /**
+     * Emits null at once so that [combine] does not wait for the server before showing local results.
+     * A failed request emits [onError] so that it does not stay pending.
+     */
+    private fun <T : Any> Flow<T>.pendingUntilLoaded(onError: T): Flow<T?> =
+        onStart<T?> { emit(null) }
+            .catch { e ->
+                Log.e(TAG, "Search request failed", e)
+                emit(onError)
+            }
+
+    // Sort keys in order:
+    //   1. tier: 0 = exact title, 1 = starts with filter, 2 = whole-word match, 3 = substring
+    //   2. isSingleUser: 0 = 1-on-1 conversation, 1 = group/other (optional)
+    //   3. position of the match in the text (earlier = better, tiebreaker within tier)
+    // exactMatchEnabled = false for messages, where an exact excerpt match is not a meaningful tier.
+    private fun <T> sortedByMatchQuality(
+        list: List<T>,
+        getText: (T) -> String?,
+        filter: String,
+        wordPattern: Regex,
+        exactMatchEnabled: Boolean = true,
+        isSingleUser: ((T) -> Boolean)? = null
+    ): List<T> =
+        list.sortedWith(
+            compareBy(
+                { item ->
+                    val text = getText(item)
+                    when {
+                        text == null -> MATCH_RANK_NONE
+                        exactMatchEnabled && text.trim().equals(filter, ignoreCase = true) -> MATCH_RANK_EXACT
+                        text.startsWith(filter, ignoreCase = true) -> MATCH_RANK_PREFIX
+                        text.contains(wordPattern) -> MATCH_RANK_WORD
+                        else -> MATCH_RANK_NONE
+                    }
+                },
+                { item -> if (isSingleUser?.invoke(item) == true) SINGLE_USER_RANK else MULTI_USER_RANK },
+                { item ->
+                    val pos = getText(item)?.indexOf(filter, ignoreCase = true) ?: -1
+                    if (pos >= 0) pos else Int.MAX_VALUE
+                }
+            )
+        )
+
+    private fun getMessagesFlow(search: String): Flow<MessageSearchResults> =
+        flow {
+            emit(searchHelper.startMessageSearch(search))
+        }.flowOn(Dispatchers.IO)
+
+    fun loadMoreMessages(context: Context) {
+        if (!areMessagesLoaded || loadMoreJob?.isActive == true) return
+        loadMoreJob = viewModelScope.launch {
+            val result = try {
+                withContext(Dispatchers.IO) { searchHelper.loadMore() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (@Suppress("Detekt.TooGenericExceptionCaught") e: Exception) {
+                Log.e(TAG, "Loading more messages failed", e)
+                null
+            }
+            if (result == null) {
+                removeLoadMoreEntry()
+                return@launch
+            }
+
+            val newEntries: List<ConversationListEntry> =
+                result.messages.map { ConversationListEntry.MessageResultEntry(it) }
+            val entriesWithLoadMore = if (result.hasMore) {
+                newEntries + ConversationListEntry.LoadMore
+            } else {
+                newEntries
+            }
+            loadedMoreMessageEntries = entriesWithLoadMore
+
+            searchResultEntries.update { current ->
+                val withoutOld = current.filter { entry ->
+                    entry !is ConversationListEntry.MessageResultEntry &&
+                        entry !is ConversationListEntry.LoadMore
+                }
+                withoutOld + entriesWithLoadMore
+            }
+        }
+    }
+
+    /** Removes the "load more" entry, as the message search can't continue after a failed request. */
+    private fun removeLoadMoreEntry() {
+        val entries = searchResultEntries.value.filterNot { it is ConversationListEntry.LoadMore }
+        loadedMoreMessageEntries = entries.filterIsInstance<ConversationListEntry.MessageResultEntry>()
+        searchResultEntries.value = entries
+    }
+
+    /**
+     * Refreshes the conversation list, unless a room list sync is already running, a search is
+     * open, or the sync would fetch the whole list without the refresh cadence calling for it.
+     *
+     * The in-flight check covers the room list request only: [getRooms] completes once the list is
+     * stored and leaves the message catch-up running, so a tick can start while messages of the
+     * previous one are still being fetched. That is deliberate - the list is what this refreshes.
+     *
+     * Whether a sync is due is read from stored state, and a read that fails must not take the
+     * refresh loop with it: this runs every tick for as long as the screen is open, and an
+     * exception would escape the loop's scope rather than skip one refresh. That read suspends, so
+     * it is done before the other checks: a sync or a search started while it runs is still seen.
+     */
+    suspend fun refreshRoomsIfIdle(user: User) {
+        val syncDue = isPeriodicSyncDue(user)
+        when {
+            _isLoadingRooms.value ->
+                Log.d(TAG, "Foreground refresh skipped: a room list sync is already in flight")
+
+            _isSearchActiveFlow.value ->
+                Log.d(TAG, "Foreground refresh skipped: a search is active")
+
+            !syncDue ->
+                Log.d(TAG, "Foreground refresh skipped: no delta available and no full sync due")
+
+            else -> getRooms(user)
+        }
+    }
+
+    /** Whether the cadence calls for a sync, treating a failed read of the stored state as yes. */
+    private suspend fun isPeriodicSyncDue(user: User): Boolean =
+        runCatching { repository.isPeriodicSyncDue(user) }.getOrElse { throwable ->
+            if (throwable is CancellationException) throw throwable
+            Log.w(TAG, "Could not read when the last sync was, refreshing anyway", throwable)
+            true
+        }
+
+    fun getRooms(user: User, forceFullSync: Boolean = false): Job {
+        val startNanoTime = System.nanoTime()
+        Log.d(TAG, "fetchData - getRooms - calling: $startNanoTime")
+        val job = repository.getRooms(user, forceFullSync)
+        // overlapping syncs (resume, pull to refresh, a refresh tick) must not end the loading
+        // state while another one is still running, or pull to refresh stops spinning too early
+        synchronized(roomSyncsLock) {
+            roomSyncsInFlight++
+            _isLoadingRooms.value = true
+        }
+        viewModelScope.launch {
+            try {
+                job.join()
+            } finally {
+                synchronized(roomSyncsLock) {
+                    roomSyncsInFlight--
+                    if (roomSyncsInFlight == 0) {
+                        _isLoadingRooms.value = false
+                    }
+                }
+            }
+        }
+        return job
+    }
+
+    /**
+     * Keeps a conversation the user left or deleted out of the list until the sync that drops it for
+     * good has landed, so it cannot flash back in between the request succeeding and the list
+     * catching up.
+     */
+    fun onConversationRemoved(user: User, token: String) {
+        val job = getRooms(user, forceFullSync = true)
+        viewModelScope.launch {
+            job.join()
+            clearConversationPendingRemoval(token)
+        }
+    }
+
+    fun checkIfThreadsExist() {
+        val limitForFollowedThreadsExistenceCheck = 1
+        val accountId = UserIdUtils.getIdForUser(currentUser)
+
+        fun isLastCheckTooOld(lastCheckDate: Long): Boolean {
+            val currentTimeMillis = System.currentTimeMillis()
+            val differenceMillis = currentTimeMillis - lastCheckDate
+            val checkIntervalInMillis = TimeUnit.HOURS.toMillis(2)
+            return differenceMillis > checkIntervalInMillis
+        }
+
+        @Suppress("Detekt.TooGenericExceptionCaught")
+        fun checkIfFollowedThreadsExist() {
+            val threadsUrl = ApiUtils.getUrlForSubscribedThreads(
+                version = 1,
+                baseUrl = currentUser.baseUrl
+            )
+
+            viewModelScope.launch {
+                try {
+                    val threads =
+                        threadsRepository.getThreads(credentials, threadsUrl, limitForFollowedThreadsExistenceCheck)
+                    val followedThreadsExistNew = threads.ocs?.data?.isNotEmpty()
+                    _threadsExistState.value = ThreadsExistUiState.Success(followedThreadsExistNew)
+                    val followedThreadsExistLastCheckNew = System.currentTimeMillis()
+                    arbitraryStorageManager.storeStorageSetting(
+                        accountId,
+                        FOLLOWED_THREADS_EXIST_LAST_CHECK,
+                        followedThreadsExistLastCheckNew.toString(),
+                        ""
+                    )
+                    arbitraryStorageManager.storeStorageSetting(
+                        accountId,
+                        FOLLOWED_THREADS_EXIST,
+                        followedThreadsExistNew.toString(),
+                        ""
+                    )
+                } catch (exception: Exception) {
+                    logger.e(TAG, "Failed to check whether followed threads exist", exception)
+                    _threadsExistState.value = ThreadsExistUiState.Error(exception)
+                }
+            }
+        }
+
+        if (!hasSpreedFeatureCapability(currentUser.capabilities?.spreedCapability, SpreedFeatures.THREADS)) {
+            _threadsExistState.value = ThreadsExistUiState.Success(false)
+            return
+        }
+
+        val followedThreadsExistOld = arbitraryStorageManager.getStorageSetting(
+            accountId,
+            FOLLOWED_THREADS_EXIST,
+            ""
+        ).blockingGet()?.value?.toBoolean() ?: false
+
+        val followedThreadsExistLastCheckOld = arbitraryStorageManager.getStorageSetting(
+            accountId,
+            FOLLOWED_THREADS_EXIST_LAST_CHECK,
+            ""
+        ).blockingGet()?.value?.toLong()
+
+        if (followedThreadsExistOld) {
+            Log.d(TAG, "followed threads exist for this user. No need to check again.")
+            _threadsExistState.value = ThreadsExistUiState.Success(true)
+        } else {
+            if (followedThreadsExistLastCheckOld == null || isLastCheckTooOld(followedThreadsExistLastCheckOld)) {
+                Log.d(TAG, "check if followed threads exist never happened or is too old. Checking now...")
+                checkIfFollowedThreadsExist()
+            } else {
+                _threadsExistState.value = ThreadsExistUiState.Success(false)
+                Log.d(TAG, "already checked in the last 2 hours if followed threads exist. Skip check.")
+            }
+        }
+    }
+
+    suspend fun fetchOpenConversations(searchTerm: String) =
+        withContext(Dispatchers.IO) {
+            _openConversationsState.value = OpenConversationsUiState.None
+
+            if (!hasSpreedFeatureCapability(
+                    currentUser.capabilities?.spreedCapability,
+                    SpreedFeatures.LISTABLE_ROOMS
+                )
+            ) {
+                return@withContext
+            }
+
+            val apiVersion = ApiUtils.getConversationApiVersion(
+                currentUser,
+                intArrayOf(ApiUtils.API_V4, ApiUtils.API_V3, 1)
+            )
+            val url = ApiUtils.getUrlForOpenConversations(apiVersion, currentUser.baseUrl!!)
+
+            openConversationsRepository.fetchConversations(currentUser, url, searchTerm)
+                .onSuccess { conversations ->
+                    if (conversations.isEmpty()) {
+                        _openConversationsState.value = OpenConversationsUiState.None
+                    } else {
+                        _openConversationsState.value = OpenConversationsUiState.Success(conversations)
+                    }
+                }
+                .onFailure { exception ->
+                    Log.e(TAG, "Failed to fetch conversations", exception)
+                    _openConversationsState.value = OpenConversationsUiState.Error(exception)
+                }
+        }
+
+    @Suppress("LongParameterList")
+    private fun buildConversationListEntries(
+        rooms: List<ConversationModel>,
+        filterState: Map<String, Boolean>,
+        searchMode: SearchDisplayMode,
+        tagFilter: TagFilterSelection,
+        searchResults: List<ConversationListEntry>,
+        excludedTokens: Set<String>
+    ): List<ConversationListEntry> {
+        if (searchMode == SearchDisplayMode.RESULTS) return searchResults
+
+        var filtered = baseFilterRooms(rooms, filterState, searchMode, excludedTokens)
+
+        if (searchMode != SearchDisplayMode.ALL_CONVERSATIONS) {
+            filtered = when {
+                tagFilter.isFavorites -> filtered.filter { it.favorite }
+                tagFilter.tagId != null -> filtered.filter { it.tagIds.contains(tagFilter.tagId) }
+                else -> filtered
+            }
+        }
+
+        val sorted = filtered.sortedWith(
+            compareByDescending<ConversationModel> { it.favorite }
+                .thenByDescending { it.lastActivity }
+        )
+        return sorted.distinctBy { it.token }.map { ConversationListEntry.ConversationEntry(it) }
+    }
+
+    /**
+     * Applies the hidden-room/lobby rules and the current filter chips (mention/unread/archive),
+     * but not the tag filter. Shared by [buildConversationListEntries] and [visibleRoomsFlow] so
+     * that both the list content and the tag-chip visibility agree on what "visible" means.
+     */
+    private fun baseFilterRooms(
+        rooms: List<ConversationModel>,
+        filterState: Map<String, Boolean>,
+        searchMode: SearchDisplayMode,
+        excludedTokens: Set<String>
+    ): List<ConversationModel> {
+        val hasFilterEnabled = filterState[MENTION] == true ||
+            filterState[UNREAD] == true ||
+            filterState[ARCHIVE] == true
+
+        var filtered = rooms
+            .filter { it.token !in excludedTokens }
+            .filter { conversation ->
+                !(
+                    conversation.objectType == ConversationEnums.ObjectType.ROOM &&
+                        conversation.lobbyState == ConversationEnums.LobbyState.LOBBY_STATE_MODERATORS_ONLY
+                    )
+            }
+
+        filtered = when {
+            // While search is open with an empty query, all conversations are listed,
+            // ignoring active filters and the default hiding of archived/future-event rooms
+            searchMode == SearchDisplayMode.ALL_CONVERSATIONS -> filtered
+            hasFilterEnabled -> filtered.filter { filterConversationModel(it, filterState) }
+            else -> filtered.filter { !isFutureEvent(it) && !it.hasArchived }
+        }
+        return filtered
+    }
+
+    @Suppress("CyclomaticComplexMethod", "NestedBlockDepth")
+    private fun filterConversationModel(conversation: ConversationModel, filterState: Map<String, Boolean>): Boolean {
+        var result = true
+        for ((k, v) in filterState) {
+            if (v) {
+                when (k) {
+                    MENTION -> result = (result && conversation.unreadMention) ||
+                        (
+                            result &&
+                                (
+                                    conversation.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL ||
+                                        conversation.type == ConversationEnums.ConversationType.FORMER_ONE_TO_ONE
+                                    ) &&
+                                (conversation.unreadMessages > 0)
+                            )
+                    UNREAD -> result = result && (conversation.unreadMessages > 0)
+                    DEFAULT -> result = if (filterState[ARCHIVE] == true) {
+                        result && conversation.hasArchived
+                    } else {
+                        result && !conversation.hasArchived
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private fun isFutureEvent(conversation: ConversationModel): Boolean {
+        val eventTimeStart = conversation.objectId.substringBefore("#").toLongOrNull() ?: return false
+        val currentTimeStampInSeconds = System.currentTimeMillis() / LONG_1000
+        return conversation.objectType == ConversationEnums.ObjectType.EVENT &&
+            (eventTimeStart - currentTimeStampInSeconds) > SIXTEEN_HOURS_IN_SECONDS
+    }
+
+    fun resetReadUnreadState() {
+        _readUnreadState.value = ConversationReadUnreadUiState.None
+    }
+
+    fun resetFavoriteState() {
+        _favoriteState.value = FavoriteUiState.None
+    }
+
+    fun resetArchiveState() {
+        _archiveState.value = ArchiveUiState.None
+    }
+
+    fun markConversationAsRead(conversation: ConversationModel) {
+        // a federated conversation sends no message id, so the server marks it read up to its last message
+        val lastReadMessage =
+            if (conversation.remoteServer.isNullOrEmpty()) conversation.lastMessage?.id?.toInt() else null
+        applyAndSend(
+            action = ConversationAction.MarkRead(lastReadMessage),
+            original = conversation,
+            optimistic = conversation.copy(unreadMessages = 0, unreadMention = false, unreadMentionDirect = false),
+            onApplied = { _readUnreadState.value = ConversationReadUnreadUiState.Success },
+            onFailed = { _readUnreadState.value = ConversationReadUnreadUiState.Error }
+        )
+    }
+
+    fun markConversationAsUnread(conversation: ConversationModel) {
+        applyAndSend(
+            action = ConversationAction.MarkUnread,
+            original = conversation,
+            optimistic = conversation.copy(unreadMessages = 1),
+            onApplied = { _readUnreadState.value = ConversationReadUnreadUiState.Success },
+            onFailed = { _readUnreadState.value = ConversationReadUnreadUiState.Error }
+        )
+    }
+
+    fun toggleConversationArchive(conversation: ConversationModel) {
+        val desiredArchived = !conversation.hasArchived
+        applyAndSend(
+            action = ConversationAction.Archive(desiredArchived),
+            original = conversation,
+            optimistic = conversation.copy(hasArchived = desiredArchived),
+            onApplied = { _archiveState.value = ArchiveUiState.Success(desiredArchived, conversation.displayName) },
+            onFailed = { _archiveState.value = ArchiveUiState.Error }
+        )
+    }
+
+    fun addConversationToFavorites(conversation: ConversationModel) {
+        setFavorite(conversation, favorite = true)
+    }
+
+    fun removeConversationFromFavorites(conversation: ConversationModel) {
+        setFavorite(conversation, favorite = false)
+    }
+
+    private fun setFavorite(conversation: ConversationModel, favorite: Boolean) {
+        applyAndSend(
+            action = ConversationAction.Favorite(favorite),
+            original = conversation,
+            optimistic = conversation.copy(favorite = favorite),
+            onApplied = { _favoriteState.value = FavoriteUiState.Success },
+            onFailed = { _favoriteState.value = FavoriteUiState.Error }
+        )
+    }
+
+    /**
+     * Sends [action] through [ConversationActionScheduler] and shows [optimistic] meanwhile.
+     *
+     * - The guard is set first, so a worker that is done at once finds it to release.
+     * - The work is enqueued outside [viewModelScope], so leaving the screen cannot keep it from being sent.
+     * - Showing the change and waiting only happen while the screen is there. If the worker gives up, [original]
+     *   is put back and [onFailed] is called; if the screen is gone by then, the next sync restores it instead.
+     */
+    private fun applyAndSend(
+        action: ConversationAction,
+        original: ConversationModel,
+        optimistic: ConversationModel,
+        onApplied: () -> Unit,
+        onFailed: () -> Unit
+    ) {
+        markPending(original.internalId, action)
+        val workId = conversationActionScheduler.enqueue(currentUser.id!!, original.token, action)
+
+        viewModelScope.launch {
+            applyLocally(optimistic)
+            onApplied()
+
+            if (conversationActionScheduler.awaitWorkerGaveUp(workId)) {
+                logger.e(TAG, "Failed to send $action for a conversation")
+                restore(original, action)
+                onFailed()
+            }
+        }
+    }
+
+    /** Sets the guard for [action]; the worker releases it once the change went through or failed. */
+    private fun markPending(internalConversationId: String, action: ConversationAction) {
+        when (action) {
+            is ConversationAction.MarkRead ->
+                conversationListUpdater.switchToPendingMarkAsRead(internalConversationId, action.lastReadMessage)
+            ConversationAction.MarkUnread ->
+                conversationListUpdater.switchToPendingMarkAsUnread(internalConversationId)
+            is ConversationAction.Favorite ->
+                conversationListUpdater.markPendingFavorite(internalConversationId, action.favorite)
+            is ConversationAction.Archive ->
+                conversationListUpdater.markPendingArchived(internalConversationId, action.archived)
+        }
+    }
+
+    private suspend fun applyLocally(conversation: ConversationModel) {
+        withContext(Dispatchers.IO) { repository.updateConversation(conversation) }
+    }
+
+    /**
+     * Puts back only the field [action] owns, on top of whatever the entry holds by now. Each action is
+     * carried by its own work, so writing the whole captured conversation back would undo a different
+     * action that succeeded while this one was still in flight.
+     */
+    @VisibleForTesting
+    internal suspend fun restore(original: ConversationModel, action: ConversationAction) {
+        val current = repository.getLocallyStoredConversation(currentUser, original.token) ?: original
+        applyLocally(
+            when (action) {
+                is ConversationAction.MarkRead -> current.copy(
+                    unreadMessages = original.unreadMessages,
+                    unreadMention = original.unreadMention,
+                    unreadMentionDirect = original.unreadMentionDirect
+                )
+                ConversationAction.MarkUnread -> current.copy(unreadMessages = original.unreadMessages)
+                is ConversationAction.Favorite -> current.copy(favorite = original.favorite)
+                is ConversationAction.Archive -> current.copy(hasArchived = original.hasArchived)
+            }
+        )
     }
 
     inner class FederatedInvitationsObserver : Observer<InvitationsModel> {
@@ -69,25 +1084,18 @@ class ConversationsListViewModel @Inject constructor(
         }
 
         override fun onNext(invitationsModel: InvitationsModel) {
-            val currentUser = userManager.currentUser.blockingGet()
-
             if (invitationsModel.user.userId?.equals(currentUser.userId) == true &&
                 invitationsModel.user.baseUrl?.equals(currentUser.baseUrl) == true
             ) {
-                if (invitationsModel.invitations.isNotEmpty()) {
-                    _getFederationInvitationsViewState.value = GetFederationInvitationsSuccessState(true)
-                } else {
-                    _getFederationInvitationsViewState.value = GetFederationInvitationsSuccessState(false)
-                }
+                _federationInvitationHintVisible.value = invitationsModel.invitations.isNotEmpty()
             } else {
                 if (invitationsModel.invitations.isNotEmpty()) {
-                    _showBadgeViewState.value = ShowBadgeSuccessState(true)
+                    _showAvatarBadge.value = true
                 }
             }
         }
 
         override fun onError(e: Throwable) {
-            _getFederationInvitationsViewState.value = GetFederationInvitationsErrorState
             Log.e(TAG, "Failed to fetch pending invitations", e)
         }
 
@@ -96,7 +1104,23 @@ class ConversationsListViewModel @Inject constructor(
         }
     }
 
+    @AssistedFactory
+    interface Factory {
+        fun build(user: User): ConversationsListViewModel
+    }
+
     companion object {
-        private val TAG = ConversationsListViewModel::class.simpleName
+        private val TAG = ConversationsListViewModel::class.java.simpleName
+        const val FOLLOWED_THREADS_EXIST_LAST_CHECK = "FOLLOWED_THREADS_EXIST_LAST_CHECK"
+        const val FOLLOWED_THREADS_EXIST = "FOLLOWED_THREADS_EXIST"
+        private const val SIXTEEN_HOURS_IN_SECONDS: Long = 57600
+        private const val LONG_1000: Long = 1000
+        private const val MATCH_RANK_EXACT = 0
+        private const val MATCH_RANK_PREFIX = 1
+        private const val MATCH_RANK_WORD = 2
+        private const val MATCH_RANK_NONE = 3
+        private const val SEARCH_DEBOUNCE_MS = 300L
+        private const val SINGLE_USER_RANK = 0
+        private const val MULTI_USER_RANK = 1
     }
 }

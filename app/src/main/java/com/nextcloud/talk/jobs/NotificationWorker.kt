@@ -1,7 +1,7 @@
 /*
  * Nextcloud Talk - Android Client
  *
- * SPDX-FileCopyrightText: 2021-2023 Marcel Hibbe <dev@mhibbe.de>
+ * SPDX-FileCopyrightText: 2021-2025 Marcel Hibbe <dev@mhibbe.de>
  * SPDX-FileCopyrightText: 2022 Andy Scherzinger <info@andy-scherzinger.de>
  * SPDX-FileCopyrightText: 2017-2018 Mario Danic <mario@lovelyhq.com>
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -15,8 +15,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.media.AudioAttributes
-import android.media.MediaPlayer
+import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -33,49 +32,67 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import androidx.core.app.TaskStackBuilder
 import androidx.core.content.ContextCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 import androidx.core.graphics.drawable.toBitmap
+import androidx.core.net.toUri
 import androidx.emoji2.text.EmojiCompat
 import androidx.work.Data
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import autodagger.AutoInjector
+import coil.executeBlocking
+import coil.imageLoader
+import coil.request.ImageRequest
 import com.bluelinelabs.logansquare.LoganSquare
 import com.nextcloud.talk.BuildConfig
 import com.nextcloud.talk.R
-import com.nextcloud.talk.activities.MainActivity
+import com.nextcloud.talk.activities.CallActivity
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
 import com.nextcloud.talk.arbitrarystorage.ArbitraryStorageManager
 import com.nextcloud.talk.callnotification.CallNotificationActivity
-import com.nextcloud.talk.chat.data.ChatRepository
-import com.nextcloud.talk.models.SignatureVerification
+import com.nextcloud.talk.chat.ChatActivity
+import com.nextcloud.talk.chat.data.network.ChatNetworkDataSource
+import com.nextcloud.talk.conversationlist.ConversationsListActivity
+import com.nextcloud.talk.conversationlist.DirectShareHelper
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.invitation.InvitationsActivity
+import com.nextcloud.talk.logger.Logger
 import com.nextcloud.talk.models.domain.ConversationModel
-import com.nextcloud.talk.models.domain.ConversationType
 import com.nextcloud.talk.models.json.chat.ChatUtils.Companion.getParsedMessage
+import com.nextcloud.talk.models.json.conversations.ConversationEnums
 import com.nextcloud.talk.models.json.notifications.NotificationOverall
-import com.nextcloud.talk.models.json.participants.Participant
+import com.nextcloud.talk.models.json.participants.ParticipantDto
 import com.nextcloud.talk.models.json.participants.ParticipantsOverall
-import com.nextcloud.talk.models.json.push.DecryptedPushMessage
-import com.nextcloud.talk.models.json.push.NotificationUser
+import com.nextcloud.talk.models.json.push.DecryptedPushMessageDto
+import com.nextcloud.talk.models.json.push.NotificationUserDto
+import com.nextcloud.talk.receivers.DeclineCallReceiver
 import com.nextcloud.talk.receivers.DirectReplyReceiver
 import com.nextcloud.talk.receivers.DismissRecordingAvailableReceiver
 import com.nextcloud.talk.receivers.MarkAsReadReceiver
 import com.nextcloud.talk.receivers.ShareRecordingToChatReceiver
 import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ActorAvatar
 import com.nextcloud.talk.utils.ApiUtils
+import com.nextcloud.talk.utils.CharacterAvatarUtils
 import com.nextcloud.talk.utils.ConversationUtils
-import com.nextcloud.talk.utils.DoNotDisturbUtils.shouldPlaySound
+import com.nextcloud.talk.utils.DeepLinkHandler
+import com.nextcloud.talk.utils.DisplayUtils
+import com.nextcloud.talk.utils.InternalEntryPoint
 import com.nextcloud.talk.utils.NotificationUtils
 import com.nextcloud.talk.utils.NotificationUtils.cancelAllNotificationsForAccount
 import com.nextcloud.talk.utils.NotificationUtils.cancelNotification
 import com.nextcloud.talk.utils.NotificationUtils.findNotificationForRoom
 import com.nextcloud.talk.utils.NotificationUtils.getCallRingtoneUri
-import com.nextcloud.talk.utils.NotificationUtils.getMessageRingtoneUri
 import com.nextcloud.talk.utils.NotificationUtils.loadAvatarSync
 import com.nextcloud.talk.utils.ParticipantPermissions
 import com.nextcloud.talk.utils.PushUtils
+import com.nextcloud.talk.utils.ShortcutManagerHelper
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_DISMISS_RECORDING_URL
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_FROM_NOTIFICATION_START_CALL
@@ -84,35 +101,37 @@ import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_MESSAGE_ID
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_NOTIFICATION_ID
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_NOTIFICATION_RESTRICT_DELETION
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_NOTIFICATION_TIMESTAMP
-import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_REMOTE_TALK_SHARE
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_OPENED_VIA_NOTIFICATION
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_ONE_TO_ONE
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_ROOM_TOKEN
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SHARE_RECORDING_TO_CHAT_URL
 import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_SYSTEM_NOTIFICATION_ID
+import com.nextcloud.talk.utils.bundle.BundleKeys.KEY_THREAD_ID
 import com.nextcloud.talk.utils.preferences.AppPreferences
-import com.nextcloud.talk.utils.singletons.ApplicationWideCurrentRoomHolder
 import io.reactivex.Observable
 import io.reactivex.Observer
-import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
 import io.reactivex.schedulers.Schedulers
+import kotlinx.coroutines.runBlocking
 import okhttp3.JavaNetCookieJar
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
-import java.io.IOException
 import java.net.CookieManager
 import java.security.InvalidKeyException
 import java.security.NoSuchAlgorithmException
 import java.security.PrivateKey
 import java.util.concurrent.TimeUnit
-import java.util.function.Consumer
 import java.util.zip.CRC32
+import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.NoSuchPaddingException
 import javax.inject.Inject
 
+@Suppress("TooManyFunctions", "LargeClass", "CyclomaticComplexMethod")
 @AutoInjector(NextcloudTalkApplication::class)
 class NotificationWorker(context: Context, workerParams: WorkerParameters) : Worker(context, workerParams) {
+
+    @Inject lateinit var logger: Logger
 
     @Inject
     lateinit var appPreferences: AppPreferences
@@ -125,7 +144,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
     @Inject
     var retrofit: Retrofit? = null
 
-    var chatRepository: ChatRepository? = null
+    var chatNetworkDataSource: ChatNetworkDataSource? = null
         @Inject set
 
     @Inject
@@ -136,41 +155,46 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
     var okHttpClient: OkHttpClient? = null
     private lateinit var credentials: String
     private lateinit var ncApi: NcApi
-    private lateinit var pushMessage: DecryptedPushMessage
-    private lateinit var signatureVerification: SignatureVerification
+    private lateinit var pushMessage: DecryptedPushMessageDto
+    private lateinit var user: User
     private var context: Context? = null
     private var conversationType: String? = "one2one"
-    private var muteCall = false
-    private var importantConversation = false
     private lateinit var notificationManager: NotificationManagerCompat
+    private var imagePreviewUrl: String? = null
+    private var imageMimeType: String? = null
 
     override fun doWork(): Result {
         sharedApplication!!.componentApplication.inject(this)
         context = applicationContext
 
-        initDecryptedData(inputData)
+        logger.d(TAG, "NotificationWorker::doWork")
+
+        if (!initDecryptedData(inputData)) {
+            logger.e(TAG, "Aborting NotificationWorker::doWork because user/pushMessage could not be initialized")
+            return Result.failure()
+        }
         initNcApiAndCredentials()
 
         notificationManager = NotificationManagerCompat.from(context!!)
 
         pushMessage.timestamp = System.currentTimeMillis()
 
-        Log.d(TAG, pushMessage.toString())
-        Log.d(TAG, "pushMessage.id (=KEY_ROOM_TOKEN): " + pushMessage.id)
-        Log.d(TAG, "pushMessage.notificationId: " + pushMessage.notificationId)
-        Log.d(TAG, "pushMessage.notificationIds: " + pushMessage.notificationIds)
-        Log.d(TAG, "pushMessage.timestamp: " + pushMessage.timestamp)
+        logger.d(TAG, pushMessage.toString())
+        logger.d(TAG, "pushMessage.id (=KEY_ROOM_TOKEN): " + pushMessage.id)
+        logger.d(TAG, "pushMessage.notificationId: " + pushMessage.notificationId)
+        logger.d(TAG, "pushMessage.notificationIds: " + pushMessage.notificationIds.toString())
+        logger.d(TAG, "pushMessage.timestamp: " + pushMessage.timestamp)
 
         if (pushMessage.delete) {
-            cancelNotification(context, signatureVerification.user!!, pushMessage.notificationId)
+            cancelNotification(context, user, pushMessage.notificationId)
         } else if (pushMessage.deleteAll) {
-            cancelAllNotificationsForAccount(context, signatureVerification.user!!)
+            cancelAllNotificationsForAccount(context, user)
         } else if (pushMessage.deleteMultiple) {
             for (notificationId in pushMessage.notificationIds!!) {
-                cancelNotification(context, signatureVerification.user!!, notificationId)
+                cancelNotification(context, user, notificationId)
             }
         } else if (isTalkNotification()) {
-            Log.d(TAG, "pushMessage.type: " + pushMessage.type)
+            logger.d(TAG, "pushMessage.type: " + pushMessage.type)
             when (pushMessage.type) {
                 TYPE_CHAT, TYPE_ROOM, TYPE_RECORDING, TYPE_REMINDER -> handleNonCallPushMessage()
                 TYPE_REMOTE_TALK_SHARE -> handleRemoteTalkSharePushMessage()
@@ -178,60 +202,62 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 else -> Log.e(TAG, pushMessage.type + " is not handled")
             }
         } else if (isAdminTalkNotification()) {
-            Log.d(TAG, "pushMessage.type: " + pushMessage.type)
+            logger.d(TAG, "pushMessage.type: " + pushMessage.type)
             when (pushMessage.type) {
-                TYPE_ADMIN_NOTIFICATIONS -> handleTestPushMessage()
+                TYPE_ADMIN_NOTIFICATIONS -> handleInternalPushMessage()
                 else -> Log.e(TAG, pushMessage.type + " is not handled")
             }
+        } else if (isInternal()) {
+            handleInternalPushMessage()
         } else {
-            Log.d(TAG, "a pushMessage that is not for spreed was received.")
+            logger.d(TAG, "a pushMessage that is not for spreed was received.")
         }
 
         return Result.success()
     }
 
-    private fun handleTestPushMessage() {
-        val intent = Intent(context, MainActivity::class.java)
-        intent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-        showNotification(intent, null)
+    private fun handleInternalPushMessage() {
+        showNotification(ConversationsListActivity.createAccountSwitchIntent(context!!, user.id!!), null)
     }
 
     private fun handleNonCallPushMessage() {
-        val mainActivityIntent = createMainActivityIntent()
-        if (pushMessage.notificationId != Long.MIN_VALUE) {
-            getNcDataAndShowNotification(mainActivityIntent)
-        } else {
-            showNotification(mainActivityIntent, null)
+        getNcDataAndShowNotification(createContentIntent())
+    }
+
+    /**
+     * Enqueues a [ChatMessageCatchUpWorker] that prefetches the pushed room's messages into the
+     * local database so they are instantly visible when the chat is opened from the notification
+     * (or later). For messages in a thread, [threadId] targets the thread so its chat block is
+     * extended. The worker runs independently of this one: the notification is displayed
+     * beforehand and a slow or failing fetch (retried there with backoff) can never delay it.
+     */
+    private fun catchUpPushedRoom(threadId: Long?) {
+        val roomToken = pushMessage.id
+        if (pushMessage.type != TYPE_CHAT || roomToken == null) {
+            logger.d(TAG, "Skipping message catch-up for pushed room (not a chat push)")
+            return
         }
+        ChatMessageCatchUpWorker.enqueue(applicationContext, user.id!!, roomToken, threadId)
     }
 
     private fun handleRemoteTalkSharePushMessage() {
-        val mainActivityIntent = Intent(context, MainActivity::class.java)
-        mainActivityIntent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-        val bundle = Bundle()
-        bundle.putLong(KEY_INTERNAL_USER_ID, signatureVerification.user!!.id!!)
-        bundle.putBoolean(KEY_REMOTE_TALK_SHARE, true)
-        mainActivityIntent.putExtras(bundle)
-
-        if (pushMessage.notificationId != Long.MIN_VALUE) {
-            getNcDataAndShowNotification(mainActivityIntent)
-        } else {
-            showNotification(mainActivityIntent, null)
-        }
+        getNcDataAndShowNotification(
+            Intent(context, InvitationsActivity::class.java).putExtra(KEY_INTERNAL_USER_ID, user.id!!)
+        )
     }
 
+    @Suppress("LongMethod", "TooGenericExceptionCaught")
     private fun handleCallPushMessage() {
-        val userBeingCalled = userManager.getUserWithId(signatureVerification.user!!.id!!).blockingGet()
+        val userBeingCalled = runBlocking { userManager.getUserWithId(user.id!!) }
 
-        fun prepareCallNotificationScreen(conversation: ConversationModel) {
-            val fullScreenIntent = Intent(context, CallNotificationActivity::class.java)
+        fun createBundle(conversation: ConversationModel): Bundle {
             val bundle = Bundle()
             bundle.putString(KEY_ROOM_TOKEN, pushMessage.id)
             bundle.putInt(KEY_NOTIFICATION_TIMESTAMP, pushMessage.timestamp.toInt())
-            bundle.putLong(KEY_INTERNAL_USER_ID, signatureVerification.user!!.id!!)
+            bundle.putLong(KEY_INTERNAL_USER_ID, user.id!!)
             bundle.putBoolean(KEY_FROM_NOTIFICATION_START_CALL, true)
 
-            val isOneToOneCall = conversation.type === ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
+            val isOneToOneCall = conversation.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL
 
             bundle.putBoolean(KEY_ROOM_ONE_TO_ONE, isOneToOneCall) // ggf change in Activity? not necessary????
             bundle.putString(BundleKeys.KEY_CONVERSATION_NAME, conversation.name)
@@ -239,7 +265,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
             bundle.putInt(BundleKeys.KEY_CALL_FLAG, conversation.callFlag)
 
             val participantPermission = ParticipantPermissions(
-                userBeingCalled!!.capabilities!!.spreedCapability!!,
+                userBeingCalled?.capabilities?.spreedCapability,
                 conversation
             )
             bundle.putBoolean(
@@ -254,9 +280,16 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 BundleKeys.KEY_IS_MODERATOR,
                 ConversationUtils.isParticipantOwnerOrModerator(conversation)
             )
+            return bundle
+        }
+
+        @Suppress("LongMethod")
+        fun prepareCallNotificationScreen(conversation: ConversationModel) {
+            val fullScreenIntent = Intent(context, CallNotificationActivity::class.java)
+            val bundle = createBundle(conversation)
 
             fullScreenIntent.putExtras(bundle)
-            fullScreenIntent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+            fullScreenIntent.flags = getIntentFlags()
 
             val requestCode = System.currentTimeMillis().toInt()
 
@@ -264,17 +297,53 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 context,
                 requestCode,
                 fullScreenIntent,
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                } else {
-                    PendingIntent.FLAG_UPDATE_CURRENT
-                }
+                pendingIntentFlags()
+            )
+
+            val pendingIntentFlags = pendingIntentFlags()
+
+            val isVideoCall = (conversation.callFlag and ParticipantDto.InCallFlags.WITH_VIDEO) > 0
+
+            val answerBundle = Bundle(bundle).apply { putBoolean(BundleKeys.KEY_CALL_VOICE_ONLY, !isVideoCall) }
+            val answerPendingIntentOffset =
+                if (isVideoCall) ANSWER_VIDEO_REQUEST_OFFSET else ANSWER_VOICE_REQUEST_OFFSET
+            val primaryAnswerIntent = PendingIntent.getActivity(
+                applicationContext,
+                requestCode + answerPendingIntentOffset,
+                Intent(applicationContext, CallActivity::class.java).apply {
+                    putExtras(answerBundle)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+                pendingIntentFlags
+            )
+
+            val declinePendingIntent = PendingIntent.getBroadcast(
+                applicationContext,
+                requestCode + DECLINE_CALL_REQUEST_OFFSET,
+                Intent(applicationContext, DeclineCallReceiver::class.java).apply {
+                    putExtra(KEY_NOTIFICATION_TIMESTAMP, pushMessage.timestamp.toInt())
+                },
+                pendingIntentFlags
             )
 
             val soundUri = getCallRingtoneUri(applicationContext, appPreferences)
-            val notificationChannelId = NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V4.name
-            val uri = Uri.parse(signatureVerification.user!!.baseUrl!!)
+            val notificationChannelId = NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_CALLS_V5.name
+            val uri = user.baseUrl!!.toUri()
             val baseUrl = uri.host
+
+            val callerPersonBuilder = Person.Builder()
+                .setName(conversation.displayName)
+                .setImportant(true)
+            if (conversation.type == ConversationEnums.ConversationType.ROOM_TYPE_ONE_TO_ONE_CALL) {
+                val avatarUrl = ApiUtils.getUrlForAvatar(
+                    user.baseUrl!!,
+                    conversation.name,
+                    false,
+                    darkMode = DisplayUtils.isDarkModeOn(applicationContext)
+                )
+                loadAvatarSync(avatarUrl, applicationContext)?.let { callerPersonBuilder.setIcon(it) }
+            }
+            val callerPerson = callerPersonBuilder.build()
 
             val notification =
                 NotificationCompat.Builder(applicationContext, notificationChannelId)
@@ -292,43 +361,33 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                     .setContentIntent(fullScreenPendingIntent)
                     .setFullScreenIntent(fullScreenPendingIntent, true)
                     .setSound(soundUri)
+                    .setStyle(
+                        NotificationCompat.CallStyle
+                            .forIncomingCall(callerPerson, declinePendingIntent, primaryAnswerIntent)
+                            .setIsVideo(isVideoCall)
+                    )
                     .build()
             notification.flags = notification.flags or Notification.FLAG_INSISTENT
 
             sendNotification(pushMessage.timestamp.toInt(), notification)
 
-            checkIfCallIsActive(signatureVerification, conversation)
+            checkIfCallIsActive(conversation)
         }
 
-        chatRepository?.getRoom(userBeingCalled, roomToken = pushMessage.id!!)
-            ?.subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(object : Observer<ConversationModel> {
-                override fun onSubscribe(d: Disposable) {
-                    // unused atm
-                }
+        val conversation = try {
+            runBlocking { chatNetworkDataSource?.getRoom(userBeingCalled!!, roomToken = pushMessage.id!!) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get room", e)
+            null
+        }
 
-                override fun onNext(conversation: ConversationModel) {
-                    if (userManager.setUserAsActive(userBeingCalled!!).blockingGet()) {
-                        prepareCallNotificationScreen(conversation)
-                    }
-                }
-
-                override fun onError(e: Throwable) {
-                    Log.e(TAG, "Failed to get room", e)
-                }
-
-                override fun onComplete() {
-                    // unused atm
-                }
-            })
+        if (conversation != null && userBeingCalled != null) {
+            prepareCallNotificationScreen(conversation)
+        }
     }
 
     private fun initNcApiAndCredentials() {
-        credentials = ApiUtils.getCredentials(
-            signatureVerification.user!!.username,
-            signatureVerification.user!!.token
-        )!!
+        credentials = user.getCredentials()
         ncApi = retrofit!!.newBuilder().client(
             okHttpClient!!.newBuilder().cookieJar(
                 JavaNetCookieJar(
@@ -340,55 +399,89 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         )
     }
 
-    @Suppress("TooGenericExceptionCaught", "NestedBlockDepth", "ComplexMethod", "LongMethod")
-    private fun initDecryptedData(inputData: Data) {
-        val subject = inputData.getString(BundleKeys.KEY_NOTIFICATION_SUBJECT)
-        val signature = inputData.getString(BundleKeys.KEY_NOTIFICATION_SIGNATURE)
+    @Suppress("TooGenericExceptionCaught")
+    private fun initDecryptedData(inputData: Data): Boolean =
         try {
-            val base64DecodedSubject = Base64.decode(subject, Base64.DEFAULT)
-            val base64DecodedSignature = Base64.decode(signature, Base64.DEFAULT)
-            val pushUtils = PushUtils()
-            val privateKey = pushUtils.readKeyFromFile(false) as PrivateKey
-            try {
-                signatureVerification = pushUtils.verifySignature(
-                    base64DecodedSignature,
-                    base64DecodedSubject
-                )
-                if (signatureVerification.signatureValid) {
-                    val cipher = Cipher.getInstance("RSA/None/PKCS1Padding")
-                    cipher.init(Cipher.DECRYPT_MODE, privateKey)
-                    val decryptedSubject = cipher.doFinal(base64DecodedSubject)
-
-                    pushMessage = LoganSquare.parse(
-                        String(decryptedSubject),
-                        DecryptedPushMessage::class.java
-                    )
-                }
-            } catch (e: NoSuchAlgorithmException) {
-                Log.e(TAG, "No proper algorithm to decrypt the message ", e)
-            } catch (e: NoSuchPaddingException) {
-                Log.e(TAG, "No proper padding to decrypt the message ", e)
-            } catch (e: InvalidKeyException) {
-                Log.e(TAG, "Invalid private key ", e)
+            if (inputData.hasKeyWithValueOfType(BundleKeys.KEY_NOTIFICATION_CLEARTEXT_SUBJECT, String::class.java)) {
+                initFromCleartextSubject(inputData)
+            } else {
+                initFromEncryptedSubject(inputData)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error occurred while initializing decoded data ", e)
+            logger.e(TAG, "Error occurred while initializing decoded data ", e)
+            false
+        }
+
+    private fun initFromCleartextSubject(inputData: Data): Boolean {
+        val subject = inputData.getString(BundleKeys.KEY_NOTIFICATION_CLEARTEXT_SUBJECT)
+        val id = inputData.getLong(BundleKeys.KEY_NOTIFICATION_USER_ID, -1)
+        user = runBlocking { userManager.getUserWithId(id) }!!
+        pushMessage = LoganSquare.parse(subject, DecryptedPushMessageDto::class.java)
+        return true
+    }
+
+    private fun initFromEncryptedSubject(inputData: Data): Boolean {
+        val subject = inputData.getString(BundleKeys.KEY_NOTIFICATION_SUBJECT)
+        val signature = inputData.getString(BundleKeys.KEY_NOTIFICATION_SIGNATURE)
+
+        val base64DecodedSubject = Base64.decode(subject, Base64.DEFAULT)
+        val base64DecodedSignature = Base64.decode(signature, Base64.DEFAULT)
+        val pushUtils = PushUtils()
+        val privateKey = pushUtils.readKeyFromFile(false) as PrivateKey
+        return try {
+            val signatureVerification = pushUtils.verifySignature(
+                base64DecodedSignature,
+                base64DecodedSubject
+            )
+            if (signatureVerification.signatureValid) {
+                val decryptedSubject = decryptSubject(privateKey, base64DecodedSubject)
+
+                pushMessage = LoganSquare.parse(
+                    String(decryptedSubject),
+                    DecryptedPushMessageDto::class.java
+                )
+                user = signatureVerification.user!!
+                true
+            } else {
+                logger.e(TAG, "Signature verification failed, discarding push message")
+                false
+            }
+        } catch (e: NoSuchAlgorithmException) {
+            logger.e(TAG, "No proper algorithm to decrypt the message ", e)
+            false
+        } catch (e: NoSuchPaddingException) {
+            logger.e(TAG, "No proper padding to decrypt the message ", e)
+            false
+        } catch (e: InvalidKeyException) {
+            logger.e(TAG, "Invalid private key ", e)
+            false
         }
     }
 
+    private fun decryptSubject(privateKey: PrivateKey, base64DecodedSubject: ByteArray): ByteArray =
+        try {
+            val cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-1AndMGF1Padding")
+            cipher.init(Cipher.DECRYPT_MODE, privateKey)
+            cipher.doFinal(base64DecodedSubject)
+        } catch (e: BadPaddingException) {
+            Log.d(TAG, "OAEP padding failed, trying PKCS1 for compatibility", e)
+            val cipher = Cipher.getInstance("RSA/None/PKCS1Padding")
+            cipher.init(Cipher.DECRYPT_MODE, privateKey)
+            cipher.doFinal(base64DecodedSubject)
+        }
+
     private fun isTalkNotification() = SPREED_APP == pushMessage.app
+    private fun isInternal() = INTERNAL == pushMessage.app
 
     private fun isAdminTalkNotification() = ADMIN_NOTIFICATION_TALK == pushMessage.app
 
     private fun getNcDataAndShowNotification(intent: Intent) {
-        val user = signatureVerification.user
-
         // see https://github.com/nextcloud/notifications/blob/master/docs/ocs-endpoint-v2.md
         ncApi.getNcNotification(
             credentials,
             ApiUtils.getUrlForNcNotificationWithId(
-                user!!.baseUrl!!,
-                (pushMessage.notificationId!!).toString()
+                user.baseUrl!!,
+                pushMessage.notificationId.toString()
             )
         )
             .blockingSubscribe(object : Observer<NotificationOverall> {
@@ -400,12 +493,31 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                     val ncNotification = notificationOverall.ocs!!.notification
                     if (ncNotification != null) {
                         enrichPushMessageByNcNotificationData(ncNotification)
+
+                        val threadId = parseThreadId(ncNotification.objectId)
+                        threadId?.let { intent.putExtra(KEY_THREAD_ID, it) }
+
                         showNotification(intent, ncNotification)
+                        catchUpPushedRoom(threadId)
                     }
                 }
 
                 override fun onError(e: Throwable) {
-                    Log.e(TAG, "Failed to get NC notification", e)
+                    fun setContentsFromPushNotificationSubject() {
+                        if (pushMessage.subject.contains(LINEBREAK)) {
+                            pushMessage.text = pushMessage.subject.substringAfter(LINEBREAK)
+                            pushMessage.subject = pushMessage.subject.substringBefore(LINEBREAK)
+                        }
+                    }
+
+                    setContentsFromPushNotificationSubject()
+                    showNotification(intent, null)
+
+                    // without the server notification the thread id is unknown — still catch up
+                    // the room itself so the pushed message is cached for the main chat
+                    catchUpPushedRoom(threadId = null)
+
+                    Log.e(TAG, "Failed to get NC notification. Using decrypted data from push notification itself", e)
                     if (BuildConfig.DEBUG) {
                         Handler(Looper.getMainLooper()).post {
                             Toast.makeText(context, "Failed to get NC notification", Toast.LENGTH_LONG).show()
@@ -420,13 +532,13 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
     }
 
     private fun enrichPushMessageByNcNotificationData(
-        ncNotification: com.nextcloud.talk.models.json.notifications.Notification
+        ncNotification: com.nextcloud.talk.models.json.notifications.NotificationDto
     ) {
         pushMessage.objectId = ncNotification.objectId
         pushMessage.timestamp = ncNotification.datetime!!.millis
 
         if (ncNotification.messageRichParameters != null &&
-            ncNotification.messageRichParameters!!.size > 0
+            ncNotification.messageRichParameters!!.isNotEmpty()
         ) {
             pushMessage.text = getParsedMessage(
                 ncNotification.messageRich,
@@ -437,11 +549,11 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         }
 
         val subjectRichParameters = ncNotification.subjectRichParameters
-        if (subjectRichParameters != null && subjectRichParameters.size > 0) {
+        if (subjectRichParameters != null && subjectRichParameters.isNotEmpty()) {
             val callHashMap = subjectRichParameters["call"]
             val userHashMap = subjectRichParameters["user"]
             val guestHashMap = subjectRichParameters["guest"]
-            if (callHashMap != null && callHashMap.size > 0 && callHashMap.containsKey("name")) {
+            if (callHashMap != null && callHashMap.isNotEmpty() && callHashMap.containsKey("name")) {
                 if (subjectRichParameters.containsKey("reaction")) {
                     pushMessage.subject = ""
                 } else if (ncNotification.objectType == "chat") {
@@ -458,7 +570,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                     conversationType = callHashMap["call-type"]
                 }
             }
-            val notificationUser = NotificationUser()
+            val notificationUser = NotificationUserDto()
             if (userHashMap != null && userHashMap.isNotEmpty()) {
                 notificationUser.id = userHashMap["id"]
                 notificationUser.type = userHashMap["type"]
@@ -473,12 +585,42 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         } else {
             pushMessage.subject = ncNotification.subject.orEmpty()
         }
+
+        checkAndExtractImagePreviewData(ncNotification)
     }
 
-    @Suppress("MagicNumber")
+    private fun checkAndExtractImagePreviewData(
+        notification: com.nextcloud.talk.models.json.notifications.NotificationDto
+    ) {
+        imagePreviewUrl = null
+        imageMimeType = null
+        val msgParams = notification.messageRichParameters
+        if (msgParams != null) {
+            for ((_, param) in msgParams) {
+                if (extractImagePreviewData(param)) break
+            }
+        }
+    }
+
+    private fun extractImagePreviewData(param: HashMap<String?, String?>): Boolean {
+        if (param["type"] == "file") {
+            val mimetype = param["mimetype"].orEmpty()
+            val fileId = param["id"]
+            if (mimetype.startsWith("image/") && fileId != null) {
+                val baseUrl = user.baseUrl!!
+                val px = context!!.resources.displayMetrics.widthPixels
+                imagePreviewUrl = ApiUtils.getUrlForFilePreviewWithFileId(baseUrl, fileId, px)
+                imageMimeType = mimetype
+                return true
+            }
+        }
+        return false
+    }
+
+    @Suppress("MagicNumber", "LongMethod")
     private fun showNotification(
         intent: Intent,
-        ncNotification: com.nextcloud.talk.models.json.notifications.Notification?
+        ncNotification: com.nextcloud.talk.models.json.notifications.NotificationDto?
     ) {
         var category = ""
         when (pushMessage.type) {
@@ -491,16 +633,24 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
             else -> Log.e(TAG, "unknown pushMessage.type")
         }
 
-        // Use unique request code to make sure that a new PendingIntent gets created for each notification
-        // See https://github.com/nextcloud/talk-android/issues/2111
-        val requestCode = System.currentTimeMillis().toInt()
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE
-        } else {
-            0
+        if (pushMessage.type == TYPE_CHAT || pushMessage.type == TYPE_ROOM) {
+            val token = pushMessage.id
+            val displayName = pushMessage.subject
+            if (token != null && displayName.isNotEmpty()) {
+                runBlocking {
+                    DirectShareHelper.reportIncomingMessage(
+                        context!!,
+                        user,
+                        token,
+                        displayName,
+                        isOneToOne = "one2one" == conversationType
+                    )
+                }
+            }
         }
-        val pendingIntent = PendingIntent.getActivity(context, requestCode, intent, intentFlag)
-        val uri = Uri.parse(signatureVerification.user!!.baseUrl!!)
+
+        val pendingIntent = createUniquePendingIntent(intent)
+        val uri = user.baseUrl!!.toUri()
         val baseUrl = uri.host
 
         var contentTitle: CharSequence? = ""
@@ -510,16 +660,87 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
 
         var contentText: CharSequence? = ""
         if (!TextUtils.isEmpty(pushMessage.text)) {
-            contentText = EmojiCompat.get().process(pushMessage.text!!)
+            contentText = EmojiCompat.get().process(pushMessage.text)
         }
 
         val autoCancelOnClick = TYPE_RECORDING != pushMessage.type
 
+        val notificationBuilder =
+            createNotificationBuilder(
+                category,
+                contentTitle,
+                contentText,
+                baseUrl,
+                pendingIntent,
+                autoCancelOnClick
+            )
+
+        if (ncNotification != null) {
+            notificationBuilder.setLargeIcon(getLargeIcon())
+        }
+
+        val activeStatusBarNotification = pushMessage.id?.let {
+            findNotificationForRoom(
+                context,
+                user,
+                it
+            )
+        }
+
+        // NOTE - systemNotificationId is an internal ID used on the device only.
+        // It is NOT the same as the notification ID used in communication with the server.
+        val systemNotificationId: Int =
+            activeStatusBarNotification?.id ?: calculateCRC32(System.currentTimeMillis().toString()).toInt()
+
+        if ((TYPE_CHAT == pushMessage.type || TYPE_REMINDER == pushMessage.type) &&
+            pushMessage.notificationUser != null
+        ) {
+            notificationBuilder.setOnlyAlertOnce(false)
+            val senderAvatar = loadSenderAvatar(pushMessage.notificationUser)
+            val conversationAvatar = if ("one2one" == conversationType) {
+                senderAvatar
+            } else {
+                pushMessage.id?.let { loadConversationAvatar(it) } ?: senderAvatar
+            }
+            val imageUri = imagePreviewUrl?.let { loadImageBitmapSync(it) }?.let {
+                NotificationUtils.saveBitmapToCache(
+                    context!!,
+                    it,
+                    "notification_preview_${pushMessage.id}.png"
+                )
+            }
+
+            styleConversationNotification(
+                notificationBuilder,
+                activeStatusBarNotification,
+                senderAvatar,
+                conversationAvatar,
+                imageUri
+            )
+            addReplyAction(notificationBuilder, systemNotificationId)
+            addMarkAsReadAction(notificationBuilder, systemNotificationId)
+            pushConversationShortcut(notificationBuilder, conversationAvatar)
+        }
+
+        if (TYPE_RECORDING == pushMessage.type && ncNotification != null) {
+            addDismissRecordingAvailableAction(notificationBuilder, systemNotificationId, ncNotification)
+            addShareRecordingToChatAction(notificationBuilder, systemNotificationId, ncNotification)
+        }
+        sendNotification(systemNotificationId, notificationBuilder.build())
+    }
+
+    private fun createNotificationBuilder(
+        category: String,
+        contentTitle: CharSequence?,
+        contentText: CharSequence?,
+        baseUrl: String?,
+        pendingIntent: PendingIntent?,
+        autoCancelOnClick: Boolean
+    ): NotificationCompat.Builder {
         val notificationBuilder = NotificationCompat.Builder(context!!, "1")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(category)
-            .setLargeIcon(getLargeIcon())
-            .setSmallIcon(R.drawable.ic_logo)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(contentTitle)
             .setContentText(contentText)
             .setSubText(baseUrl)
@@ -530,7 +751,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
             .setColor(context!!.resources.getColor(R.color.colorPrimary, null))
 
         val notificationInfoBundle = Bundle()
-        notificationInfoBundle.putLong(KEY_INTERNAL_USER_ID, signatureVerification.user!!.id!!)
+        notificationInfoBundle.putLong(KEY_INTERNAL_USER_ID, user.id!!)
         // could be an ID or a TOKEN
         notificationInfoBundle.putString(KEY_ROOM_TOKEN, pushMessage.id)
         notificationInfoBundle.putLong(KEY_NOTIFICATION_ID, pushMessage.notificationId!!)
@@ -541,51 +762,23 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
 
         notificationBuilder.setExtras(notificationInfoBundle)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            when (pushMessage.type) {
-                TYPE_CHAT,
-                TYPE_ROOM,
-                TYPE_RECORDING,
-                TYPE_REMINDER,
-                TYPE_ADMIN_NOTIFICATIONS,
-                TYPE_REMOTE_TALK_SHARE -> {
-                    notificationBuilder.setChannelId(
-                        NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name
-                    )
-                }
+        when (pushMessage.type) {
+            TYPE_CHAT,
+            TYPE_ROOM,
+            TYPE_RECORDING,
+            TYPE_REMINDER,
+            TYPE_ADMIN_NOTIFICATIONS,
+            TYPE_REMOTE_TALK_SHARE -> {
+                notificationBuilder.setChannelId(
+                    NotificationUtils.NotificationChannels.NOTIFICATION_CHANNEL_MESSAGES_V4.name
+                )
             }
-        } else {
-            // red color for the lights
-            notificationBuilder.setLights(-0x10000, 200, 200)
         }
 
         notificationBuilder.setContentIntent(pendingIntent)
-        val groupName = signatureVerification.user!!.id.toString() + "@" + pushMessage.id
+        val groupName = user.id.toString() + "@" + pushMessage.id
         notificationBuilder.setGroup(calculateCRC32(groupName).toString())
-        val activeStatusBarNotification = findNotificationForRoom(
-            context,
-            signatureVerification.user!!,
-            pushMessage.id!!
-        )
-
-        // NOTE - systemNotificationId is an internal ID used on the device only.
-        // It is NOT the same as the notification ID used in communication with the server.
-        val systemNotificationId: Int =
-            activeStatusBarNotification?.id ?: calculateCRC32(System.currentTimeMillis().toString()).toInt()
-
-        if ((TYPE_CHAT == pushMessage.type || TYPE_REMINDER == pushMessage.type) &&
-            pushMessage.notificationUser != null
-        ) {
-            prepareChatNotification(notificationBuilder, activeStatusBarNotification, systemNotificationId)
-            addReplyAction(notificationBuilder, systemNotificationId)
-            addMarkAsReadAction(notificationBuilder, systemNotificationId)
-        }
-
-        if (TYPE_RECORDING == pushMessage.type && ncNotification != null) {
-            addDismissRecordingAvailableAction(notificationBuilder, systemNotificationId, ncNotification)
-            addShareRecordingToChatAction(notificationBuilder, systemNotificationId, ncNotification)
-        }
-        sendNotification(systemNotificationId, notificationBuilder.build())
+        return notificationBuilder
     }
 
     private fun getLargeIcon(): Bitmap {
@@ -597,7 +790,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 "one2one" -> {
                     pushMessage.subject = ""
                     largeIcon =
-                        ContextCompat.getDrawable(context!!, R.drawable.ic_people_group_black_24px)?.toBitmap()!!
+                        ContextCompat.getDrawable(context!!, R.drawable.ic_baseline_person_black_24)?.toBitmap()!!
                 }
 
                 "group" ->
@@ -627,57 +820,162 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         return crc32.value
     }
 
-    private fun prepareChatNotification(
+    private fun styleConversationNotification(
         notificationBuilder: NotificationCompat.Builder,
         activeStatusBarNotification: StatusBarNotification?,
-        systemNotificationId: Int
+        senderAvatar: Bitmap?,
+        conversationAvatar: Bitmap?,
+        imageUri: Uri?
     ) {
-        val notificationUser = pushMessage.notificationUser
-        val userType = notificationUser!!.type
+        val notificationUser = pushMessage.notificationUser ?: return
+
+        val userType = notificationUser.type
         var style: NotificationCompat.MessagingStyle? = null
         if (activeStatusBarNotification != null) {
             style = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(
                 activeStatusBarNotification.notification
             )
         }
-        val person = Person.Builder()
-            .setKey(signatureVerification.user!!.id.toString() + "@" + notificationUser.id)
+        val personBuilder = Person.Builder()
+            .setKey(user.id.toString() + "@" + notificationUser.id)
             .setName(EmojiCompat.get().process(notificationUser.name!!))
             .setBot("bot" == userType)
-        notificationBuilder.setOnlyAlertOnce(true)
 
-        if ("user" == userType || "guest" == userType) {
-            val baseUrl = signatureVerification.user!!.baseUrl
-            val avatarUrl = if ("user" == userType) {
-                ApiUtils.getUrlForAvatar(
-                    baseUrl!!,
-                    notificationUser.id,
-                    false
-                )
-            } else {
-                ApiUtils.getUrlForGuestAvatar(baseUrl!!, notificationUser.name, false)
-            }
-            person.setIcon(loadAvatarSync(avatarUrl, context!!))
+        if (senderAvatar != null) {
+            personBuilder.setIcon(IconCompat.createWithBitmap(senderAvatar))
         }
-        notificationBuilder.setStyle(getStyle(person.build(), style))
+        if (conversationAvatar != null) {
+            notificationBuilder.setLargeIcon(conversationAvatar)
+        }
+
+        val deviceUser = Person.Builder()
+            .setKey(user.id.toString() + "@" + user.userId)
+            .setName(user.displayName ?: user.userId ?: "You")
+            .build()
+
+        val sender = personBuilder.build()
+        val newStyle = NotificationCompat.MessagingStyle(deviceUser)
+        newStyle.conversationTitle = pushMessage.subject.ifEmpty { sender.name }
+        newStyle.isGroupConversation = "one2one" != conversationType
+        style?.messages?.forEach { message ->
+            newStyle.addMessage(
+                NotificationCompat.MessagingStyle.Message(
+                    message.text,
+                    message.timestamp,
+                    message.person
+                )
+            )
+        }
+
+        if (imageUri != null) {
+            val imageMessage = NotificationCompat.MessagingStyle.Message(
+                "",
+                pushMessage.timestamp,
+                sender
+            )
+            imageMessage.setData(imageMimeType ?: "image/*", imageUri)
+            newStyle.addMessage(imageMessage)
+        }
+
+        val message = NotificationCompat.MessagingStyle.Message(
+            pushMessage.text,
+            pushMessage.timestamp,
+            sender
+        )
+        newStyle.addMessage(message)
+        notificationBuilder.setStyle(newStyle)
     }
 
-    private fun buildIntentForAction(cls: Class<*>, systemNotificationId: Int, messageId: Int): PendingIntent {
+    private fun loadSenderAvatar(notificationUser: NotificationUserDto?): Bitmap? {
+        val userType = notificationUser?.type ?: return null
+
+        return if ("user" == userType) {
+            val avatarUrl = ApiUtils.getUrlForAvatar(
+                user.baseUrl!!,
+                notificationUser.id,
+                false,
+                darkMode = DisplayUtils.isDarkModeOn(context!!)
+            )
+            NotificationUtils.loadAvatarBitmapSync(avatarUrl, context!!)
+        } else {
+            // Guests and bots have no avatar on the server, so theirs is drawn from their name here
+            val avatar = CharacterAvatarUtils.avatarFor(
+                actorType = userType,
+                actorId = notificationUser.id,
+                displayName = notificationUser.name,
+                guestLabel = context!!.getString(R.string.nc_guest)
+            )
+            (avatar as? ActorAvatar.Character)?.let { NotificationUtils.characterAvatarBitmap(context!!, it) }
+        }
+    }
+
+    private fun loadConversationAvatar(roomToken: String): Bitmap? =
+        NotificationUtils.loadConversationAvatarBitmapSync(
+            user.baseUrl,
+            roomToken,
+            credentials,
+            context!!,
+            isOneToOne = false
+        )
+
+    private fun loadImageBitmapSync(imageUrl: String): Bitmap? {
+        var bitmap: Bitmap? = null
+        val request = ImageRequest.Builder(context!!)
+            .data(imageUrl)
+            .allowHardware(false)
+            .addHeader("Authorization", credentials)
+            .target(
+                onSuccess = { result -> bitmap = (result as BitmapDrawable).bitmap },
+                onError = { Log.w(TAG, "Failed to load notification image: $imageUrl") }
+            )
+            .build()
+        context!!.imageLoader.executeBlocking(request)
+        return bitmap
+    }
+
+    private fun pushConversationShortcut(notificationBuilder: NotificationCompat.Builder, avatarBitmap: Bitmap?) {
+        val notificationUser = pushMessage.notificationUser ?: return
+        val roomToken = pushMessage.id?.takeIf(DeepLinkHandler::isValidToken) ?: return
+        // like the conversation shortcuts of the conversation list, which use the same id
+        val intent = ShortcutManagerHelper.createConversationIntent(context!!, roomToken, user) ?: return
+
+        val shortcutId = ShortcutManagerHelper.getShortcutId(roomToken, user.id!!)
+
+        val personBuilder = Person.Builder()
+            .setKey(user.id.toString() + "@" + notificationUser.id)
+            .setName(EmojiCompat.get().process(notificationUser.name!!))
+
+        if (avatarBitmap != null) {
+            personBuilder.setIcon(IconCompat.createWithBitmap(avatarBitmap))
+        }
+
+        val shortcut = ShortcutInfoCompat.Builder(context!!, shortcutId)
+            .setShortLabel(pushMessage.subject.ifEmpty { notificationUser.name ?: "Chat" })
+            .setLongLived(true)
+            .setIntent(intent)
+            .setPerson(personBuilder.build())
+            .build()
+
+        ShortcutManagerCompat.pushDynamicShortcut(context!!, shortcut)
+        notificationBuilder.setShortcutId(shortcutId)
+    }
+
+    private fun buildIntentForAction(
+        cls: Class<*>,
+        systemNotificationId: Int,
+        messageId: Int,
+        mutable: Boolean = false
+    ): PendingIntent {
         val actualIntent = Intent(context, cls)
 
         // NOTE - systemNotificationId is an internal ID used on the device only.
         // It is NOT the same as the notification ID used in communication with the server.
         actualIntent.putExtra(KEY_SYSTEM_NOTIFICATION_ID, systemNotificationId)
-        actualIntent.putExtra(KEY_INTERNAL_USER_ID, signatureVerification.user?.id)
+        actualIntent.putExtra(KEY_INTERNAL_USER_ID, user.id)
         actualIntent.putExtra(KEY_ROOM_TOKEN, pushMessage.id)
         actualIntent.putExtra(KEY_MESSAGE_ID, messageId)
 
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
-        return PendingIntent.getBroadcast(context, systemNotificationId, actualIntent, intentFlag)
+        return PendingIntent.getBroadcast(context, systemNotificationId, actualIntent, pendingIntentFlags(mutable))
     }
 
     private fun addMarkAsReadAction(notificationBuilder: NotificationCompat.Builder, systemNotificationId: Int) {
@@ -692,10 +990,11 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
             val pendingIntent = buildIntentForAction(
                 MarkAsReadReceiver::class.java,
                 systemNotificationId,
-                messageId
+                messageId,
+                mutable = false
             )
             val markAsReadAction = NotificationCompat.Action.Builder(
-                R.drawable.ic_eye,
+                R.drawable.ic_mark_chat_read_24px,
                 context!!.resources.getString(R.string.nc_mark_as_read),
                 pendingIntent
             )
@@ -715,7 +1014,8 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         val replyPendingIntent = buildIntentForAction(
             DirectReplyReceiver::class.java,
             systemNotificationId,
-            0
+            0,
+            mutable = true
         )
         val replyAction = NotificationCompat.Action.Builder(R.drawable.ic_reply, replyLabel, replyPendingIntent)
             .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
@@ -729,7 +1029,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
     private fun addDismissRecordingAvailableAction(
         notificationBuilder: NotificationCompat.Builder,
         systemNotificationId: Int,
-        ncNotification: com.nextcloud.talk.models.json.notifications.Notification
+        ncNotification: com.nextcloud.talk.models.json.notifications.NotificationDto
     ) {
         var dismissLabel = ""
         var dismissRecordingUrl = ""
@@ -743,13 +1043,10 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
 
         val dismissIntent = Intent(context, DismissRecordingAvailableReceiver::class.java)
         dismissIntent.putExtra(KEY_SYSTEM_NOTIFICATION_ID, systemNotificationId)
+        dismissIntent.putExtra(KEY_INTERNAL_USER_ID, user.id)
         dismissIntent.putExtra(KEY_DISMISS_RECORDING_URL, dismissRecordingUrl)
 
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
+        val intentFlag = pendingIntentFlags()
         val dismissPendingIntent = PendingIntent.getBroadcast(context, systemNotificationId, dismissIntent, intentFlag)
 
         val dismissAction = NotificationCompat.Action.Builder(R.drawable.ic_delete, dismissLabel, dismissPendingIntent)
@@ -762,7 +1059,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
     private fun addShareRecordingToChatAction(
         notificationBuilder: NotificationCompat.Builder,
         systemNotificationId: Int,
-        ncNotification: com.nextcloud.talk.models.json.notifications.Notification
+        ncNotification: com.nextcloud.talk.models.json.notifications.NotificationDto
     ) {
         var shareToChatLabel = ""
         var shareToChatUrl = ""
@@ -776,14 +1073,11 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
 
         val shareRecordingIntent = Intent(context, ShareRecordingToChatReceiver::class.java)
         shareRecordingIntent.putExtra(KEY_SYSTEM_NOTIFICATION_ID, systemNotificationId)
+        shareRecordingIntent.putExtra(KEY_INTERNAL_USER_ID, user.id)
         shareRecordingIntent.putExtra(KEY_SHARE_RECORDING_TO_CHAT_URL, shareToChatUrl)
         shareRecordingIntent.putExtra(KEY_ROOM_TOKEN, pushMessage.id)
 
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
+        val intentFlag = pendingIntentFlags()
         val shareRecordingPendingIntent = PendingIntent.getBroadcast(
             context,
             systemNotificationId,
@@ -802,25 +1096,6 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         notificationBuilder.addAction(shareRecordingAction)
     }
 
-    private fun getStyle(person: Person, style: NotificationCompat.MessagingStyle?): NotificationCompat.MessagingStyle {
-        val newStyle = NotificationCompat.MessagingStyle(person)
-        newStyle.conversationTitle = pushMessage.subject
-        newStyle.isGroupConversation = "one2one" != conversationType
-        style?.messages?.forEach(
-            Consumer { message: NotificationCompat.MessagingStyle.Message ->
-                newStyle.addMessage(
-                    NotificationCompat.MessagingStyle.Message(
-                        message.text,
-                        message.timestamp,
-                        message.person
-                    )
-                )
-            }
-        )
-        newStyle.addMessage(pushMessage.text, pushMessage.timestamp, person)
-        return newStyle
-    }
-
     @Throws(NumberFormatException::class)
     private fun parseMessageId(objectId: String): Int {
         val objectIdParts = objectId.split("/".toRegex()).toTypedArray()
@@ -831,8 +1106,10 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         }
     }
 
+    private fun parseThreadId(objectId: String?): Long? = objectId?.split("/")?.getOrNull(2)?.toLongOrNull()
+
     private fun sendNotification(notificationId: Int, notification: Notification) {
-        Log.d(TAG, "show notification with id $notificationId")
+        logger.d(TAG, "show notification with id $notificationId")
         if (ActivityCompat.checkSelfPermission(
                 applicationContext,
                 Manifest.permission.POST_NOTIFICATIONS
@@ -847,49 +1124,21 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         }
         notificationManager.notify(notificationId, notification)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // On devices with Android 8.0 (Oreo) or later, notification sound will be handled by the system
-            // if notifications have not been disabled by the user.
-            return
-        }
-        if (Notification.CATEGORY_CALL != notification.category || !muteCall) {
-            val soundUri = getMessageRingtoneUri(context!!, appPreferences)
-            if (soundUri != null && !ApplicationWideCurrentRoomHolder.getInstance().isInCall &&
-                (shouldPlaySound() || importantConversation)
-            ) {
-                val audioAttributesBuilder =
-                    AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                if (TYPE_CHAT == pushMessage.type || TYPE_ROOM == pushMessage.type) {
-                    audioAttributesBuilder.setUsage(AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT)
-                } else {
-                    audioAttributesBuilder.setUsage(AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_REQUEST)
-                }
-                val mediaPlayer = MediaPlayer()
-                try {
-                    mediaPlayer.setDataSource(context!!, soundUri)
-                    mediaPlayer.setAudioAttributes(audioAttributesBuilder.build())
-                    mediaPlayer.setOnPreparedListener { mediaPlayer.start() }
-                    mediaPlayer.setOnCompletionListener { obj: MediaPlayer -> obj.release() }
-                    mediaPlayer.prepareAsync()
-                } catch (e: IOException) {
-                    Log.e(TAG, "Failed to set data source")
-                }
-            }
-        }
+        return
     }
 
     private fun removeNotification(notificationId: Int) {
-        Log.d(TAG, "removed notification with id $notificationId")
+        logger.d(TAG, "removed notification with id $notificationId")
         notificationManager.cancel(notificationId)
     }
 
-    private fun checkIfCallIsActive(signatureVerification: SignatureVerification, conversation: ConversationModel) {
+    private fun checkIfCallIsActive(conversation: ConversationModel) {
         Log.d(TAG, "checkIfCallIsActive")
         var hasParticipantsInCall = true
         var inCallOnDifferentDevice = false
 
         val apiVersion = ApiUtils.getConversationApiVersion(
-            signatureVerification.user!!,
+            user,
             intArrayOf(ApiUtils.API_V4, 1)
         )
 
@@ -899,7 +1148,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
             credentials,
             ApiUtils.getUrlForCall(
                 apiVersion,
-                signatureVerification.user!!.baseUrl!!,
+                user.baseUrl!!,
                 pushMessage.id!!
             )
         )
@@ -913,12 +1162,12 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 override fun onSubscribe(d: Disposable) = Unit
 
                 override fun onNext(participantsOverall: ParticipantsOverall) {
-                    val participantList: List<Participant> = participantsOverall.ocs!!.data!!
+                    val participantList: List<ParticipantDto> = participantsOverall.ocs!!.data!!
                     hasParticipantsInCall = participantList.isNotEmpty()
                     if (hasParticipantsInCall) {
                         for (participant in participantList) {
-                            if (participant.actorId == signatureVerification.user!!.userId &&
-                                participant.actorType == Participant.ActorType.USERS
+                            if (participant.actorId == user.userId &&
+                                participant.actorType == ParticipantDto.ActorType.USERS
                             ) {
                                 inCallOnDifferentDevice = true
                                 break
@@ -968,13 +1217,13 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         )
 
         if (isOngoingCallNotificationVisible) {
-            val notificationBuilder: NotificationCompat.Builder?
-
-            notificationBuilder = NotificationCompat.Builder(
+            val notificationBuilder = NotificationCompat.Builder(
                 context!!,
                 NotificationUtils.NotificationChannels
                     .NOTIFICATION_CHANNEL_MESSAGES_V4.name
             )
+
+            val intent = createContentIntent()
 
             val notification: Notification = notificationBuilder
                 .setContentTitle(
@@ -987,7 +1236,7 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
                 .setOngoing(false)
                 .setAutoCancel(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
-                .setContentIntent(getIntentToOpenConversation())
+                .setContentIntent(createUniquePendingIntent(intent))
                 .build()
 
             val notificationId: Int = SystemClock.uptimeMillis().toInt()
@@ -1008,35 +1257,52 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         }
     }
 
-    private fun createMainActivityIntent(): Intent {
-        val intent = Intent(context, MainActivity::class.java)
-        intent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-        val bundle = Bundle()
-        bundle.putString(KEY_ROOM_TOKEN, pushMessage.id)
-        bundle.putLong(KEY_INTERNAL_USER_ID, signatureVerification.user!!.id!!)
-        intent.putExtras(bundle)
-        return intent
+    /**
+     * The intent the notification opens: the chat of its conversation, or else the conversation list of its account.
+     */
+    private fun createContentIntent(): Intent {
+        val roomToken = pushMessage.id?.takeIf(DeepLinkHandler::isValidToken)
+            ?: return ConversationsListActivity.createAccountSwitchIntent(context!!, user.id!!)
+        val extras = Bundle().apply { putBoolean(KEY_OPENED_VIA_NOTIFICATION, true) }
+        return ChatActivity.createIntent(context!!, user.id!!, roomToken, extras)
     }
 
-    private fun getIntentToOpenConversation(): PendingIntent? {
-        val intent = Intent(context, MainActivity::class.java)
-        intent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
-        val bundle = Bundle()
-        bundle.putString(KEY_ROOM_TOKEN, pushMessage.id)
-        bundle.putLong(KEY_INTERNAL_USER_ID, signatureVerification.user!!.id!!)
-        intent.putExtras(bundle)
-
-        val requestCode = System.currentTimeMillis().toInt()
-        val intentFlag: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.FLAG_MUTABLE
-        } else {
-            0
+    /**
+     * The flags of the pending intents of a notification. They are immutable unless [mutable], e.g. for a direct reply,
+     * so that apps that get hold of them, like a notification listener, can't add extras when sending them: before
+     * Android 12 they were mutable by default.
+     */
+    private fun pendingIntentFlags(mutable: Boolean = false): Int {
+        val mutabilityFlag = when {
+            !mutable -> PendingIntent.FLAG_IMMUTABLE
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> PendingIntent.FLAG_MUTABLE
+            else -> 0
         }
-        return PendingIntent.getActivity(context, requestCode, intent, intentFlag)
+        return mutabilityFlag or PendingIntent.FLAG_UPDATE_CURRENT
     }
+
+    private fun createUniquePendingIntent(intent: Intent): PendingIntent? {
+        // Use unique request code to make sure that a new PendingIntent gets created for each notification
+        // See https://github.com/nextcloud/talk-android/issues/2111
+        val requestCode = System.currentTimeMillis().toInt()
+        val intentFlag = pendingIntentFlags()
+        val isConversationList = InternalEntryPoint.isStartedThrough(intent, ConversationsListActivity::class.java)
+        return if (!isConversationList) {
+            // a new back stack in the task of the app, with the conversation list of its account below the screen,
+            // which back leads to
+            val backStack = TaskStackBuilder.create(context!!)
+            ConversationsListActivity.createBackStack(context!!, user.id!!, intent)
+                .forEach { backStack.addNextIntent(it) }
+            backStack.getPendingIntent(requestCode, intentFlag)
+        } else {
+            PendingIntent.getActivity(context, requestCode, intent, intentFlag)
+        }
+    }
+
+    private fun getIntentFlags(): Int = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
 
     companion object {
-        val TAG = NotificationWorker::class.simpleName
+        val TAG: String = NotificationWorker::class.java.simpleName
         private const val TYPE_CHAT = "chat"
         private const val TYPE_ROOM = "room"
         private const val TYPE_CALL = "call"
@@ -1045,10 +1311,14 @@ class NotificationWorker(context: Context, workerParams: WorkerParameters) : Wor
         private const val TYPE_REMINDER = "reminder"
         private const val TYPE_ADMIN_NOTIFICATIONS = "admin_notifications"
         private const val SPREED_APP = "spreed"
+        private const val INTERNAL = "internal"
         private const val ADMIN_NOTIFICATION_TALK = "admin_notification_talk"
         private const val TIMER_START = 1
         private const val TIMER_COUNT = 12
         private const val TIMER_DELAY: Long = 5
-        private const val GET_ROOM_RETRY_COUNT: Long = 3
+        private const val LINEBREAK: String = "\n"
+        private const val ANSWER_VOICE_REQUEST_OFFSET = 1
+        private const val ANSWER_VIDEO_REQUEST_OFFSET = 2
+        private const val DECLINE_CALL_REQUEST_OFFSET = 3
     }
 }

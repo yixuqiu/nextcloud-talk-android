@@ -7,61 +7,79 @@
 package com.nextcloud.talk.openconversations.viewmodels
 
 import android.util.Log
-import androidx.lifecycle.LiveData
-import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
-import com.nextcloud.talk.openconversations.data.OpenConversation
-import com.nextcloud.talk.openconversations.data.OpenConversationsModel
+import androidx.lifecycle.viewModelScope
+import com.nextcloud.talk.data.user.model.User
+import com.nextcloud.talk.models.json.conversations.ConversationDto
 import com.nextcloud.talk.openconversations.data.OpenConversationsRepository
-import io.reactivex.Observer
-import io.reactivex.android.schedulers.AndroidSchedulers
-import io.reactivex.disposables.Disposable
-import io.reactivex.schedulers.Schedulers
-import javax.inject.Inject
+import com.nextcloud.talk.utils.ApiUtils
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
-class OpenConversationsViewModel @Inject constructor(private val repository: OpenConversationsRepository) :
-    ViewModel() {
+class OpenConversationsViewModel @AssistedInject constructor(
+    private val repository: OpenConversationsRepository,
+    @Assisted private val user: User
+) : ViewModel() {
 
     sealed interface ViewState
 
     object FetchConversationsStartState : ViewState
     object FetchConversationsEmptyState : ViewState
     object FetchConversationsErrorState : ViewState
-    open class FetchConversationsSuccessState(val conversations: List<OpenConversation>) : ViewState
+    open class FetchConversationsSuccessState(val conversations: List<ConversationDto>) : ViewState
 
-    private val _viewState: MutableLiveData<ViewState> = MutableLiveData(FetchConversationsStartState)
-    val viewState: LiveData<ViewState>
+    private val _viewState: MutableStateFlow<ViewState> = MutableStateFlow(FetchConversationsStartState)
+    val viewState: StateFlow<ViewState>
         get() = _viewState
+
+    private val _searchTerm: MutableStateFlow<String> = MutableStateFlow("")
+    val searchTerm: StateFlow<String>
+        get() = _searchTerm
 
     fun fetchConversations() {
         _viewState.value = FetchConversationsStartState
-        repository.fetchConversations()
-            .subscribeOn(Schedulers.io())
-            ?.observeOn(AndroidSchedulers.mainThread())
-            ?.subscribe(FetchConversationsObserver())
+
+        viewModelScope.launch {
+            val apiVersion = ApiUtils.getConversationApiVersion(
+                user,
+                intArrayOf(
+                    ApiUtils.API_V4,
+                    ApiUtils.API_V3,
+                    1
+                )
+            )
+            val url = ApiUtils.getUrlForOpenConversations(apiVersion, user.baseUrl!!)
+
+            repository.fetchConversations(
+                user,
+                url,
+                _searchTerm.value
+            )
+                .onSuccess { conversations ->
+                    if (conversations.isEmpty()) {
+                        _viewState.value = FetchConversationsEmptyState
+                    } else {
+                        _viewState.value = FetchConversationsSuccessState(conversations)
+                    }
+                }
+                .onFailure { exception ->
+                    Log.e(TAG, "Failed to fetch conversations", exception)
+                    _viewState.value = FetchConversationsErrorState
+                }
+        }
     }
 
-    inner class FetchConversationsObserver : Observer<OpenConversationsModel> {
-        override fun onSubscribe(d: Disposable) {
-            // unused atm
-        }
+    fun updateSearchTerm(newTerm: String) {
+        _searchTerm.value = newTerm
+    }
 
-        override fun onNext(model: OpenConversationsModel) {
-            if (model.conversations.isEmpty()) {
-                _viewState.value = FetchConversationsEmptyState
-            } else {
-                _viewState.value = FetchConversationsSuccessState(model.conversations)
-            }
-        }
-
-        override fun onError(e: Throwable) {
-            Log.e(TAG, "Error when fetching open conversations")
-            _viewState.value = FetchConversationsErrorState
-        }
-
-        override fun onComplete() {
-            // unused atm
-        }
+    @AssistedFactory
+    interface Factory {
+        fun build(user: User): OpenConversationsViewModel
     }
 
     companion object {

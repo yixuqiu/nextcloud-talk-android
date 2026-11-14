@@ -20,8 +20,9 @@ import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.chat.ChatActivity
 import com.nextcloud.talk.databinding.DialogAttachmentBinding
 import com.nextcloud.talk.ui.theme.ViewThemeUtils
-import com.nextcloud.talk.utils.SpreedFeatures
+import com.nextcloud.talk.ui.theme.hostViewThemeUtils
 import com.nextcloud.talk.utils.CapabilitiesUtil
+import com.nextcloud.talk.utils.SpreedFeatures
 import javax.inject.Inject
 
 @AutoInjector(NextcloudTalkApplication::class)
@@ -35,6 +36,7 @@ class AttachmentDialog(val activity: Activity, var chatActivity: ChatActivity) :
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NextcloudTalkApplication.sharedApplication?.componentApplication?.inject(this)
+        viewThemeUtils = hostViewThemeUtils(activity, viewThemeUtils)
 
         dialogAttachmentBinding = DialogAttachmentBinding.inflate(layoutInflater)
         setContentView(dialogAttachmentBinding.root)
@@ -81,6 +83,15 @@ class AttachmentDialog(val activity: Activity, var chatActivity: ChatActivity) :
             dialogAttachmentBinding.menuAttachPoll.visibility = View.GONE
         }
 
+        if (!CapabilitiesUtil.hasSpreedFeatureCapability(
+                chatActivity.spreedCapabilities,
+                SpreedFeatures.THREADS
+            ) ||
+            chatActivity.conversationThreadId != null
+        ) {
+            dialogAttachmentBinding.menuCreateThread.visibility = View.GONE
+        }
+
         if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
             dialogAttachmentBinding.menuAttachVideoFromCam.visibility = View.GONE
         }
@@ -89,6 +100,11 @@ class AttachmentDialog(val activity: Activity, var chatActivity: ChatActivity) :
     private fun initItemsClickListeners() {
         dialogAttachmentBinding.menuShareLocation.setOnClickListener {
             chatActivity.showShareLocationScreen()
+            dismiss()
+        }
+
+        dialogAttachmentBinding.menuAttachFileFromGallery.setOnClickListener {
+            chatActivity.showGalleryPicker()
             dismiss()
         }
 
@@ -104,6 +120,11 @@ class AttachmentDialog(val activity: Activity, var chatActivity: ChatActivity) :
 
         dialogAttachmentBinding.menuAttachVideoFromCam.setOnClickListener {
             chatActivity.sendVideoFromCamIntent()
+            dismiss()
+        }
+
+        dialogAttachmentBinding.menuCreateThread.setOnClickListener {
+            chatActivity.createThread()
             dismiss()
         }
 

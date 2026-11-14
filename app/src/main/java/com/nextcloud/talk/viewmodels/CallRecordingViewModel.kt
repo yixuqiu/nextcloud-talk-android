@@ -10,10 +10,11 @@ import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.models.domain.StartCallRecordingModel
 import com.nextcloud.talk.models.domain.StopCallRecordingModel
 import com.nextcloud.talk.repositories.callrecording.CallRecordingRepository
-import com.nextcloud.talk.users.UserManager
+import com.nextcloud.talk.utils.ApiUtils
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -22,10 +23,8 @@ import javax.inject.Inject
 
 class CallRecordingViewModel @Inject constructor(private val repository: CallRecordingRepository) : ViewModel() {
 
-    @Inject
-    lateinit var userManager: UserManager
-
     lateinit var roomToken: String
+    private lateinit var currentUser: User
 
     sealed interface ViewState
     open class RecordingStartedState(val hasVideo: Boolean, val showStartedInfo: Boolean) : ViewState
@@ -41,6 +40,9 @@ class CallRecordingViewModel @Inject constructor(private val repository: CallRec
         get() = _viewState
 
     private var disposable: Disposable? = null
+
+    private val credentials: String
+        get() = ApiUtils.getCredentials(currentUser.username, currentUser.token)!!
 
     fun clickRecordButton() {
         when (viewState.value) {
@@ -67,7 +69,18 @@ class CallRecordingViewModel @Inject constructor(private val repository: CallRec
 
     private fun startRecording() {
         _viewState.value = RecordingStartingState(true)
-        repository.startRecording(roomToken)
+        val apiVersion = 1
+        val url = ApiUtils.getUrlForRecording(
+            apiVersion,
+            currentUser.baseUrl!!,
+            roomToken
+        )
+
+        repository.startRecording(
+            credentials,
+            url,
+            roomToken
+        )
             .subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
             ?.subscribe(CallStartRecordingObserver())
@@ -75,7 +88,18 @@ class CallRecordingViewModel @Inject constructor(private val repository: CallRec
 
     fun stopRecording() {
         _viewState.value = RecordingStoppingState
-        repository.stopRecording(roomToken)
+        val apiVersion = 1
+        val url = ApiUtils.getUrlForRecording(
+            apiVersion,
+            currentUser.baseUrl!!,
+            roomToken
+        )
+
+        repository.stopRecording(
+            credentials,
+            url,
+            roomToken
+        )
             .subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
             ?.subscribe(CallStopRecordingObserver())
@@ -86,11 +110,11 @@ class CallRecordingViewModel @Inject constructor(private val repository: CallRec
     }
 
     override fun onCleared() {
-        super.onCleared()
         disposable?.dispose()
     }
 
-    fun setData(roomToken: String) {
+    fun setData(user: User, roomToken: String) {
+        this.currentUser = user
         this.roomToken = roomToken
     }
 

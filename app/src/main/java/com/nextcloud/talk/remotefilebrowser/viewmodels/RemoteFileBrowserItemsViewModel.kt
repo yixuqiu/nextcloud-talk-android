@@ -12,11 +12,15 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import com.nextcloud.talk.R
+import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.remotefilebrowser.model.RemoteFileBrowserItem
 import com.nextcloud.talk.remotefilebrowser.repositories.RemoteFileBrowserItemsRepository
 import com.nextcloud.talk.utils.FileSortOrder
 import com.nextcloud.talk.utils.Mimetype.FOLDER
 import com.nextcloud.talk.utils.preferences.AppPreferencesImpl
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedFactory
+import dagger.assisted.AssistedInject
 import io.reactivex.Observer
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.disposables.Disposable
@@ -27,7 +31,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import java.io.File
-import javax.inject.Inject
 
 /**
  * @startuml
@@ -43,13 +46,11 @@ import javax.inject.Inject
  * @enduml
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-class RemoteFileBrowserItemsViewModel
-@Inject
-constructor(
+class RemoteFileBrowserItemsViewModel @AssistedInject constructor(
     private val repository: RemoteFileBrowserItemsRepository,
-    private val appPreferences: AppPreferencesImpl
-) :
-    ViewModel() {
+    private val appPreferences: AppPreferencesImpl,
+    @Assisted private val currentUser: User
+) : ViewModel() {
 
     sealed interface ViewState
     object InitialState : ViewState
@@ -95,7 +96,10 @@ constructor(
 
     fun loadItems() {
         _viewState.value = LoadingItemsState
-        repository.listFolder(currentPath.value!!).subscribeOn(Schedulers.io())
+        repository.listFolder(
+            currentUser,
+            currentPath.value!!
+        ).subscribeOn(Schedulers.io())
             ?.observeOn(AndroidSchedulers.mainThread())
             ?.subscribe(RemoteFileBrowserItemsObserver())
     }
@@ -212,8 +216,12 @@ constructor(
         return false
     }
 
-    fun isPathSelected(path: String): Boolean {
-        return selectedPaths.value?.contains(path) == true || shouldPathBeSelectedDueToParent(path)
+    fun isPathSelected(path: String): Boolean =
+        selectedPaths.value?.contains(path) == true || shouldPathBeSelectedDueToParent(path)
+
+    @AssistedFactory
+    interface Factory {
+        fun build(user: User): RemoteFileBrowserItemsViewModel
     }
 
     companion object {

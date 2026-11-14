@@ -10,7 +10,7 @@ package com.nextcloud.talk.utils
 
 import android.util.Log
 import com.nextcloud.talk.data.user.model.User
-import com.nextcloud.talk.models.json.capabilities.SpreedCapability
+import com.nextcloud.talk.models.json.capabilities.SpreedCapabilityDto
 
 enum class SpreedFeatures(val value: String) {
     RECORDING_V1("recording-v1"),
@@ -40,6 +40,7 @@ enum class SpreedFeatures(val value: String) {
     GEO_LOCATION_SHARING("geo-location-sharing"),
     TALK_POLLS("talk-polls"),
     FAVORITES("favorites"),
+    CHAT_KEEP_NOTIFICATIONS("chat-keep-notifications"),
     CHAT_READ_MARKER("chat-read-marker"),
     CHAT_UNREAD("chat-unread"),
     EDIT_MESSAGES("edit-messages"),
@@ -53,7 +54,26 @@ enum class SpreedFeatures(val value: String) {
     CHAT_PERMISSION("chat-permission"),
     CONVERSATION_PERMISSION("conversation-permissions"),
     FEDERATION_V1("federation-v1"),
-    DELETE_MESSAGES_UNLIMITED("delete-messages-unlimited")
+    DELETE_MESSAGES_UNLIMITED("delete-messages-unlimited"),
+    BAN_V1("ban-v1"),
+    EDIT_MESSAGES_NOTE_TO_SELF("edit-messages-note-to-self"),
+    ARCHIVE_CONVERSATIONS("archived-conversations-v2"),
+    CONVERSATION_CREATION_ALL("conversation-creation-all"),
+    CONVERSATION_CREATION_PASSWORD("conversation-creation-password"),
+    UNBIND_CONVERSATION("unbind-conversation"),
+    SENSITIVE_CONVERSATIONS("sensitive-conversations"),
+    IMPORTANT_CONVERSATIONS("important-conversations"),
+    THREADS("threads"),
+    PINNED_MESSAGES("pinned-messages"),
+    SCHEDULED_MESSAGES("scheduled-messages"),
+    REACT_PERMISSION("react-permission"),
+    CONVERSATION_PRESETS("conversation-presets"),
+    CLASSIFIED_CONVERSATIONS("classified-conversations"),
+    ANNOUNCEMENT_PRESET("announcement-preset"),
+    CONVERSATION_TAGS("conversation-tags"),
+    PROMOTE_DEMOTE_OWNER("promote-demote-owner"),
+    NOTE_TO_SELF("note-to-self"),
+    CALL_END_TO_END_ENCRYPTION("call-end-to-end-encryption")
 }
 
 @Suppress("TooManyFunctions")
@@ -81,28 +101,66 @@ object CapabilitiesUtil {
     //region CoreCapabilities
 
     @JvmStatic
-    fun isLinkPreviewAvailable(user: User): Boolean {
-        return user.capabilities?.coreCapability?.referenceApi != null &&
+    fun isLinkPreviewAvailable(user: User): Boolean =
+        user.capabilities?.coreCapability?.referenceApi != null &&
             user.capabilities?.coreCapability?.referenceApi == "true"
-    }
+
+    fun canGeneratePrettyURL(user: User): Boolean = user.capabilities?.coreCapability?.modRewriteWorking == true
+
+    // endregion
+
+    //region PasswordPolicyCapabilities
+
+    /**
+     * The endpoint that validates a password against the server's policy, or null when the server
+     * does not advertise the password_policy capability.
+     */
+    fun getPasswordValidationUrl(user: User?): String? = user?.capabilities?.passwordPolicy?.api?.validatePasswordApi
+
+    /**
+     * The endpoint that generates a password satisfying the server's policy, or null when the
+     * server does not advertise the password_policy capability.
+     */
+    fun getPasswordGenerationUrl(user: User?): String? = user?.capabilities?.passwordPolicy?.api?.generatePasswordApi
 
     // endregion
 
     //region SpreedCapabilities
 
     @JvmStatic
-    fun hasSpreedFeatureCapability(spreedCapabilities: SpreedCapability, spreedFeatures: SpreedFeatures): Boolean {
-        if (spreedCapabilities.features != null) {
-            return spreedCapabilities.features!!.contains(spreedFeatures.value)
+    fun hasSpreedFeatureCapability(spreedCapabilities: SpreedCapabilityDto?, spreedFeatures: SpreedFeatures): Boolean {
+        if (spreedCapabilities == null) {
+            Log.e(TAG, "spreedCapabilities were null when checking capability ${spreedFeatures.value}")
+            return false
+        }
+
+        return spreedCapabilities.features?.contains(spreedFeatures.value) == true
+    }
+
+    fun hasConversationSubfoldersForAttachments(spreedCapabilities: SpreedCapabilityDto): Boolean {
+        if (spreedCapabilities.config?.containsKey("attachments") == true) {
+            val map = spreedCapabilities.config!!["attachments"]
+            if (map?.containsKey("conversation-subfolders") == true) {
+                return map["conversation-subfolders"].toString().toBoolean()
+            }
         }
         return false
     }
 
-    fun isSharedItemsAvailable(spreedCapabilities: SpreedCapability): Boolean {
-        return hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.RICH_OBJECT_LIST_MEDIA)
+    fun isPasswordEnforced(spreedCapabilities: SpreedCapabilityDto?): Boolean {
+        if (spreedCapabilities?.config?.containsKey("conversations") == true) {
+            val map = spreedCapabilities.config!!["conversations"]
+            if (map?.containsKey("force-passwords") == true) {
+                return map["force-passwords"].toString().toBoolean()
+            }
+        }
+        return false
     }
 
-    fun getMessageMaxLength(spreedCapabilities: SpreedCapability): Int {
+    fun isSharedItemsAvailable(spreedCapabilities: SpreedCapabilityDto): Boolean =
+        hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.RICH_OBJECT_LIST_MEDIA)
+
+    fun getMessageMaxLength(spreedCapabilities: SpreedCapabilityDto): Int {
         if (spreedCapabilities.config?.containsKey("chat") == true) {
             val chatConfigHashMap = spreedCapabilities.config!!["chat"]
             if (chatConfigHashMap?.containsKey("max-length") == true) {
@@ -118,16 +176,85 @@ object CapabilitiesUtil {
         return DEFAULT_CHAT_SIZE
     }
 
-    fun isReadStatusAvailable(spreedCapabilities: SpreedCapability): Boolean {
-        if (spreedCapabilities.config?.containsKey("chat") == true) {
-            val map: Map<String, Any>? = spreedCapabilities.config!!["chat"]
-            return map != null && map.containsKey("read-privacy")
+    fun getMaxGifSize(spreedCapabilities: SpreedCapabilityDto): Long {
+        if (spreedCapabilities.config?.containsKey("previews") == true) {
+            val previewsConfigHashMap = spreedCapabilities.config!!["previews"]
+            if (previewsConfigHashMap?.containsKey("max-gif-size") == true) {
+                val maxGifSize = previewsConfigHashMap["max-gif-size"]!!.toString().toLong()
+                return if (maxGifSize > 0) {
+                    maxGifSize
+                } else {
+                    DEFAULT_MAX_GIF_SIZE
+                }
+            }
         }
-        return false
+        return DEFAULT_MAX_GIF_SIZE
+    }
+
+    fun conversationDescriptionLength(spreedCapabilities: SpreedCapabilityDto?): Int {
+        if (spreedCapabilities?.config?.containsKey("conversations") == true) {
+            val map: Map<String, Any>? = spreedCapabilities.config!!["conversations"]
+            if (map != null && map.containsKey("description-length")) {
+                return (map["description-length"].toString().toInt())
+            }
+        }
+        return CONVERSATION_DESCRIPTION_LENGTH_FOR_OLD_SERVER
+    }
+
+    fun isReadStatusAvailable(spreedCapabilities: SpreedCapabilityDto?): Boolean {
+        val chatConfig = spreedCapabilities?.config?.get("chat") as? Map<*, *>
+        return if (chatConfig?.containsKey("read-privacy") == true) {
+            true
+        } else {
+            if (spreedCapabilities == null) {
+                Log.e(TAG, "spreedCapabilities were null when checking capability isReadStatusAvailable")
+            }
+            false
+        }
+    }
+
+    fun retentionOfEventRooms(spreedCapabilities: SpreedCapabilityDto): Int {
+        if (spreedCapabilities.config?.containsKey("conversations") == true) {
+            val map = spreedCapabilities.config!!["conversations"]
+            if (map?.containsKey("retention-event") == true) {
+                return map["retention-event"].toString().toInt()
+            }
+        }
+        return 0
+    }
+
+    fun retentionOfSIPRoom(spreedCapabilities: SpreedCapabilityDto): Int {
+        if (spreedCapabilities.config?.containsKey("conversations") == true) {
+            val map = spreedCapabilities.config!!["conversations"]
+            if (map?.containsKey("retention-phone") == true) {
+                return map["retention-phone"].toString().toInt()
+            }
+        }
+        return 0
+    }
+
+    fun retentionOfInstantMeetingRoom(spreedCapabilities: SpreedCapabilityDto): Int {
+        if (spreedCapabilities.config?.containsKey("conversations") == true) {
+            val map = spreedCapabilities.config!!["conversations"]
+            if (map?.containsKey("retention-instant-meetings") == true) {
+                return map["retention-instant-meetings"].toString().toInt()
+            }
+        }
+        return 0
+    }
+
+    fun retentionOfClassifiedRoom(spreedCapabilities: SpreedCapabilityDto): Int {
+        if (spreedCapabilities.config?.containsKey("conversations") == true) {
+            val map = spreedCapabilities.config!!["conversations"]
+            if (map?.containsKey("retention-classified") == true) {
+                return map["retention-classified"].toString().toInt()
+            }
+        }
+        return 0
     }
 
     @JvmStatic
-    fun isCallRecordingAvailable(spreedCapabilities: SpreedCapability): Boolean {
+    fun isCallRecordingAvailable(spreedCapabilities: SpreedCapabilityDto): Boolean {
         if (hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.RECORDING_V1) &&
             spreedCapabilities.config?.containsKey("call") == true
         ) {
@@ -140,7 +267,7 @@ object CapabilitiesUtil {
     }
 
     @JvmStatic
-    fun getAttachmentFolder(spreedCapabilities: SpreedCapability): String {
+    fun getAttachmentFolder(spreedCapabilities: SpreedCapabilityDto): String {
         if (spreedCapabilities.config?.containsKey("attachments") == true) {
             val map = spreedCapabilities.config!!["attachments"]
             if (map?.containsKey("folder") == true) {
@@ -150,19 +277,11 @@ object CapabilitiesUtil {
         return "/Talk"
     }
 
-    fun isConversationDescriptionEndpointAvailable(spreedCapabilities: SpreedCapability): Boolean {
-        return hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.ROOM_DESCRIPTION)
-    }
+    fun isConversationDescriptionEndpointAvailable(spreedCapabilities: SpreedCapabilityDto): Boolean =
+        hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.ROOM_DESCRIPTION)
 
-    fun isUnifiedSearchAvailable(spreedCapabilities: SpreedCapability): Boolean {
-        if (hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.FEDERATION_V1)) {
-            return false
-        }
-        return hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.UNIFIED_SEARCH)
-    }
-
-    fun isAbleToCall(spreedCapabilities: SpreedCapability): Boolean {
-        return if (
+    fun isAbleToCall(spreedCapabilities: SpreedCapabilityDto): Boolean =
+        if (
             spreedCapabilities.config?.containsKey("call") == true &&
             spreedCapabilities.config!!["call"] != null &&
             spreedCapabilities.config!!["call"]!!.containsKey("enabled")
@@ -172,7 +291,6 @@ object CapabilitiesUtil {
             // older nextcloud versions without the capability can't disable the calls
             true
         }
-    }
 
     fun isCallReactionsSupported(user: User?): Boolean {
         if (user?.capabilities != null) {
@@ -184,14 +302,24 @@ object CapabilitiesUtil {
         return false
     }
 
-    fun isTranslationsSupported(spreedCapabilities: SpreedCapability): Boolean {
-        return spreedCapabilities.config?.containsKey("chat") == true &&
+    /**
+     * Whether the server lets mobile clients preload chat messages before the user opens a
+     * conversation.
+     *
+     * True unless the server says `mobile-preload-chat` is false, so a server that does not know
+     * the setting, does not report it, or has not been asked for its capabilities yet, allows
+     * preloading.
+     */
+    fun isChatPreloadAllowed(spreedCapabilities: SpreedCapabilityDto?): Boolean =
+        spreedCapabilities?.config?.get("chat")?.get(MOBILE_PRELOAD_CHAT)?.toString()?.lowercase() != "false"
+
+    fun isTranslationsSupported(spreedCapabilities: SpreedCapabilityDto): Boolean =
+        spreedCapabilities.config?.containsKey("chat") == true &&
             spreedCapabilities.config!!["chat"] != null &&
             spreedCapabilities.config!!["chat"]!!.containsKey("has-translation-providers") &&
             spreedCapabilities.config!!["chat"]!!["has-translation-providers"] == true
-    }
 
-    fun getRecordingConsentType(spreedCapabilities: SpreedCapability): Int {
+    fun getRecordingConsentType(spreedCapabilities: SpreedCapabilityDto): Int {
         if (
             spreedCapabilities.config?.containsKey("call") == true &&
             spreedCapabilities.config!!["call"] != null &&
@@ -207,6 +335,24 @@ object CapabilitiesUtil {
             }
         }
         return RECORDING_CONSENT_NOT_REQUIRED
+    }
+
+    fun isBanningAvailable(spreedCapabilities: SpreedCapabilityDto): Boolean =
+        hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.BAN_V1)
+
+    /**
+     * Whether calls have to be end-to-end encrypted: the signaling setup supports it and the admin turned it on.
+     */
+    fun isCallEndToEndEncryptionEnabled(spreedCapabilities: SpreedCapabilityDto?): Boolean {
+        if (
+            hasSpreedFeatureCapability(spreedCapabilities, SpreedFeatures.CALL_END_TO_END_ENCRYPTION) &&
+            spreedCapabilities?.config?.containsKey("call") == true &&
+            spreedCapabilities.config!!["call"] != null &&
+            spreedCapabilities.config!!["call"]!!.containsKey("end-to-end-encryption")
+        ) {
+            return spreedCapabilities.config!!["call"]!!["end-to-end-encryption"].toString().toBoolean()
+        }
+        return false
     }
 
     // endregion
@@ -241,12 +387,11 @@ object CapabilitiesUtil {
         return false
     }
 
-    fun isFederationAvailable(user: User): Boolean {
-        return hasSpreedFeatureCapability(user.capabilities!!.spreedCapability!!, SpreedFeatures.FEDERATION_V1) &&
+    fun isFederationAvailable(user: User): Boolean =
+        hasSpreedFeatureCapability(user.capabilities!!.spreedCapability!!, SpreedFeatures.FEDERATION_V1) &&
             user.capabilities!!.spreedCapability!!.config?.containsKey("federation") == true &&
             user.capabilities!!.spreedCapability!!.config!!["federation"] != null &&
             user.capabilities!!.spreedCapability!!.config!!["federation"]!!.containsKey("enabled")
-    }
 
     // endregion
 
@@ -263,28 +408,31 @@ object CapabilitiesUtil {
 
     //region ProvisioningCapabilities
 
-    fun canEditScopes(user: User): Boolean {
-        return user.capabilities?.provisioningCapability?.accountPropertyScopesVersion != null &&
+    fun canEditScopes(user: User): Boolean =
+        user.capabilities?.provisioningCapability?.accountPropertyScopesVersion != null &&
             user.capabilities!!.provisioningCapability!!.accountPropertyScopesVersion!! > 1
-    }
 
     // endregion
 
     //region UserStatusCapabilities
 
     @JvmStatic
-    fun isUserStatusAvailable(user: User): Boolean {
-        return user.capabilities?.userStatusCapability?.enabled == true &&
+    fun isUserStatusAvailable(user: User): Boolean =
+        user.capabilities?.userStatusCapability?.enabled == true &&
             user.capabilities?.userStatusCapability?.supportsEmoji == true
-    }
+
+    fun isRestoreStatusAvailable(user: User): Boolean = user.capabilities?.userStatusCapability?.restore == true
 
     // endregion
 
     private val TAG = CapabilitiesUtil::class.java.simpleName
     const val DEFAULT_CHAT_SIZE = 1000
+    const val DEFAULT_MAX_GIF_SIZE = 3_145_728L
     const val RECORDING_CONSENT_NOT_REQUIRED = 0
     const val RECORDING_CONSENT_REQUIRED = 1
     const val RECORDING_CONSENT_DEPEND_ON_CONVERSATION = 2
-    private const val SERVER_VERSION_MIN_SUPPORTED = 14
-    private const val SERVER_VERSION_SUPPORT_WARNING = 18
+    private const val SERVER_VERSION_MIN_SUPPORTED = 17
+    private const val SERVER_VERSION_SUPPORT_WARNING = 26
+    private const val CONVERSATION_DESCRIPTION_LENGTH_FOR_OLD_SERVER = 500
+    private const val MOBILE_PRELOAD_CHAT = "mobile-preload-chat"
 }

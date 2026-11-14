@@ -8,24 +8,33 @@
 
 package com.nextcloud.talk.utils
 
-import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Log
+import android.widget.Toast
+import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
+import androidx.lifecycle.lifecycleScope
+import androidx.core.content.FileProvider
 import autodagger.AutoInjector
 import com.github.dhaval2404.imagepicker.ImagePicker
 import com.github.dhaval2404.imagepicker.constant.ImageProvider
-import com.nextcloud.talk.activities.TakePhotoActivity
+import com.nextcloud.talk.R
 import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.data.user.model.User
 import com.nextcloud.talk.remotefilebrowser.activities.RemoteFileBrowserActivity
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import com.nextcloud.talk.utils.permissions.PlatformPermissionUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.ResponseBody
 import retrofit2.Call
 import retrofit2.Callback
@@ -33,19 +42,60 @@ import retrofit2.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
 import javax.inject.Inject
 
+private const val TAG: String = "PickImage"
+private const val FULL_QUALITY: Int = 100
+
+/**
+ * Launches [block] and closes [body] when the job completes, including when the scope is already cancelled
+ * (e.g. the activity was destroyed) and [block] never starts. Closing twice is safe.
+ */
+internal fun CoroutineScope.launchClosing(body: ResponseBody?, block: suspend CoroutineScope.() -> Unit): Job {
+    val job = launch(block = block)
+    job.invokeOnCompletion { body?.close() }
+    return job
+}
+
+/**
+ * Decodes the avatar thumbnail and writes it as PNG. Blocking, call off the main thread.
+ * Returns null and logs the cause if the body is missing, does not decode or cannot be written.
+ */
+internal fun decodeAvatarToFile(
+    body: ResponseBody?,
+    decode: (InputStream) -> Bitmap? = { BitmapFactory.decodeStream(it) },
+    createFile: () -> File
+): File? {
+    val bitmap = body?.use { decode(it.byteStream()) }
+    if (bitmap == null) {
+        val cause = if (body == null) "request returned no body" else "could not be decoded"
+        Log.e(TAG, "Avatar thumbnail $cause")
+        return null
+    }
+    return try {
+        val file = createFile()
+        val written = FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, FULL_QUALITY, out)
+        }
+        if (!written) throw IOException("Bitmap.compress returned false")
+        file
+    } catch (e: IOException) {
+        Log.e(TAG, "Error saving the avatar image", e)
+        null
+    }
+}
+
 @AutoInjector(NextcloudTalkApplication::class)
-class PickImage(
-    private val activity: Activity,
-    private var currentUser: User?
-) {
+class PickImage(private val activity: ComponentActivity, private var currentUser: User?) {
 
     @Inject
     lateinit var ncApi: NcApi
 
     @Inject
     lateinit var permissionUtil: PlatformPermissionUtil
+
+    private var pendingCameraFile: File? = null
 
     init {
         NextcloudTalkApplication.sharedApplication!!.componentApplication.inject(this)
@@ -82,12 +132,19 @@ class PickImage(
 
         val avatarIntent = Intent(activity, RemoteFileBrowserActivity::class.java)
         avatarIntent.putExtras(bundle)
+        currentUser?.id?.let { avatarIntent.putExtra(BundleKeys.KEY_INTERNAL_USER_ID, it) }
         startSelectRemoteFilesIntentForResult.launch(avatarIntent)
     }
 
     fun takePicture(startTakePictureIntentForResult: ActivityResultLauncher<Intent>) {
         if (permissionUtil.isCameraPermissionGranted()) {
-            startTakePictureIntentForResult.launch(TakePhotoActivity.createIntent(activity))
+            val photoFile = createTempFileForCameraCapture()
+            pendingCameraFile = photoFile
+            val uri = FileProvider.getUriForFile(activity, activity.packageName, photoFile)
+            val takePictureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(MediaStore.EXTRA_OUTPUT, uri)
+            }
+            startTakePictureIntentForResult.launch(takePictureIntent)
         } else {
             activity.requestPermissions(
                 arrayOf(android.Manifest.permission.CAMERA),
@@ -105,42 +162,28 @@ class PickImage(
         )
         downloadCall.enqueue(object : Callback<ResponseBody> {
             override fun onResponse(call: Call<ResponseBody>, response: Response<ResponseBody>) {
-                saveBitmapAndPassToImagePicker(
-                    startImagePickerForResult,
-                    BitmapFactory.decodeStream(response.body()!!.byteStream())
-                )
+                val body = response.body()
+                activity.lifecycleScope.launchClosing(body) {
+                    val file = withContext(Dispatchers.IO) {
+                        decodeAvatarToFile(body) { createTempFileForAvatar() }
+                    }
+                    if (file != null) {
+                        selectLocal(startImagePickerForResult, file)
+                    } else {
+                        showAvatarError()
+                    }
+                }
             }
 
             override fun onFailure(call: Call<ResponseBody>, t: Throwable) {
-                // unused atm
+                Log.e(TAG, "Failed to download the avatar thumbnail", t)
+                showAvatarError()
             }
         })
     }
 
-    // only possible with API26
-    private fun saveBitmapAndPassToImagePicker(
-        startImagePickerForResult: ActivityResultLauncher<Intent>,
-        bitmap: Bitmap
-    ) {
-        val file: File = saveBitmapToTempFile(bitmap) ?: return
-        selectLocal(startImagePickerForResult, file)
-    }
-
-    private fun saveBitmapToTempFile(bitmap: Bitmap): File? {
-        try {
-            val file = createTempFileForAvatar()
-            try {
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, FULL_QUALITY, out)
-                }
-                return file
-            } catch (e: IOException) {
-                Log.e(TAG, "Error compressing bitmap", e)
-            }
-        } catch (e: IOException) {
-            Log.e(TAG, "Error creating temporary avatar image", e)
-        }
-        return null
+    private fun showAvatarError() {
+        Toast.makeText(activity, R.string.nc_common_error_sorry, Toast.LENGTH_LONG).show()
     }
 
     private fun createTempFileForAvatar(): File {
@@ -151,6 +194,17 @@ class PickImage(
         return FileUtils.getTempCacheFile(
             activity,
             AVATAR_PATH
+        )
+    }
+
+    private fun createTempFileForCameraCapture(): File {
+        FileUtils.removeTempCacheFile(
+            activity,
+            CAMERA_CAPTURE_PATH
+        )
+        return FileUtils.getTempCacheFile(
+            activity,
+            CAMERA_CAPTURE_PATH
         )
     }
 
@@ -166,17 +220,16 @@ class PickImage(
         }
     }
 
-    fun onTakePictureResult(startImagePickerForResult: ActivityResultLauncher<Intent>, data: Intent?) {
-        data?.data?.path?.let {
-            selectLocal(startImagePickerForResult, File(it))
-        }
+    fun onTakePictureResult(startImagePickerForResult: ActivityResultLauncher<Intent>) {
+        val file = pendingCameraFile ?: return
+        pendingCameraFile = null
+        selectLocal(startImagePickerForResult, file)
     }
 
     companion object {
-        private const val TAG: String = "PickImage"
         private const val MAX_SIZE: Int = 1024
         private const val AVATAR_PATH = "photos/avatar.png"
-        private const val FULL_QUALITY: Int = 100
+        private const val CAMERA_CAPTURE_PATH = "photos/camera_capture.jpg"
         const val REQUEST_PERMISSION_CAMERA: Int = 1
     }
 }

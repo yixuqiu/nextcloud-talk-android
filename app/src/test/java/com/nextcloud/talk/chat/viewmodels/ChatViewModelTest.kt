@@ -1,0 +1,625 @@
+/*
+ * Nextcloud Talk - Android Client
+ *
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package com.nextcloud.talk.chat.viewmodels
+
+import com.nextcloud.talk.chat.data.model.ChatMessage
+import com.nextcloud.talk.chat.ui.model.ChatMessageUi
+import com.nextcloud.talk.chat.ui.model.MessageStatusIcon
+import com.nextcloud.talk.chat.ui.model.MessageTypeContent
+import com.nextcloud.talk.data.database.model.SendStatus
+import com.nextcloud.talk.models.json.chat.ChatMessageDto
+import com.nextcloud.talk.utils.message.SendMessageUtils
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.time.LocalDate
+
+@Suppress("TooManyFunctions")
+class ChatViewModelTest {
+
+    // The unread marker latch: the marker position must only be derived from the visible window
+    // when the window provably reaches back to the unread boundary — otherwise a window of
+    // only-unread messages (e.g. after a capped fetch of the newest messages) would place the
+    // marker in the middle of the unread messages.
+
+    @Test
+    fun `marker is placed at the first message above the boundary when the boundary is visible`() {
+        val messages = listOf(uiMessage(39), uiMessage(40), uiMessage(41), uiMessage(42))
+
+        assertEquals(41, ChatViewModel.findFirstUnreadMessageId(messages, lastReadMessage = 40))
+    }
+
+    @Test
+    fun `marker is placed correctly when the boundary message itself is missing`() {
+        // the last read message may have been deleted or expired — an older read message is
+        // equally valid proof that the window reaches the boundary
+        val messages = listOf(uiMessage(38), uiMessage(41), uiMessage(42))
+
+        assertEquals(41, ChatViewModel.findFirstUnreadMessageId(messages, lastReadMessage = 40))
+    }
+
+    @Test
+    fun `no marker is placed when the window floats entirely above the boundary`() {
+        val messages = listOf(uiMessage(141), uiMessage(142), uiMessage(143))
+
+        assertNull(ChatViewModel.findFirstUnreadMessageId(messages, lastReadMessage = 40))
+    }
+
+    @Test
+    fun `temporary messages with negative ids are no proof of the boundary`() {
+        val messages = listOf(uiMessage(-5), uiMessage(141), uiMessage(142))
+
+        assertNull(ChatViewModel.findFirstUnreadMessageId(messages, lastReadMessage = 40))
+    }
+
+    @Test
+    fun `no marker is placed when everything is read`() {
+        val messages = listOf(uiMessage(38), uiMessage(39), uiMessage(40))
+
+        assertNull(ChatViewModel.findFirstUnreadMessageId(messages, lastReadMessage = 40))
+    }
+
+    // holdsShare(): whether a share to the note to self that failed transiently already arrived.
+    // The server stores a reference id without ever looking at it again, so it deduplicates nothing
+    // and a second attempt that is not needed posts the message twice.
+
+    @Test
+    fun `a share the note to self already holds is not sent again`() {
+        val messages = listOf(messageWithReference("other-1"), messageWithReference("ours"))
+
+        assertEquals(true, ChatViewModel.holdsShare(messages, "ours"))
+    }
+
+    @Test
+    fun `a share that did not arrive is sent again`() {
+        val messages = listOf(messageWithReference("other-1"), messageWithReference("other-2"))
+
+        assertEquals(false, ChatViewModel.holdsShare(messages, "ours"))
+    }
+
+    @Test
+    fun `a lookup that could not be answered gives no verdict`() {
+        assertNull(ChatViewModel.holdsShare(null, "ours"))
+    }
+
+    @Test
+    fun `an empty note to self is proof the share did not arrive`() {
+        assertEquals(false, ChatViewModel.holdsShare(emptyList(), "ours"))
+    }
+
+    @Test
+    fun `messages without a reference id of their own are no proof either way`() {
+        assertEquals(false, ChatViewModel.holdsShare(listOf(messageWithReference(null)), "ours"))
+    }
+
+    private fun messageWithReference(referenceId: String?) = ChatMessageDto(referenceId = referenceId)
+
+    // combineFileShareGroups(): combining batch-uploaded file shares into grouped "album" bubbles.
+    // Mirrors web's combineFileMessages.ts tests - see https://github.com/nextcloud/spreed/pull/19040
+
+    private val refUtils = SendMessageUtils()
+
+    @Test
+    fun `consecutive file shares from the same batch combine into one group`() {
+        val uploadId = "batch-1"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2)),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(1, result.size)
+        assertTrue(result[0] is CombinedUnit.Group)
+        assertEquals(listOf(1, 2, 3), result[0].messages.map { it.id })
+    }
+
+    @Test
+    fun `a real caption ends the group at that message`() {
+        val uploadId = "batch-2"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), plainMessage = "check these out"),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(2, result.size)
+        assertEquals(listOf(1, 2), (result[0] as CombinedUnit.Group).messages.map { it.id })
+        assertEquals(3, (result[1] as CombinedUnit.Single).message.id)
+    }
+
+    @Test
+    fun `a different reply target breaks the group`() {
+        val uploadId = "batch-3"
+        val parentA = mediaMessage(100, referenceId = null)
+        val parentB = mediaMessage(200, referenceId = null)
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), parentMessage = parentA),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), parentMessage = parentB)
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(2, result.size)
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `an interleaved non-file message breaks the group`() {
+        val uploadId = "batch-4"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+            uiMessage(2),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(3, result.size)
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `audio and vcard file shares never combine even from the same batch`() {
+        val uploadId = "batch-5"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), mimeType = "audio/mpeg"),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), mimeType = "text/vcard")
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(2, result.size)
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `a failed message is excluded and breaks the group around it`() {
+        val uploadId = "batch-6"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), statusIcon = MessageStatusIcon.FAILED),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(3, result.size)
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `still-uploading files from the same batch combine into one group immediately`() {
+        val uploadId = "batch-7"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), isTemporary = true),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), isTemporary = true),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3), isTemporary = true)
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(1, result.size)
+        assertTrue(result[0] is CombinedUnit.Group)
+        assertEquals(listOf(1, 2, 3), result[0].messages.map { it.id })
+    }
+
+    @Test
+    fun `a mix of an already-synced and a still-uploading file from the same batch combine`() {
+        val uploadId = "batch-8"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), isTemporary = false),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), isTemporary = true)
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(1, result.size)
+        assertTrue(result[0] is CombinedUnit.Group)
+        assertEquals(listOf(1, 2), result[0].messages.map { it.id })
+    }
+
+    // Regression test: a failed upload in the middle of a batch excludes that one message and
+    // splits the rest into two separate groups (see combineFileShareGroups()) - both halves share
+    // the same batch hash from groupHash(), which crashed the LazyColumn when MediaGroupItem's
+    // stableKey() was derived from that shared hash instead of from the group's own first message.
+    @Test
+    fun `two groups split by a failed upload in the same batch get distinct stable keys`() {
+        val uploadId = "batch-9"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2)),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3), statusIcon = MessageStatusIcon.FAILED),
+            mediaMessage(4, refUtils.generateGroupedReferenceId(uploadId, 4)),
+            mediaMessage(5, refUtils.generateGroupedReferenceId(uploadId, 5))
+        )
+
+        val groups = combineFileShareGroups(messages).filterIsInstance<CombinedUnit.Group>()
+        assertEquals(2, groups.size)
+
+        val keys = groups.map { ChatViewModel.ChatItem.MediaGroupItem(it.messages).stableKey() }
+        assertEquals(keys.size, keys.toSet().size)
+    }
+
+    @Test
+    fun `messages with non-grouped referenceIds never combine`() {
+        val messages = listOf(
+            mediaMessage(1, referenceId = "abcdef0123456789abcdef0123456789"),
+            mediaMessage(2, referenceId = "abcdef0123456789abcdef0123456789")
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(2, result.size)
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `deleted file shares of the same batch collapse into their last message`() {
+        val uploadId = "batch-10"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), isDeleted = true),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2), isDeleted = true),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3), isDeleted = true)
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(1, result.size)
+        assertEquals(listOf(1, 2, 3), (result[0] as CombinedUnit.Collapsed).messages.map { it.id })
+    }
+
+    @Test
+    fun `deleted file shares of different batches do not collapse`() {
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId("batch-11", 1), isDeleted = true),
+            mediaMessage(2, refUtils.generateGroupedReferenceId("batch-12", 1), isDeleted = true),
+            mediaMessage(3, referenceId = null, isDeleted = true),
+            mediaMessage(4, referenceId = null, isDeleted = true)
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(listOf(1, 2, 3, 4), result.flatMap { unit -> unit.messages.map { it.id } })
+        assertTrue(result.all { it is CombinedUnit.Single })
+    }
+
+    @Test
+    fun `a deleted file share does not combine with a file share of the same batch`() {
+        val uploadId = "batch-13"
+        val messages = listOf(
+            mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1), isDeleted = true),
+            mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2)),
+            mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+        )
+
+        val result = combineFileShareGroups(messages)
+
+        assertEquals(2, result.size)
+        assertEquals(1, (result[0] as CombinedUnit.Single).message.id)
+        assertEquals(listOf(2, 3), (result[1] as CombinedUnit.Group).messages.map { it.id })
+    }
+
+    @Test
+    fun `a collapsed deleted message still stands for the messages it hides`() {
+        val item = ChatViewModel.ChatItem.MessageItem(uiMessage(3), collapsedMessageIds = listOf(1, 2))
+
+        assertEquals(listOf(1, 2, 3), item.messageIds())
+        assertTrue(item.containsMessage(1))
+    }
+
+    @Test
+    fun `marking a collapsed deleted message as unread keeps the messages it hides read`() {
+        val items = listOf(
+            messageItem(4),
+            ChatViewModel.ChatItem.MessageItem(uiMessage(3), collapsedMessageIds = listOf(1, 2)),
+            messageItem(0)
+        )
+
+        assertEquals(2, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 3))
+    }
+
+    // Deleting a message shown in a media group deletes the whole group, same as web.
+
+    @Test
+    fun `deleting a message of a media group deletes every message of the group`() {
+        val uploadId = "batch-14"
+        val group = ChatViewModel.ChatItem.MediaGroupItem(
+            listOf(
+                mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+                mediaMessage(2, refUtils.generateGroupedReferenceId(uploadId, 2)),
+                mediaMessage(3, refUtils.generateGroupedReferenceId(uploadId, 3))
+            )
+        )
+        val items = listOf(messageItem(4), group)
+
+        assertEquals(listOf(1, 2, 3), ChatViewModel.messageIdsToDelete(items, messageId = 3))
+        assertEquals(listOf(1, 2, 3), ChatViewModel.messageIdsToDelete(items, messageId = 1))
+    }
+
+    @Test
+    fun `deleting a media group skips files that are still uploading`() {
+        val uploadId = "batch-15"
+        val group = ChatViewModel.ChatItem.MediaGroupItem(
+            listOf(
+                mediaMessage(1, refUtils.generateGroupedReferenceId(uploadId, 1)),
+                mediaMessage(-2, refUtils.generateGroupedReferenceId(uploadId, 2), isTemporary = true)
+            )
+        )
+
+        assertEquals(listOf(1), ChatViewModel.messageIdsToDelete(listOf(group), messageId = 1))
+    }
+
+    @Test
+    fun `deleting a message outside of a media group deletes only that message`() {
+        val items = listOf(messageItem(4), messageItem(5))
+
+        assertEquals(listOf(5), ChatViewModel.messageIdsToDelete(items, messageId = 5))
+    }
+
+    // Marking a message as unread. The chat items run newest first, the way the chat renders them
+    // bottom-up, so the message that must stay read follows the selected one in that order - taking
+    // the other neighbour would leave the selected message read and lose one unread message per step.
+
+    @Test
+    fun `marking a message as unread reads up to the message before it`() {
+        val items = listOf(messageItem(42), messageItem(41), messageItem(40), messageItem(39))
+
+        assertEquals(40, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 41))
+    }
+
+    @Test
+    fun `marking the sixth last message as unread leaves six messages unread`() {
+        val items = (42 downTo 30).map { messageItem(it) }
+
+        val marker = ChatViewModel.readMarkerForMarkingUnread(items, messageId = 37)
+
+        assertEquals(36, marker)
+        assertEquals(6, items.count { (it as ChatViewModel.ChatItem.MessageItem).uiMessage.id > marker!! })
+    }
+
+    @Test
+    fun `marking the oldest message as unread leaves nothing read`() {
+        val items = listOf(messageItem(41), messageItem(40), messageItem(39))
+
+        assertEquals(0, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 39))
+    }
+
+    @Test
+    fun `marking the newest message as unread only affects that message`() {
+        val items = listOf(messageItem(41), messageItem(40), messageItem(39))
+
+        assertEquals(40, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 41))
+    }
+
+    @Test
+    fun `date headers and markers between the messages are skipped`() {
+        val items = listOf(
+            messageItem(40),
+            ChatViewModel.ChatItem.UnreadMessagesMarkerItem(LocalDate.of(2026, 1, 2)),
+            ChatViewModel.ChatItem.DateHeaderItem(LocalDate.of(2026, 1, 2)),
+            messageItem(39)
+        )
+
+        assertEquals(39, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 40))
+    }
+
+    @Test
+    fun `a media group is a stack of messages, not a single one`() {
+        // the group carries its messages oldest first, the list around it runs the other way
+        val items = listOf(
+            messageItem(45),
+            ChatViewModel.ChatItem.MediaGroupItem(listOf(uiMessage(42), uiMessage(43), uiMessage(44))),
+            messageItem(41)
+        )
+
+        assertEquals(43, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 44))
+        assertEquals(41, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 42))
+        assertEquals(44, ChatViewModel.readMarkerForMarkingUnread(items, messageId = 45))
+    }
+
+    @Test
+    fun `a message that is not on screen yields no marker at all`() {
+        val items = listOf(messageItem(40), messageItem(39))
+
+        assertNull(ChatViewModel.readMarkerForMarkingUnread(items, messageId = 77))
+    }
+
+    // Read marker after the user sent a message: the server moves the marker to the sent message, so the
+    // client must never send an older one. Sequence from the server log of a real chat: the user sent
+    // message 2624 while the client's local marker still was 2623. The decision is made on the message
+    // list from the database, not on the rendered items, which lag behind it.
+
+    private fun readMarker(messages: List<ChatMessage>, local: Int = 2623, conversation: Int = 2620): Int? =
+        ChatViewModel.readMarkerToSend(
+            localLastReadMessage = local,
+            conversationLastReadMessage = conversation,
+            newestOwnMessageId = ChatViewModel.newestOwnMessageId(messages),
+            hasUnconfirmedOwnMessage = ChatViewModel.hasUnconfirmedOwnMessage(messages)
+        )
+
+    @Test
+    fun `read marker is not sent below the own message just sent`() {
+        assertEquals(2624, readMarker(listOf(ownMessage(2624), incomingMessage(2623))))
+    }
+
+    @Test
+    fun `read marker is not sent while the own message is on its way to the server`() {
+        // the request is in flight: the server may have accepted the message, the answer is not processed yet
+        assertNull(readMarker(listOf(ownMessage(-77, SendStatus.PENDING), incomingMessage(2623))))
+    }
+
+    @Test
+    fun `read marker is not sent while the own message waits for its server copy`() {
+        assertNull(readMarker(listOf(ownMessage(-77, SendStatus.SENT_PENDING_ACK), incomingMessage(2623))))
+    }
+
+    private fun localReadMarker(messages: List<ChatMessage>, local: Int = 2623, conversation: Int = 2620): Int? =
+        ChatViewModel.localReadMarker(
+            localLastReadMessage = local,
+            conversationLastReadMessage = conversation,
+            newestOwnMessageId = ChatViewModel.newestOwnMessageId(messages)
+        )
+
+    @Test
+    fun `local read state is still written while the own message waits to be sent offline`() {
+        // 5 unread messages read offline, then a reply that is only queued (PENDING): the server request
+        // has to wait, the conversation list must not keep showing the messages as unread
+        val messages = listOf(ownMessage(-77, SendStatus.PENDING), incomingMessage(2623))
+
+        assertNull(readMarker(messages))
+        assertEquals(2623, localReadMarker(messages))
+    }
+
+    @Test
+    fun `local read state is still written while the own message waits for its server copy`() {
+        val messages = listOf(ownMessage(-77, SendStatus.SENT_PENDING_ACK), incomingMessage(2623))
+
+        assertNull(readMarker(messages))
+        assertEquals(2623, localReadMarker(messages))
+    }
+
+    @Test
+    fun `local read state is not written below the own message just sent`() {
+        assertEquals(2624, localReadMarker(listOf(ownMessage(2624), incomingMessage(2623))))
+    }
+
+    @Test
+    fun `local read state is not written when the conversation already has it`() {
+        assertNull(localReadMarker(listOf(incomingMessage(2623)), local = 2620, conversation = 2620))
+    }
+
+    @Test
+    fun `read marker is sent when the own message failed to send`() {
+        assertEquals(2623, readMarker(listOf(ownMessage(-77, SendStatus.FAILED), incomingMessage(2623))))
+    }
+
+    @Test
+    fun `read marker is sent while a file of the user is still uploading`() {
+        val upload = ownMessage(-5, SendStatus.PENDING).apply {
+            messageParameters = hashMapOf("file" to hashMapOf("type" to "file"))
+        }
+        assertEquals(2623, readMarker(listOf(upload, incomingMessage(2623))))
+    }
+
+    @Test
+    fun `read marker waits for a file of the user that was shared`() {
+        val shared = ownMessage(-5, SendStatus.SENT_PENDING_ACK).apply {
+            messageParameters = hashMapOf("file" to hashMapOf("type" to "file"))
+        }
+        assertNull(readMarker(listOf(shared, incomingMessage(2623))))
+    }
+
+    @Test
+    fun `read marker of the incoming messages is sent when the user sent nothing`() {
+        assertEquals(2623, readMarker(listOf(incomingMessage(2623), incomingMessage(2622))))
+    }
+
+    @Test
+    fun `read marker is not sent when the server already has it`() {
+        assertNull(ChatViewModel.readMarkerToSend(2624, 2624, newestOwnMessageId = 2624, false))
+    }
+
+    @Test
+    fun `newest own message ignores incoming and temporary messages`() {
+        val messages = listOf(
+            incomingMessage(2630),
+            ownMessage(-5, SendStatus.PENDING),
+            ownMessage(2624),
+            ownMessage(2610)
+        )
+
+        assertEquals(2624, ChatViewModel.newestOwnMessageId(messages))
+    }
+
+    private fun incomingMessage(id: Int): ChatMessage =
+        ChatMessage().apply {
+            jsonMessageId = id
+            incoming = true
+        }
+
+    private fun ownMessage(id: Int, status: SendStatus? = null): ChatMessage =
+        ChatMessage().apply {
+            jsonMessageId = id
+            incoming = false
+            isTemporary = id < 0
+            sendStatus = status
+        }
+
+    private fun messageItem(id: Int): ChatViewModel.ChatItem.MessageItem =
+        ChatViewModel.ChatItem.MessageItem(uiMessage(id))
+
+    private fun uiMessage(id: Int): ChatMessageUi =
+        ChatMessageUi(
+            id = id,
+            message = "message $id",
+            renderMarkdown = false,
+            actorDisplayName = "Other User",
+            isThread = false,
+            threadTitle = "",
+            threadReplies = 0,
+            incoming = true,
+            isDeleted = false,
+            avatarUrl = null,
+            statusIcon = MessageStatusIcon.SENT,
+            timestamp = id.toLong(),
+            date = LocalDate.of(2026, 8, 12),
+            content = MessageTypeContent.RegularText
+        )
+
+    @Suppress("LongParameterList")
+    private fun mediaMessage(
+        id: Int,
+        referenceId: String?,
+        mimeType: String = "image/jpeg",
+        plainMessage: String = "{file}",
+        parentMessage: ChatMessageUi? = null,
+        isDeleted: Boolean = false,
+        statusIcon: MessageStatusIcon = MessageStatusIcon.SENT,
+        isTemporary: Boolean = false
+    ): ChatMessageUi {
+        val content = if (isTemporary) {
+            MessageTypeContent.UploadingMedia(
+                localFileUri = "file://local",
+                fileName = "file-$id",
+                caption = null,
+                mimeType = mimeType,
+                drawableResourceId = 0
+            )
+        } else {
+            MessageTypeContent.Media(
+                previewUrl = null,
+                drawableResourceId = 0,
+                mimeType = mimeType
+            )
+        }
+        return ChatMessageUi(
+            id = id,
+            message = plainMessage,
+            plainMessage = plainMessage,
+            renderMarkdown = false,
+            actorDisplayName = "Other User",
+            isThread = false,
+            threadTitle = "",
+            threadReplies = 0,
+            incoming = true,
+            isDeleted = isDeleted,
+            avatarUrl = null,
+            statusIcon = statusIcon,
+            timestamp = id.toLong(),
+            date = LocalDate.of(2026, 8, 12),
+            content = content,
+            parentMessage = parentMessage,
+            referenceId = referenceId
+        )
+    }
+}
